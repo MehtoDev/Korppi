@@ -1,0 +1,15 @@
+Copyright (c) 2026 Mikko Metso. All rights reserved. 
+
+This software is provided for educational and viewing purposes only. No license, express or implied, is granted to use, copy, modify, merge, publish, distribute, sublicense, or sell this software, or to use it in any commercial or non-commercial games, products, or applications. 
+
+Authorized Use: 
+
+* You may view the source code for educational purposes.
+* You may clone or fork the repository solely as permitted by the hosting platform's terms of service for viewing purposes.
+
+Prohibited Use: 
+
+* You may not compile or integrate this source code into any software application, game, or engine intended for distribution or use.
+* You may not redistribute modified or unmodified versions of this source code.
+
+This project is currently in early alpha. Contributions and pull requests are not being accepted at this time.
