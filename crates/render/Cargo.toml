@@ -1,0 +1,21 @@
+[package]
+name = "korppi_render"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+korppi_core = { path = "../core" }
+korppi_math = { path = "../math" }
+korppi_rhi = { path = "../rhi" }
+tracing = { workspace = true }
+
+[dev-dependencies]
+korppi_rhi_conformance = { path = "../rhi_conformance" }
+korppi_rhi_opengl = { path = "../rhi_opengl" }
+korppi_rhi_vulkan = { path = "../rhi_vulkan" }
+
+[lints]
+workspace = true

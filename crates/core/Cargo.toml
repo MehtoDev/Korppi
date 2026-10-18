@@ -1,0 +1,18 @@
+[package]
+name = "korppi_core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[features]
+default = []
+logging = ["dep:tracing-subscriber"]
+
+[lints]
+workspace = true

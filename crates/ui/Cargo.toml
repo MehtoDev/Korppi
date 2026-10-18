@@ -1,0 +1,25 @@
+[package]
+name = "korppi_ui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+korppi_core = { path = "../core" }
+korppi_math = { path = "../math" }
+korppi_ecs = { path = "../ecs" }
+korppi_scene = { path = "../scene" }
+korppi_input = { path = "../input" }
+korppi_render = { path = "../render" }
+korppi_rhi = { path = "../rhi" }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+korppi_rhi_opengl = { path = "../rhi_opengl" }
+korppi_rhi_vulkan = { path = "../rhi_vulkan" }
+
+[lints]
+workspace = true

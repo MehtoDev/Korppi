@@ -1,0 +1,32 @@
+[package]
+name = "korppi_engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+korppi_core = { path = "../core" }
+korppi_math = { path = "../math" }
+korppi_ecs = { path = "../ecs" }
+korppi_scene = { path = "../scene" }
+korppi_physics = { path = "../physics" }
+korppi_physics2d = { path = "../physics2d" }
+korppi_input = { path = "../input" }
+korppi_window = { path = "../window" }
+korppi_asset = { path = "../asset" }
+korppi_audio = { path = "../audio", features = ["cpal"] }
+korppi_rhi = { path = "../rhi" }
+korppi_rhi_opengl = { path = "../rhi_opengl" }
+korppi_rhi_vulkan = { path = "../rhi_vulkan" }
+korppi_render = { path = "../render" }
+korppi_ui = { path = "../ui" }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+korppi_rhi_conformance = { path = "../rhi_conformance" }
+
+[lints]
+workspace = true

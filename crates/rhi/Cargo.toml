@@ -1,0 +1,22 @@
+[package]
+name = "korppi_rhi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+korppi_core = { path = "../core" }
+raw-window-handle = { workspace = true }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde = { workspace = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[lints]
+workspace = true

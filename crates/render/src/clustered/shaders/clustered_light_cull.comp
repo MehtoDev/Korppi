@@ -1,0 +1,304 @@
+#version 450
+// Asynchronous GPU Compute Shader: Froxel AABB vs Point & Spot Lights, Decals & Reflection Probes
+//
+// Bind groups (explicit layouts, `GpuLightCuller::init`):
+// - Set 0, binding 0: Uniform buffer for grid dimensions, light, decal and probe counts
+// - Set 1, binding 0: Froxel AABBs (readonly)
+// - Set 1, binding 1: Point lights (readonly)
+// - Set 1, binding 2: Spot lights (readonly)
+// - Set 1, binding 3: Cluster records (read-write output)
+// - Set 1, binding 4: Global light index list (writeonly output)
+// - Set 1, binding 5: Global atomic counters (read-write atomic)
+// - Set 1, binding 6: Decals (readonly)
+// - Set 1, binding 7: Reflection probes (readonly)
+// - Set 1, binding 8: Global decal index list (writeonly output)
+// - Set 1, binding 9: Global reflection probe index list (writeonly output)
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std140) uniform CullingParams {
+    uint total_clusters;
+    uint point_light_count;
+    uint spot_light_count;
+    uint decal_count;
+    uint probe_count;
+    uint max_light_indices;
+    uint max_decal_indices;
+    uint max_probe_indices;
+} params;
+
+struct FroxelAabbGpu {
+    vec4 aabb_min;       // xyz = min corner, w = unused
+    vec4 aabb_max;       // xyz = max corner, w = unused
+    vec4 sphere_center;  // xyz = center, w = sphere_radius
+};
+
+struct PointLightGpu {
+    vec4 position_radius; // xyz = position_vs, w = radius
+    vec4 color_intensity; // xyz = color, w = intensity
+};
+
+struct SpotLightGpu {
+    vec4 position_range;       // xyz = position_vs, w = range
+    vec4 direction_half_angle; // xyz = direction_vs, w = half_angle
+    vec4 color_intensity;      // xyz = color, w = intensity
+};
+
+struct DecalGpu {
+    vec4 position_vs;   // xyz = center, w = unused
+    vec4 half_extents;  // xyz = half_extents, w = unused
+    vec4 axis0;         // b0
+    vec4 axis1;         // b1
+    vec4 axis2;         // b2
+};
+
+struct ProbeGpu {
+    vec4 position_type; // xyz = position_vs, w = shape_type (0.0 = Sphere, 1.0 = Box)
+    vec4 param;         // if Sphere: x = radius; if Box: xyz = half_extents
+};
+
+struct ClusterRecordGpu {
+    uint point_offset;
+    uint point_count;
+    uint spot_offset;
+    uint spot_count;
+    uint decal_offset;
+    uint decal_count;
+    uint probe_offset;
+    uint probe_count;
+};
+
+layout(std430, set = 1, binding = 0) readonly buffer FroxelBuffer {
+    FroxelAabbGpu froxels[];
+};
+
+layout(std430, set = 1, binding = 1) readonly buffer PointLightBuffer {
+    PointLightGpu point_lights[];
+};
+
+layout(std430, set = 1, binding = 2) readonly buffer SpotLightBuffer {
+    SpotLightGpu spot_lights[];
+};
+
+layout(std430, set = 1, binding = 3) buffer ClusterRecordBuffer {
+    ClusterRecordGpu records[];
+};
+
+layout(std430, set = 1, binding = 4) writeonly buffer GlobalLightIndicesBuffer {
+    uint global_indices[];
+};
+
+layout(std430, set = 1, binding = 5) buffer AtomicCounterBuffer {
+    uint global_light_counter;
+    uint global_decal_counter;
+    uint global_probe_counter;
+    uint padding;
+};
+
+layout(std430, set = 1, binding = 6) readonly buffer DecalBuffer {
+    DecalGpu decals[];
+};
+
+layout(std430, set = 1, binding = 7) readonly buffer ProbeBuffer {
+    ProbeGpu probes[];
+};
+
+layout(std430, set = 1, binding = 8) writeonly buffer GlobalDecalIndicesBuffer {
+    uint global_decal_indices[];
+};
+
+layout(std430, set = 1, binding = 9) writeonly buffer GlobalProbeIndicesBuffer {
+    uint global_probe_indices[];
+};
+
+// Arvo's algorithm: Distance squared between view-space sphere and AABB
+bool test_sphere_vs_aabb(vec3 center, float radius, vec3 b_min, vec3 b_max) {
+    vec3 closest = clamp(center, b_min, b_max);
+    vec3 d = center - closest;
+    return dot(d, d) <= radius * radius;
+}
+
+// Bart Wronski's cone vs sphere intersection test
+bool test_cone_vs_sphere(vec3 origin, vec3 forward, float range, float half_angle, vec3 sphere_center, float radius) {
+    vec3 v = sphere_center - origin;
+    float v_len_sq = dot(v, v);
+    vec3 norm_fwd = normalize(forward);
+    float v1_len = dot(v, norm_fwd);
+    float v_perp_len = sqrt(max(0.0, v_len_sq - v1_len * v1_len));
+    float dist_closest = cos(half_angle) * v_perp_len - v1_len * sin(half_angle);
+    if (dist_closest > radius) return false;
+    if (v1_len > (radius + range)) return false;
+    if (v1_len < -radius) return false;
+    return true;
+}
+
+// Separating Axis Theorem (SAT): View-space Decal OBB vs Froxel AABB
+bool test_decal_vs_aabb(DecalGpu decal, vec3 aabb_min, vec3 aabb_max) {
+    vec3 aabb_center = (aabb_min + aabb_max) * 0.5;
+    vec3 aabb_extents = (aabb_max - aabb_min) * 0.5;
+    vec3 t = decal.position_vs.xyz - aabb_center;
+
+    vec3 b0 = decal.axis0.xyz;
+    vec3 b1 = decal.axis1.xyz;
+    vec3 b2 = decal.axis2.xyz;
+    vec3 e_b = decal.half_extents.xyz;
+
+    float r00 = abs(b0.x) + 1e-6;
+    float r01 = abs(b1.x) + 1e-6;
+    float r02 = abs(b2.x) + 1e-6;
+    float r10 = abs(b0.y) + 1e-6;
+    float r11 = abs(b1.y) + 1e-6;
+    float r12 = abs(b2.y) + 1e-6;
+    float r20 = abs(b0.z) + 1e-6;
+    float r21 = abs(b1.z) + 1e-6;
+    float r22 = abs(b2.z) + 1e-6;
+
+    // 1. AABB face axes
+    if (abs(t.x) > aabb_extents.x + e_b.x * r00 + e_b.y * r01 + e_b.z * r02) return false;
+    if (abs(t.y) > aabb_extents.y + e_b.x * r10 + e_b.y * r11 + e_b.z * r12) return false;
+    if (abs(t.z) > aabb_extents.z + e_b.x * r20 + e_b.y * r21 + e_b.z * r22) return false;
+
+    // 2. OBB face axes
+    if (abs(dot(t, b0)) > aabb_extents.x * r00 + aabb_extents.y * r10 + aabb_extents.z * r20 + e_b.x) return false;
+    if (abs(dot(t, b1)) > aabb_extents.x * r01 + aabb_extents.y * r11 + aabb_extents.z * r21 + e_b.y) return false;
+    if (abs(dot(t, b2)) > aabb_extents.x * r02 + aabb_extents.y * r12 + aabb_extents.z * r22 + e_b.z) return false;
+
+    // 3. Cross-product axes
+    // A0 x B0
+    if (abs(t.z * b0.y - t.y * b0.z) > aabb_extents.y * r20 + aabb_extents.z * r10 + e_b.y * r02 + e_b.z * r01) return false;
+    // A0 x B1
+    if (abs(t.z * b1.y - t.y * b1.z) > aabb_extents.y * r21 + aabb_extents.z * r11 + e_b.x * r02 + e_b.z * r00) return false;
+    // A0 x B2
+    if (abs(t.z * b2.y - t.y * b2.z) > aabb_extents.y * r22 + aabb_extents.z * r12 + e_b.x * r01 + e_b.y * r00) return false;
+
+    // A1 x B0
+    if (abs(t.x * b0.z - t.z * b0.x) > aabb_extents.x * r20 + aabb_extents.z * r00 + e_b.y * r12 + e_b.z * r11) return false;
+    // A1 x B1
+    if (abs(t.x * b1.z - t.z * b1.x) > aabb_extents.x * r21 + aabb_extents.z * r01 + e_b.x * r12 + e_b.z * r10) return false;
+    // A1 x B2
+    if (abs(t.x * b2.z - t.z * b2.x) > aabb_extents.x * r22 + aabb_extents.z * r02 + e_b.x * r11 + e_b.y * r10) return false;
+
+    // A2 x B0
+    if (abs(t.y * b0.x - t.x * b0.y) > aabb_extents.x * r10 + aabb_extents.y * r00 + e_b.y * r22 + e_b.z * r21) return false;
+    // A2 x B1
+    if (abs(t.y * b1.x - t.x * b1.y) > aabb_extents.x * r11 + aabb_extents.y * r01 + e_b.x * r22 + e_b.z * r20) return false;
+    // A2 x B2
+    if (abs(t.y * b2.x - t.x * b2.y) > aabb_extents.x * r12 + aabb_extents.y * r02 + e_b.x * r21 + e_b.y * r20) return false;
+
+    return true;
+}
+
+// Reflection Probe vs Froxel AABB
+bool test_probe_vs_aabb(ProbeGpu probe, vec3 aabb_min, vec3 aabb_max) {
+    if (probe.position_type.w < 0.5) {
+        float r = probe.param.x;
+        return test_sphere_vs_aabb(probe.position_type.xyz, r, aabb_min, aabb_max);
+    } else {
+        vec3 b_min = probe.position_type.xyz - probe.param.xyz;
+        vec3 b_max = probe.position_type.xyz + probe.param.xyz;
+        if (any(greaterThan(aabb_min, b_max))) return false;
+        if (any(lessThan(aabb_max, b_min))) return false;
+        return true;
+    }
+}
+
+void main() {
+    uint cluster_idx = gl_GlobalInvocationID.x;
+    if (cluster_idx >= params.total_clusters) {
+        return;
+    }
+
+    FroxelAabbGpu froxel = froxels[cluster_idx];
+    vec3 aabb_min = froxel.aabb_min.xyz;
+    vec3 aabb_max = froxel.aabb_max.xyz;
+    vec3 sph_center = froxel.sphere_center.xyz;
+    float sph_radius = froxel.sphere_center.w;
+
+    const uint MAX_PER_FROXEL = 256;
+
+    uint visible_points[MAX_PER_FROXEL];
+    uint visible_point_count = 0;
+    for (uint i = 0; i < params.point_light_count; ++i) {
+        if (visible_point_count >= MAX_PER_FROXEL) break;
+        vec3 pos = point_lights[i].position_radius.xyz;
+        float r = point_lights[i].position_radius.w;
+        if (test_sphere_vs_aabb(pos, r, aabb_min, aabb_max)) {
+            visible_points[visible_point_count] = i;
+            visible_point_count += 1;
+        }
+    }
+
+    uint visible_spots[MAX_PER_FROXEL];
+    uint visible_spot_count = 0;
+    for (uint j = 0; j < params.spot_light_count; ++j) {
+        if (visible_spot_count >= MAX_PER_FROXEL) break;
+        vec3 pos = spot_lights[j].position_range.xyz;
+        float range = spot_lights[j].position_range.w;
+        vec3 dir = spot_lights[j].direction_half_angle.xyz;
+        float half_angle = spot_lights[j].direction_half_angle.w;
+        if (test_cone_vs_sphere(pos, dir, range, half_angle, sph_center, sph_radius)) {
+            visible_spots[visible_spot_count] = j;
+            visible_spot_count += 1;
+        }
+    }
+
+    uint visible_decals[MAX_PER_FROXEL];
+    uint visible_decal_count = 0;
+    for (uint d = 0; d < params.decal_count; ++d) {
+        if (visible_decal_count >= MAX_PER_FROXEL) break;
+        if (test_decal_vs_aabb(decals[d], aabb_min, aabb_max)) {
+            visible_decals[visible_decal_count] = d;
+            visible_decal_count += 1;
+        }
+    }
+
+    uint visible_probes[MAX_PER_FROXEL];
+    uint visible_probe_count = 0;
+    for (uint p = 0; p < params.probe_count; ++p) {
+        if (visible_probe_count >= MAX_PER_FROXEL) break;
+        if (test_probe_vs_aabb(probes[p], aabb_min, aabb_max)) {
+            visible_probes[visible_probe_count] = p;
+            visible_probe_count += 1;
+        }
+    }
+
+    uint total_lights = visible_point_count + visible_spot_count;
+    uint light_offset = atomicAdd(global_light_counter, total_lights);
+    uint decal_offset = atomicAdd(global_decal_counter, visible_decal_count);
+    uint probe_offset = atomicAdd(global_probe_counter, visible_probe_count);
+
+    uint pt_offset = min(light_offset, params.max_light_indices);
+    uint actual_point_count = min(visible_point_count, params.max_light_indices - pt_offset);
+    for (uint k = 0; k < actual_point_count; ++k) {
+        global_indices[pt_offset + k] = visible_points[k];
+    }
+
+    uint raw_sp_offset = light_offset + visible_point_count;
+    uint sp_offset = min(raw_sp_offset, params.max_light_indices);
+    uint actual_spot_count = min(visible_spot_count, params.max_light_indices - sp_offset);
+    for (uint m = 0; m < actual_spot_count; ++m) {
+        global_indices[sp_offset + m] = visible_spots[m];
+    }
+
+    uint safe_decal_offset = min(decal_offset, params.max_decal_indices);
+    uint actual_decal_count = min(visible_decal_count, params.max_decal_indices - safe_decal_offset);
+    for (uint di = 0; di < actual_decal_count; ++di) {
+        global_decal_indices[safe_decal_offset + di] = visible_decals[di];
+    }
+
+    uint safe_probe_offset = min(probe_offset, params.max_probe_indices);
+    uint actual_probe_count = min(visible_probe_count, params.max_probe_indices - safe_probe_offset);
+    for (uint pi = 0; pi < actual_probe_count; ++pi) {
+        global_probe_indices[safe_probe_offset + pi] = visible_probes[pi];
+    }
+
+    records[cluster_idx].point_offset = pt_offset;
+    records[cluster_idx].point_count = actual_point_count;
+    records[cluster_idx].spot_offset = sp_offset;
+    records[cluster_idx].spot_count = actual_spot_count;
+    records[cluster_idx].decal_offset = safe_decal_offset;
+    records[cluster_idx].decal_count = actual_decal_count;
+    records[cluster_idx].probe_offset = safe_probe_offset;
+    records[cluster_idx].probe_count = actual_probe_count;
+}
+

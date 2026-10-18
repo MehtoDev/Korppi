@@ -1,0 +1,28 @@
+[package]
+name = "korppi_audio"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+korppi_core = { path = "../core" }
+korppi_math = { path = "../math" }
+korppi_ecs = { path = "../ecs" }
+korppi_scene = { path = "../scene" }
+korppi_physics = { path = "../physics" }
+korppi_asset = { path = "../asset" }
+serde = { workspace = true }
+tracing = { workspace = true }
+cpal = { workspace = true, optional = true }
+lewton = { workspace = true }
+
+[features]
+default = []
+cpal = ["dep:cpal"]
+
+[dev-dependencies]
+
+[lints]
+workspace = true

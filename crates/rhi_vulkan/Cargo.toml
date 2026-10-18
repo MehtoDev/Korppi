@@ -1,0 +1,16 @@
+[package]
+name = "korppi_rhi_vulkan"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+korppi_rhi = { path = "../rhi" }
+ash = { workspace = true }
+ash-window = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

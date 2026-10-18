@@ -1,0 +1,27 @@
+[package]
+name = "korppi_project"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+korppi_core = { path = "../core" }
+korppi_asset = { path = "../asset" }
+korppi_audio = { path = "../audio" }
+korppi_engine = { path = "../engine" }
+korppi_scene = { path = "../scene" }
+korppi_math = { path = "../math" }
+korppi_rhi = { path = "../rhi" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+korppi_physics = { path = "../physics" }
+korppi_physics2d = { path = "../physics2d" }
+
+[lints]
+workspace = true

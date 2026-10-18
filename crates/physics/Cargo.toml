@@ -1,0 +1,20 @@
+[package]
+name = "korppi_physics"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+korppi_core = { path = "../core" }
+korppi_math = { path = "../math" }
+korppi_ecs = { path = "../ecs" }
+serde = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

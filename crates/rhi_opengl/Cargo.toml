@@ -1,0 +1,28 @@
+[package]
+name = "korppi_rhi_opengl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenGL 4.5 Core Direct State Access (DSA) RHI implementation for the engine"
+
+[dependencies]
+korppi_rhi = { path = "../rhi" }
+glow = { workspace = true }
+naga = { workspace = true }
+raw-window-handle = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(not(windows))'.dependencies]
+khronos-egl = { workspace = true }
+libloading = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+korppi_rhi_vulkan = { path = "../rhi_vulkan" }

@@ -1,0 +1,25 @@
+[package]
+name = "korppi_scene"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+korppi_core = { path = "../core" }
+korppi_math = { path = "../math" }
+korppi_ecs = { path = "../ecs" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "scene_benchmarks"
+harness = false
+
+[lints]
+workspace = true

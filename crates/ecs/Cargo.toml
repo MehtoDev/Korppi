@@ -1,0 +1,21 @@
+[package]
+name = "korppi_ecs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+korppi_math = { path = "../math" }
+criterion = { workspace = true }
+
+[[bench]]
+name = "ecs_benchmarks"
+harness = false
+
+[lints]
+workspace = true
