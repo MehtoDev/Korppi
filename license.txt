@@ -1,15 +1,59 @@
-Copyright (c) 2026 Mikko Metso. All rights reserved. 
+Copyright (c) 2026 Mikko Metso. All rights reserved.
 
-This software is provided for educational and viewing purposes only. No license, express or implied, is granted to use, copy, modify, merge, publish, distribute, sublicense, or sell this software, or to use it in any commercial or non-commercial games, products, or applications. 
+This software is provided for educational and viewing purposes only. No license, express or implied, is granted to use, copy, modify, merge, publish, distribute, sublicense, or sell this software, or to use it in any commercial or non-commercial games, products, or applications.
 
-Authorized Use: 
+Authorized Use:
 
-* You may view the source code for educational purposes.
-* You may clone or fork the repository solely as permitted by the hosting platform's terms of service for viewing purposes.
+- You may view the source code for educational purposes.
+- You may clone or fork the repository solely as permitted by the hosting platform's terms of service for viewing purposes.
 
-Prohibited Use: 
+Prohibited Use:
 
-* You may not compile or integrate this source code into any software application, game, or engine intended for distribution or use.
-* You may not redistribute modified or unmodified versions of this source code.
+- You may not compile or integrate this source code into any software application, game, or engine intended for distribution or use.
+- You may not redistribute modified or unmodified versions of this source code.
 
 This project is currently in early alpha. Contributions and pull requests are not being accepted at this time.
+
+================================================================================
+THIRD-PARTY NOTICES AND ATTRIBUTIONS
+================================================================================
+
+Portions of this software's architecture, algorithms, and design are based on or
+adapted from the following open-source projects, which are licensed under the
+MIT License. The inclusion of these notices does not grant any license to the
+Korppi project as a whole, which remains subject to the terms above.
+
+1. Box2D (https://github.com/erincatto/box2d)
+   Copyright (c) 2022 Erin Catto
+
+2. Box3D (https://github.com/erincatto/box3d)
+   Copyright (c) 2024 Erin Catto
+
+3. Flecs (https://github.com/SanderMertens/flecs)
+   Copyright (c) 2019 Sander Mertens
+
+4. Godot Engine (https://github.com/godotengine/godot)
+   Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md).
+   Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.
+
+--------------------------------------------------------------------------------
+MIT License (applicable to the upstream works listed above)
+--------------------------------------------------------------------------------
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
