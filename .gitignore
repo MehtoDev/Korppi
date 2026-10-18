@@ -1,35 +1,6 @@
 # Environment & Local Configuration
 .env
 .gitconfig
-.public-repo
-
-# Research & Local Investigations
-research/
-
-# External Reference Clones
-.external_src/
 
 # Rust Build & Target Outputs
 /target/
-# Audit probe harnesses are standalone Cargo workspaces
-/docs/audits/probes/*/target/
-**/*.rs.bk
-*.pdb
-
-# IDE & Editor Configurations
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Profiling & Diagnostics
-perf.data
-perf.data.old
-flamegraph.svg
-*.trace
-callgrind.out.*
-
-# OS Artifacts
-.DS_Store
-Thumbs.db
