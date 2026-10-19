@@ -2,7 +2,61 @@
 
 use crate::theme::stylebox::{StyleBox, StyleBoxFlat};
 use korppi_ecs::Component;
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
+
+trait ThemeKeyPair {
+    fn key_pair(&self) -> (&str, &str);
+}
+
+impl ThemeKeyPair for (String, String) {
+    #[inline]
+    fn key_pair(&self) -> (&str, &str) {
+        (&self.0, &self.1)
+    }
+}
+
+impl ThemeKeyPair for (&str, &str) {
+    #[inline]
+    fn key_pair(&self) -> (&str, &str) {
+        *self
+    }
+}
+
+impl PartialEq for dyn ThemeKeyPair + '_ {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.key_pair() == other.key_pair()
+    }
+}
+
+impl Eq for dyn ThemeKeyPair + '_ {}
+
+impl Hash for dyn ThemeKeyPair + '_ {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let (a, b) = self.key_pair();
+        a.hash(state);
+        b.hash(state);
+    }
+}
+
+impl<'a> Borrow<dyn ThemeKeyPair + 'a> for (String, String) {
+    #[inline]
+    fn borrow(&self) -> &(dyn ThemeKeyPair + 'a) {
+        self
+    }
+}
+
+static DEFAULT_DARK_THEME: OnceLock<Theme> = OnceLock::new();
+
+/// Returns a shared reference to the cached default dark engine theme.
+#[inline]
+pub(crate) fn default_dark_theme() -> &'static Theme {
+    DEFAULT_DARK_THEME.get_or_init(Theme::build_dark)
+}
 
 /// Central theme mapping UI control types and item keys to visual styling attributes.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -35,9 +89,8 @@ impl Theme {
     /// Queries a color attribute for a specific control type.
     #[must_use]
     pub fn get_color(&self, theme_type: &str, item: &str) -> Option<[f32; 4]> {
-        self.colors
-            .get(&(theme_type.to_string(), item.to_string()))
-            .copied()
+        let key = (theme_type, item);
+        self.colors.get(&key as &dyn ThemeKeyPair).copied()
     }
 
     /// Registers a numeric constant for a specific control type.
@@ -49,9 +102,8 @@ impl Theme {
     /// Queries a numeric constant for a specific control type.
     #[must_use]
     pub fn get_constant(&self, theme_type: &str, item: &str) -> Option<i32> {
-        self.constants
-            .get(&(theme_type.to_string(), item.to_string()))
-            .copied()
+        let key = (theme_type, item);
+        self.constants.get(&key as &dyn ThemeKeyPair).copied()
     }
 
     /// Registers a font size for a specific control type.
@@ -63,9 +115,8 @@ impl Theme {
     /// Queries a font size for a specific control type.
     #[must_use]
     pub fn get_font_size(&self, theme_type: &str, item: &str) -> Option<u32> {
-        self.font_sizes
-            .get(&(theme_type.to_string(), item.to_string()))
-            .copied()
+        let key = (theme_type, item);
+        self.font_sizes.get(&key as &dyn ThemeKeyPair).copied()
     }
 
     /// Registers a stylebox for a specific control type and state.
@@ -77,13 +128,17 @@ impl Theme {
     /// Queries a stylebox for a specific control type and state.
     #[must_use]
     pub fn get_stylebox(&self, theme_type: &str, item: &str) -> Option<&StyleBox> {
-        self.styleboxes
-            .get(&(theme_type.to_string(), item.to_string()))
+        let key = (theme_type, item);
+        self.styleboxes.get(&key as &dyn ThemeKeyPair)
     }
 
     /// Creates a modern dark theme preset with standard controls styled.
     #[must_use]
     pub fn dark() -> Self {
+        default_dark_theme().clone()
+    }
+
+    fn build_dark() -> Self {
         let mut theme = Self {
             default_font_size: 14,
             default_font: "fonts/default.ttf".to_string(),

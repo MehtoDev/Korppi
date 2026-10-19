@@ -154,12 +154,27 @@ impl BiquadFilter {
 
     /// Recalculates filter transfer function coefficients.
     fn recalculate_coefficients(&mut self) {
-        let nyquist = self.sample_rate * 0.5;
-        let clamped_freq = self.frequency.clamp(10.0, nyquist * 0.999);
-        let omega = 2.0 * PI * clamped_freq / self.sample_rate;
+        let sample_rate = if self.sample_rate.is_finite() {
+            self.sample_rate.max(25.0)
+        } else {
+            48_000.0
+        };
+        let nyquist = sample_rate * 0.5;
+        let max_freq = (nyquist * 0.999).max(10.0);
+        let clamped_freq = if self.frequency.is_finite() {
+            self.frequency.clamp(10.0, max_freq)
+        } else {
+            1000.0f32.min(max_freq)
+        };
+        let q = if self.q.is_finite() {
+            self.q.max(0.01)
+        } else {
+            0.707
+        };
+        let omega = 2.0 * PI * clamped_freq / sample_rate;
         let cos_omega = omega.cos();
         let sin_omega = omega.sin();
-        let alpha = sin_omega / (2.0 * self.q);
+        let alpha = sin_omega / (2.0 * q);
         let a_gain = 10.0f32.powf(self.gain_db / 40.0);
 
         let (b0, b1, b2, a0, a1, a2) = match self.filter_type {

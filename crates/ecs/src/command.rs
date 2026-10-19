@@ -96,30 +96,65 @@ impl CommandQueue {
 
     /// Applies every command to `world` in the order they were recorded, then empties the queue
     /// (keeping its storage). Commands recorded by these commands run after them.
+    ///
+    /// If a command panics while being applied, any remaining commands in the queue are dropped
+    /// and any reserved entities that were not yet placed are reclaimed before unwinding continues.
     pub fn apply(&mut self, world: &mut World) {
+        struct ApplyGuard<'a> {
+            base: *mut MaybeUninit<u8>,
+            offset: usize,
+            len: usize,
+            world: &'a mut World,
+        }
+
+        impl Drop for ApplyGuard<'_> {
+            fn drop(&mut self) {
+                while self.offset < self.len {
+                    // SAFETY: `push` wrote a `CommandMeta` at every command boundary.
+                    let meta = unsafe {
+                        self.base
+                            .add(self.offset)
+                            .cast::<CommandMeta>()
+                            .read_unaligned()
+                    };
+                    let command = self.offset + size_of::<CommandMeta>();
+                    self.offset = command + meta.size;
+                    // SAFETY: each remaining command has not been read yet; passing `None` drops it.
+                    unsafe { (meta.run)(self.base.add(command), None) };
+                }
+                self.world.reclaim_unplaced_entities();
+            }
+        }
+
         world.flush_reserved_entities();
-        // Commands may record further commands into the world's own queue; only this queue's
-        // bytes are consumed here. The length drops to zero first, so a panicking command leaks
-        // the rest instead of running or dropping any command twice.
         let len = self.bytes.len();
-        // SAFETY: the bytes stay allocated; they are only read below.
+        // SAFETY: the bytes stay allocated; `guard` reads or drops each command once.
         unsafe { self.bytes.set_len(0) };
-        let base = self.bytes.as_mut_ptr();
-        let mut offset = 0;
-        while offset < len {
+        let mut guard = ApplyGuard {
+            base: self.bytes.as_mut_ptr(),
+            offset: 0,
+            len,
+            world,
+        };
+        while guard.offset < guard.len {
             // SAFETY: `push` wrote a meta at every command boundary, starting at 0.
-            let meta = unsafe { base.add(offset).cast::<CommandMeta>().read_unaligned() };
-            let command = offset + size_of::<CommandMeta>();
-            offset = command + meta.size;
+            let meta = unsafe {
+                guard
+                    .base
+                    .add(guard.offset)
+                    .cast::<CommandMeta>()
+                    .read_unaligned()
+            };
+            let command = guard.offset + size_of::<CommandMeta>();
+            guard.offset = command + meta.size;
             // SAFETY: the command after this meta was written by `push` with this `run` function
             // and is read exactly once, here.
-            unsafe { (meta.run)(base.add(command), Some(world)) };
+            unsafe { (meta.run)(guard.base.add(command), Some(guard.world)) };
         }
     }
-}
 
-impl Drop for CommandQueue {
-    fn drop(&mut self) {
+    /// Drops all pending commands without applying them, keeping the buffer's capacity.
+    pub fn clear(&mut self) {
         let len = self.bytes.len();
         // SAFETY: as in `apply`; each pending command is dropped exactly once.
         unsafe { self.bytes.set_len(0) };
@@ -133,6 +168,12 @@ impl Drop for CommandQueue {
             // SAFETY: as in `apply`; the command is dropped instead of applied.
             unsafe { (meta.run)(base.add(command), None) };
         }
+    }
+}
+
+impl Drop for CommandQueue {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 

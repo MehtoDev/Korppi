@@ -261,6 +261,21 @@ pub struct Transform {
     pub q: Quat,
 }
 
+/// Type alias for [`Transform`].
+pub type Transform3d = Transform;
+
+impl Default for Transform {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl From<(Vec3, Quat)> for Transform {
+    fn from((p, q): (Vec3, Quat)) -> Self {
+        Self { p, q }
+    }
+}
+
 impl Transform {
     /// The identity transform with zero translation and identity rotation.
     pub const IDENTITY: Self = Self {
@@ -269,21 +284,25 @@ impl Transform {
     };
 
     /// Constructs a transform from translation `p` and rotation `q`.
+    #[must_use]
     pub const fn new(p: Vec3, q: Quat) -> Self {
         Self { p, q }
     }
 
     /// Box3D `b3TransformPoint`.
+    #[must_use]
     pub fn apply(&self, v: Vec3) -> Vec3 {
         rotate(self.q, v) + self.p
     }
 
     /// Box3D `b3InvTransformPoint`.
+    #[must_use]
     pub fn apply_inverse(&self, v: Vec3) -> Vec3 {
         inv_rotate(self.q, v - self.p)
     }
 
     /// Box3D `b3InvMulTransforms`: `other` in this transform's frame.
+    #[must_use]
     pub fn inv_mul(&self, other: &Self) -> Self {
         Self::new(
             inv_rotate(self.q, other.p - self.p),
@@ -292,11 +311,13 @@ impl Transform {
     }
 
     /// Box3D `b3MulTransforms`: compound transform `self * other`.
+    #[must_use]
     pub fn mul(&self, other: &Self) -> Self {
         Self::new(self.apply(other.p), self.q * other.q)
     }
 
     /// Box3D `b3InvertTransform`.
+    #[must_use]
     pub fn inverse(&self) -> Self {
         Self::new(inv_rotate(self.q, -self.p), self.q.conjugate())
     }

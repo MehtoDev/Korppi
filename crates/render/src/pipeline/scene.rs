@@ -333,21 +333,61 @@ impl Default for Camera3d {
 }
 
 impl Camera3d {
-    /// Right-handed world-to-view matrix (`-Z` forward).
+    /// Right-handed world-to-view matrix (`-Z` forward, `RND-25`).
     #[inline]
     pub fn view_matrix(&self) -> Mat4 {
-        Mat4::look_at_rh(self.position, self.target, self.up)
+        let pos = if self.position.is_finite() {
+            self.position
+        } else {
+            Vec3::new(0.0, 0.0, 5.0)
+        };
+        let raw_dir = if self.target.is_finite() {
+            self.target - pos
+        } else {
+            Vec3::NEG_Z
+        };
+        let forward = raw_dir.try_normalize().unwrap_or(Vec3::NEG_Z);
+        let raw_up = if self.up.is_finite() {
+            self.up.try_normalize().unwrap_or(Vec3::Y)
+        } else {
+            Vec3::Y
+        };
+        let up = if forward.dot(raw_up).abs() > 0.999 {
+            if forward.y.abs() < 0.9 {
+                Vec3::Y
+            } else {
+                Vec3::Z
+            }
+        } else {
+            raw_up
+        };
+        Mat4::look_at_rh(pos, pos + forward, up)
     }
 
-    /// Right-handed Reverse-Z perspective projection matrix (`near -> 1.0`, `far -> 0.0`).
+    /// Right-handed Reverse-Z perspective projection matrix (`near -> 1.0`, `far -> 0.0`, `RND-25`).
     #[inline]
     pub fn projection_matrix(&self) -> Mat4 {
-        ReverseZ::perspective_rh(
-            self.fov_y_radians,
-            self.aspect_ratio,
-            self.z_near,
-            self.z_far,
-        )
+        let fov = if self.fov_y_radians.is_finite() {
+            self.fov_y_radians.clamp(0.01, 3.10)
+        } else {
+            std::f32::consts::FRAC_PI_3
+        };
+        let aspect = if self.aspect_ratio.is_finite() && self.aspect_ratio > 1e-4 {
+            self.aspect_ratio
+        } else {
+            1.0
+        };
+        let near = if self.z_near.is_finite() && self.z_near > 1e-4 {
+            self.z_near
+        } else {
+            0.1
+        };
+        let far = if self.z_far.is_finite() && self.z_far > near + 1e-3 {
+            self.z_far
+        } else {
+            near + 100.0
+        };
+        ReverseZ::perspective_rh(fov, aspect, near, far)
     }
 }
 

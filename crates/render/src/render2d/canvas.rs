@@ -25,21 +25,34 @@ pub struct CanvasTransform {
     pub viewport_pos: Vec2,
     /// Physical pixel dimensions of the canvas viewport.
     pub viewport_size: Vec2,
-    /// Effective scaling factor.
+    /// Effective uniform scaling factor (`min(scale_xy.x, scale_xy.y)` or average for `Stretch`).
     pub scale: f32,
+    /// Per-axis scaling factors mapping virtual coordinates to physical screen coordinates (`RND-25`).
+    pub scale_xy: Vec2,
 }
 
 impl CanvasTransform {
-    /// Converts a virtual canvas coordinate point into physical window screen space.
+    /// Computes canvas viewport placement and scaling parameters for a target window size.
     #[inline]
-    pub fn virtual_to_screen(&self, virtual_pos: Vec2) -> Vec2 {
-        self.viewport_pos + virtual_pos * self.scale
+    pub fn compute(virtual_size: Vec2, window_size: Vec2, mode: CanvasScaleMode) -> Self {
+        compute_canvas_transform(virtual_size, window_size, mode)
     }
 
-    /// Converts a physical window screen coordinate into virtual canvas space.
+    /// Converts a virtual canvas coordinate point into physical window screen space (`RND-25`).
+    #[inline]
+    pub fn virtual_to_screen(&self, virtual_pos: Vec2) -> Vec2 {
+        self.viewport_pos + virtual_pos * self.scale_xy
+    }
+
+    /// Converts a physical window screen coordinate into virtual canvas space (`RND-25`).
     #[inline]
     pub fn screen_to_virtual(&self, screen_pos: Vec2) -> Vec2 {
-        (screen_pos - self.viewport_pos) / self.scale.max(1e-4)
+        let sx = self.scale_xy.x.max(1e-4);
+        let sy = self.scale_xy.y.max(1e-4);
+        Vec2::new(
+            (screen_pos.x - self.viewport_pos.x) / sx,
+            (screen_pos.y - self.viewport_pos.y) / sy,
+        )
     }
 
     /// Generates an orthographic projection matrix mapping virtual canvas bounds into NDC.
@@ -64,6 +77,7 @@ pub fn compute_canvas_transform(
                 viewport_pos: Vec2::ZERO,
                 viewport_size: window_size,
                 scale: (scale_x + scale_y) * 0.5,
+                scale_xy: Vec2::new(scale_x, scale_y),
             }
         }
         CanvasScaleMode::KeepAspect => {
@@ -80,6 +94,7 @@ pub fn compute_canvas_transform(
                 viewport_pos,
                 viewport_size,
                 scale,
+                scale_xy: Vec2::splat(scale),
             }
         }
         CanvasScaleMode::IntegerRatio => {
@@ -96,6 +111,7 @@ pub fn compute_canvas_transform(
                 viewport_pos,
                 viewport_size,
                 scale,
+                scale_xy: Vec2::splat(scale),
             }
         }
     }

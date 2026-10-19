@@ -1,6 +1,6 @@
 //! Abstract action mapping, chords, and multi-input aggregation.
 
-use crate::gamepad::{GamepadAxis, GamepadButton, GamepadId, GamepadState};
+use crate::gamepad::{GamepadAxis, GamepadButton, GamepadState};
 use crate::keyboard::{KeyCode, KeyboardState};
 use crate::mouse::{MouseButton, MouseState};
 use korppi_math::Vec2;
@@ -93,6 +93,31 @@ impl ActionMap {
         entry.bindings.push(binding);
     }
 
+    /// Alias for [`Self::bind`].
+    pub fn bind_action(&mut self, action_name: impl Into<String>, binding: ActionBinding) {
+        self.bind(action_name, binding);
+    }
+
+    /// Removes a specific binding from `action_name`, returning `true` if a matching binding was removed.
+    pub fn unbind(&mut self, action_name: &str, binding: &ActionBinding) -> bool {
+        let Some(action) = self.actions.get_mut(action_name) else {
+            return false;
+        };
+        let before = action.bindings.len();
+        action.bindings.retain(|b| b != binding);
+        action.bindings.len() != before
+    }
+
+    /// Removes all bindings for `action_name`, returning `true` if the action existed.
+    pub fn clear_action(&mut self, action_name: &str) -> bool {
+        self.actions.remove(action_name).is_some()
+    }
+
+    /// Clears all registered actions and bindings.
+    pub fn clear(&mut self) {
+        self.actions.clear();
+    }
+
     /// Returns `true` if any binding associated with `action_name` is currently active.
     #[must_use]
     pub fn is_active(
@@ -119,8 +144,10 @@ impl ActionMap {
                     }
                 }
                 ActionBinding::GamepadButton(btn) => {
-                    // Check default gamepad 0 or any connected gamepad
-                    if gamepad.is_pressed(GamepadId(0), *btn) {
+                    if gamepad
+                        .connected_ids()
+                        .any(|id| gamepad.is_pressed(id, *btn))
+                    {
                         return true;
                     }
                 }
@@ -152,7 +179,10 @@ impl ActionMap {
                     }
                 }
                 ActionBinding::GamepadAxis { axis, .. } => {
-                    if gamepad.axis(GamepadId(0), *axis).abs() > 0.1 {
+                    if gamepad
+                        .connected_ids()
+                        .any(|id| gamepad.axis(id, *axis).abs() > 0.1)
+                    {
                         return true;
                     }
                 }
@@ -162,7 +192,151 @@ impl ActionMap {
         false
     }
 
-    /// Computes aggregated 1D scalar value for `action_name` (e.g. throttle, steering).
+    /// Returns `true` if any binding associated with `action_name` was just pressed this frame.
+    #[must_use]
+    pub fn is_just_pressed(
+        &self,
+        action_name: &str,
+        keyboard: &KeyboardState,
+        mouse: &MouseState,
+        gamepad: &GamepadState,
+    ) -> bool {
+        let Some(action) = self.actions.get(action_name) else {
+            return false;
+        };
+
+        for binding in &action.bindings {
+            match binding {
+                ActionBinding::Key(key) => {
+                    if keyboard.is_just_pressed(*key) {
+                        return true;
+                    }
+                }
+                ActionBinding::MouseButton(btn) => {
+                    if mouse.is_just_pressed(*btn) {
+                        return true;
+                    }
+                }
+                ActionBinding::GamepadButton(btn) => {
+                    if gamepad
+                        .connected_ids()
+                        .any(|id| gamepad.is_just_pressed(id, *btn))
+                    {
+                        return true;
+                    }
+                }
+                ActionBinding::Chord { modifiers, key } => {
+                    let all_held = modifiers.iter().all(|&m| keyboard.is_pressed(m))
+                        && keyboard.is_pressed(*key);
+                    let any_just = keyboard.is_just_pressed(*key)
+                        || modifiers.iter().any(|&m| keyboard.is_just_pressed(m));
+                    if all_held && any_just {
+                        return true;
+                    }
+                }
+                ActionBinding::Axis1D {
+                    positive, negative, ..
+                } => {
+                    if keyboard.is_just_pressed(*positive) || keyboard.is_just_pressed(*negative) {
+                        return true;
+                    }
+                }
+                ActionBinding::Axis2D {
+                    up,
+                    down,
+                    left,
+                    right,
+                } => {
+                    if keyboard.is_just_pressed(*up)
+                        || keyboard.is_just_pressed(*down)
+                        || keyboard.is_just_pressed(*left)
+                        || keyboard.is_just_pressed(*right)
+                    {
+                        return true;
+                    }
+                }
+                ActionBinding::GamepadAxis { .. } => {}
+            }
+        }
+
+        false
+    }
+
+    /// Returns `true` if any binding associated with `action_name` was just released this frame.
+    #[must_use]
+    pub fn is_just_released(
+        &self,
+        action_name: &str,
+        keyboard: &KeyboardState,
+        mouse: &MouseState,
+        gamepad: &GamepadState,
+    ) -> bool {
+        let Some(action) = self.actions.get(action_name) else {
+            return false;
+        };
+
+        for binding in &action.bindings {
+            match binding {
+                ActionBinding::Key(key) => {
+                    if keyboard.is_just_released(*key) {
+                        return true;
+                    }
+                }
+                ActionBinding::MouseButton(btn) => {
+                    if mouse.is_just_released(*btn) {
+                        return true;
+                    }
+                }
+                ActionBinding::GamepadButton(btn) => {
+                    if gamepad
+                        .connected_ids()
+                        .any(|id| gamepad.is_just_released(id, *btn))
+                    {
+                        return true;
+                    }
+                }
+                ActionBinding::Chord { modifiers, key } => {
+                    let key_was_active =
+                        keyboard.is_pressed(*key) || keyboard.is_just_released(*key);
+                    let mods_were_active = modifiers
+                        .iter()
+                        .all(|&m| keyboard.is_pressed(m) || keyboard.is_just_released(m));
+                    let any_released = keyboard.is_just_released(*key)
+                        || modifiers.iter().any(|&m| keyboard.is_just_released(m));
+                    if key_was_active && mods_were_active && any_released {
+                        return true;
+                    }
+                }
+                ActionBinding::Axis1D {
+                    positive, negative, ..
+                } => {
+                    if keyboard.is_just_released(*positive) || keyboard.is_just_released(*negative)
+                    {
+                        return true;
+                    }
+                }
+                ActionBinding::Axis2D {
+                    up,
+                    down,
+                    left,
+                    right,
+                } => {
+                    if keyboard.is_just_released(*up)
+                        || keyboard.is_just_released(*down)
+                        || keyboard.is_just_released(*left)
+                        || keyboard.is_just_released(*right)
+                    {
+                        return true;
+                    }
+                }
+                ActionBinding::GamepadAxis { .. } => {}
+            }
+        }
+
+        false
+    }
+
+    /// Computes aggregated 1D scalar value for `action_name` (e.g. throttle, steering), clamped to `[-1.0, 1.0]`.
     #[must_use]
     pub fn axis_1d(
         &self,
@@ -175,7 +349,7 @@ impl ActionMap {
             return 0.0;
         };
 
-        let mut val = 0.0;
+        let mut val = 0.0f32;
 
         for binding in &action.bindings {
             match binding {
@@ -184,6 +358,9 @@ impl ActionMap {
                     negative,
                     scale,
                 } => {
+                    if !scale.is_finite() {
+                        continue;
+                    }
                     let mut delta = 0.0;
                     if keyboard.is_pressed(*positive) {
                         delta += 1.0;
@@ -194,16 +371,29 @@ impl ActionMap {
                     val += delta * scale;
                 }
                 ActionBinding::GamepadAxis { axis, scale } => {
-                    val += gamepad.axis(GamepadId(0), *axis) * scale;
+                    if !scale.is_finite() {
+                        continue;
+                    }
+                    for id in gamepad.connected_ids() {
+                        let a = gamepad.axis(id, *axis);
+                        if a.is_finite() {
+                            val += a * scale;
+                        }
+                    }
                 }
                 _ => {}
             }
         }
 
-        val.clamp(-1.0, 1.0)
+        if !val.is_finite() {
+            0.0
+        } else {
+            val.clamp(-1.0, 1.0)
+        }
     }
 
-    /// Computes aggregated 2D directional vector for `action_name` (e.g. movement, look).
+    /// Computes aggregated 2D directional vector for `action_name` (e.g. movement, look),
+    /// clamped to a maximum Euclidean magnitude of `1.0` (`INP-05`).
     #[must_use]
     pub fn axis_2d(
         &self,
@@ -239,20 +429,38 @@ impl ActionMap {
                         dir.x += 1.0;
                     }
                 }
-                ActionBinding::GamepadAxis { axis, scale } => match axis {
-                    GamepadAxis::LeftStickX | GamepadAxis::RightStickX => {
-                        dir.x += gamepad.axis(GamepadId(0), *axis) * scale;
+                ActionBinding::GamepadAxis { axis, scale } => {
+                    if !scale.is_finite() {
+                        continue;
                     }
-                    GamepadAxis::LeftStickY | GamepadAxis::RightStickY => {
-                        dir.y += gamepad.axis(GamepadId(0), *axis) * scale;
+                    for id in gamepad.connected_ids() {
+                        let a = gamepad.axis(id, *axis);
+                        if !a.is_finite() {
+                            continue;
+                        }
+                        match axis {
+                            GamepadAxis::LeftStickX | GamepadAxis::RightStickX => {
+                                dir.x += a * scale;
+                            }
+                            GamepadAxis::LeftStickY | GamepadAxis::RightStickY => {
+                                dir.y += a * scale;
+                            }
+                            _ => {}
+                        }
                     }
-                    _ => {}
-                },
+                }
                 _ => {}
             }
         }
 
-        let _ = mouse; // Available for look/aim bindings
-        dir
+        let _ = mouse;
+        let len_sq = dir.length_squared();
+        if !len_sq.is_finite() {
+            Vec2::ZERO
+        } else if len_sq > 1.0 {
+            dir / len_sq.sqrt()
+        } else {
+            dir
+        }
     }
 }

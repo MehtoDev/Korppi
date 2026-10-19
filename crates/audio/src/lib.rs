@@ -31,9 +31,9 @@ pub use error::{AudioError, AudioResult};
 pub use frame::AudioFrame;
 pub use player::{AudioOcclusion, AudioPlayer, AudioRoom, AudioSource, PlayerState};
 pub use raytrace::{
-    eyring_rt60, fibonacci_sphere_rays, sabine_rt60, AcousticBox, AcousticHit, AcousticMaterial,
-    AcousticRay, AcousticScene, AcousticTriangle, EarlyReflectionHit, EnergyHistogram,
-    PathTraceConfig, RaytracedAcoustics,
+    eyring_rt60, fibonacci_sphere_rays, sabine_rt60, AcousticBox, AcousticGeometry, AcousticHit,
+    AcousticMaterial, AcousticRay, AcousticTriangle, EarlyReflectionHit, EnergyHistogram,
+    PathTracer, ReflectionPath, RoomResponse, RoomWorker, TraceSettings, TraceStatistics,
 };
 pub use ring_buffer::{Consumer, Producer, SpscRingBuffer};
 pub use spatial::{
@@ -43,5 +43,5 @@ pub use spatial::{
 };
 pub use synthesis::{
     householder_diffuse_8, triple_buffer, triple_buffer_with, EarlyReflectionTap, FdnConfig,
-    FeedbackDelayNetwork, TappedDelayLine, TripleBufferConsumer, TripleBufferProducer,
+    FeedbackDelayNetwork, TripleBufferConsumer, TripleBufferProducer,
 };

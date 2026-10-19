@@ -91,7 +91,7 @@ pub struct AllocatedMemoryChunk {
 /// Uses inline `SmallVec` storage so steady-state frame compilation performs zero heap allocations (`RND-11`).
 pub struct TransientMemoryHeapAllocator {
     alignment: u64,
-    chunks: SmallVec<[AllocatedMemoryChunk; 16]>,
+    chunks: SmallVec<[AllocatedMemoryChunk; 32]>,
     total_peak_bytes: u64,
 }
 
@@ -116,7 +116,7 @@ impl TransientMemoryHeapAllocator {
         let aligned_size = (size + self.alignment - 1) & !(self.alignment - 1);
 
         // 1. Gather all candidate offsets inline without heap allocation
-        let mut candidates: SmallVec<[u64; 16]> = SmallVec::new();
+        let mut candidates: SmallVec<[u64; 32]> = SmallVec::new();
         candidates.push(0);
         for c in &self.chunks {
             let cand = (c.offset + c.size + self.alignment - 1) & !(self.alignment - 1);

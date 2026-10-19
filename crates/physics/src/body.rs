@@ -138,6 +138,10 @@ pub struct RigidBody {
     pub sleep_time: f32,
     /// Whether this body is allowed to fall asleep.
     pub enable_sleep: bool,
+    /// Sleep velocity threshold in m/s below which the body rests (Box3D `sleepThreshold`,
+    /// default 0.05).
+    #[serde(default = "default_sleep_threshold")]
+    pub sleep_threshold: f32,
     /// Whether continuous collision also sweeps this body against kinematic and dynamic bodies
     /// that are not bullets, not only static ones (Box3D `isBullet`, off by default).
     #[serde(default)]
@@ -151,10 +155,17 @@ pub struct RigidBody {
     /// collisions, which characters may want to avoid.
     #[serde(default = "default_true")]
     pub enable_contact_recycling: bool,
+    /// Whether the body is in the simulation (`false` puts it in the disabled set; Box3D
+    /// `b3BodyDef::isEnabled`).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 /// Box3D's default continuous collision safety factor.
 pub const CONTINUOUS_SAFETY_FACTOR: f32 = 0.5;
+
+/// Box3D's default sleep velocity threshold, in m/s (`0.05`).
+pub const DEFAULT_SLEEP_THRESHOLD: f32 = 0.05;
 
 fn one() -> f32 {
     1.0
@@ -166,6 +177,10 @@ fn huge() -> f32 {
 
 fn default_safety_factor() -> f32 {
     CONTINUOUS_SAFETY_FACTOR
+}
+
+fn default_sleep_threshold() -> f32 {
+    DEFAULT_SLEEP_THRESHOLD
 }
 
 fn default_true() -> bool {
@@ -199,9 +214,11 @@ impl Default for RigidBody {
             is_sleeping: false,
             sleep_time: 0.0,
             enable_sleep: true,
+            sleep_threshold: DEFAULT_SLEEP_THRESHOLD,
             is_bullet: false,
             safety_factor: CONTINUOUS_SAFETY_FACTOR,
             enable_contact_recycling: true,
+            enabled: true,
         }
     }
 }
@@ -217,6 +234,13 @@ impl RigidBody {
         };
         body.recompute_mass_properties();
         body
+    }
+
+    /// Sets whether the body starts enabled in the simulation (Box3D `b3BodyDef::isEnabled`).
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
     }
 
     /// Sets the position translation.
@@ -251,6 +275,17 @@ impl RigidBody {
     #[must_use]
     pub fn with_enable_sleep(mut self, enable_sleep: bool) -> Self {
         self.enable_sleep = enable_sleep;
+        self
+    }
+
+    /// Sets the sleep velocity threshold in m/s (Box3D `sleepThreshold`).
+    #[must_use]
+    pub fn with_sleep_threshold(mut self, sleep_threshold: f32) -> Self {
+        self.sleep_threshold = if sleep_threshold.is_finite() {
+            sleep_threshold.max(0.0)
+        } else {
+            DEFAULT_SLEEP_THRESHOLD
+        };
         self
     }
 

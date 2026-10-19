@@ -36,11 +36,18 @@ impl ColorPicker {
 
     /// Sets the RGBA color directly.
     pub fn set_rgba(&mut self, rgba: [f32; 4]) {
+        let sanitize = |v: f32| {
+            if v.is_finite() {
+                v.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        };
         self.color = [
-            rgba[0].clamp(0.0, 1.0),
-            rgba[1].clamp(0.0, 1.0),
-            rgba[2].clamp(0.0, 1.0),
-            rgba[3].clamp(0.0, 1.0),
+            sanitize(rgba[0]),
+            sanitize(rgba[1]),
+            sanitize(rgba[2]),
+            sanitize(rgba[3]),
         ];
     }
 
@@ -73,10 +80,23 @@ impl ColorPicker {
 
     /// Sets the color from HSVA `(h in [0, 360], s in [0, 1], v in [0, 1], a in [0, 1])`.
     pub fn set_hsva(&mut self, h: f32, s: f32, v: f32, a: f32) {
-        let h_norm = (h % 360.0 + 360.0) % 360.0;
-        let s_clamped = s.clamp(0.0, 1.0);
-        let v_clamped = v.clamp(0.0, 1.0);
-        let a_clamped = a.clamp(0.0, 1.0);
+        let h_safe = if h.is_finite() { h } else { 0.0 };
+        let h_norm = (h_safe % 360.0 + 360.0) % 360.0;
+        let s_clamped = if s.is_finite() {
+            s.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let v_clamped = if v.is_finite() {
+            v.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let a_clamped = if a.is_finite() {
+            a.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
 
         let c = v_clamped * s_clamped;
         let h_prime = h_norm / 60.0;
@@ -112,6 +132,9 @@ impl ColorPicker {
     /// Parses and sets color from a hex string (e.g. `"#RRGGBB"` or `"#RRGGBBAA"`).
     pub fn set_from_hex(&mut self, hex: &str) -> bool {
         let clean = hex.trim().trim_start_matches('#');
+        if !clean.is_ascii() {
+            return false;
+        }
         if clean.len() == 6 {
             if let (Ok(r), Ok(g), Ok(b)) = (
                 u8::from_str_radix(&clean[0..2], 16),

@@ -23,9 +23,9 @@ struct InputScratch {
 impl InputScratch {
     fn new() -> Self {
         Self {
-            textures: Vec::with_capacity(16),
-            buffers: Vec::with_capacity(16),
-            passes: Vec::with_capacity(16),
+            textures: Vec::with_capacity(32),
+            buffers: Vec::with_capacity(32),
+            passes: Vec::with_capacity(32),
         }
     }
 
@@ -73,8 +73,11 @@ fn return_output_scratch(mut scratch: OutputScratch) {
     });
 }
 
+static NEXT_GRAPH_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
 /// Directed Acyclic Graph (DAG) pass scheduler and frame orchestrator.
 pub struct RenderGraph {
+    graph_id: u32,
     textures: Vec<VirtualTexture>,
     buffers: Vec<VirtualBuffer>,
     passes: Vec<PassNode>,
@@ -100,11 +103,29 @@ impl RenderGraph {
     /// Creates a new empty Render Graph, reusing thread-local vector capacities when available (`RND-11`).
     pub fn new() -> Self {
         let scratch = take_input_scratch();
+        let graph_id = NEXT_GRAPH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
+            graph_id,
             textures: scratch.textures,
             buffers: scratch.buffers,
             passes: scratch.passes,
         }
+    }
+
+    /// Returns the unique ID of this `RenderGraph` instance (`RND-21`).
+    #[inline]
+    pub fn graph_id(&self) -> u32 {
+        self.graph_id
+    }
+
+    /// Returns the `(width, height)` in pixels of a texture registered in this graph (`RND-18`).
+    pub fn texture_dimensions(&self, handle: RenderGraphTextureHandle) -> Option<(u32, u32)> {
+        if handle.graph_id() != self.graph_id {
+            return None;
+        }
+        let vtex = self.textures.get(handle.id() as usize)?;
+        let (w, h, _, _) = vtex.extent_and_subresources();
+        Some((w, h))
     }
 
     /// Registers a transient texture (1 mip level, 1 array layer) to be allocated and managed by the graph.
@@ -130,7 +151,7 @@ impl RenderGraph {
                 array_layers: array_layers.max(1),
             },
         });
-        RenderGraphTextureHandle(id)
+        RenderGraphTextureHandle::new(id, self.graph_id)
     }
 
     /// Imports an existing external physical texture (e.g. swapchain image) into the graph.
@@ -153,7 +174,7 @@ impl RenderGraph {
                 array_layers: 1,
             },
         });
-        RenderGraphTextureHandle(id)
+        RenderGraphTextureHandle::new(id, self.graph_id)
     }
 
     /// Imports an external texture and specifies the final access state/layout to transition it into
@@ -178,7 +199,7 @@ impl RenderGraph {
                 array_layers: 1,
             },
         });
-        RenderGraphTextureHandle(id)
+        RenderGraphTextureHandle::new(id, self.graph_id)
     }
 
     /// Imports an external texture with explicit mip level and array layer counts (`RND-10`).
@@ -205,7 +226,7 @@ impl RenderGraph {
                 array_layers: array_layers.max(1),
             },
         });
-        RenderGraphTextureHandle(id)
+        RenderGraphTextureHandle::new(id, self.graph_id)
     }
 
     /// Registers a transient buffer to be allocated and managed by the graph.
@@ -217,7 +238,7 @@ impl RenderGraph {
         self.buffers.push(VirtualBuffer {
             kind: VirtualBufferKind::Transient(desc),
         });
-        RenderGraphBufferHandle(id)
+        RenderGraphBufferHandle::new(id, self.graph_id)
     }
 
     /// Imports an existing external physical buffer into the graph.
@@ -234,7 +255,7 @@ impl RenderGraph {
                 final_access: None,
             },
         });
-        RenderGraphBufferHandle(id)
+        RenderGraphBufferHandle::new(id, self.graph_id)
     }
 
     /// Imports an external buffer and specifies the final access state to synchronize after the graph (`RND-05`).
@@ -252,7 +273,7 @@ impl RenderGraph {
                 final_access: Some(final_access),
             },
         });
-        RenderGraphBufferHandle(id)
+        RenderGraphBufferHandle::new(id, self.graph_id)
     }
 
     /// Adds a new pass to the graph and returns a fluent builder.
@@ -264,13 +285,31 @@ impl RenderGraph {
         PassBuilder::new(&mut self.passes, name, pass_type)
     }
 
+    /// Clears all virtual resources and passes while preserving internal capacities and advancing `graph_id`.
+    pub fn clear(&mut self) {
+        self.graph_id = NEXT_GRAPH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.textures.clear();
+        self.buffers.clear();
+        self.passes.clear();
+    }
+
+    /// Compiles the render graph in-place without consuming `self`, preserving its backing capacities.
+    pub fn compile_reusable(&mut self) -> Result<CompiledRenderGraph, RenderError> {
+        let out_scratch = take_output_scratch();
+        let compiler = GraphCompiler::new(
+            self.graph_id,
+            &mut self.passes,
+            &self.textures,
+            &self.buffers,
+        );
+        let output = compiler.compile(None, out_scratch)?;
+        Ok(CompiledRenderGraph::from_output(self.graph_id, output))
+    }
+
     /// Compiles the render graph: performs topological sorting, dead-pass culling,
     /// transient memory aliasing, and barrier deduction.
     pub fn compile(mut self) -> Result<CompiledRenderGraph, RenderError> {
-        let out_scratch = take_output_scratch();
-        let compiler = GraphCompiler::new(&mut self.passes, &self.textures, &self.buffers);
-        let output = compiler.compile(None, out_scratch)?;
-        Ok(CompiledRenderGraph::from_output(output))
+        self.compile_reusable()
     }
 
     /// Compiles the render graph with a real graphics device and transient resource pool,
@@ -281,15 +320,21 @@ impl RenderGraph {
         pool: &mut TransientResourcePool,
     ) -> Result<CompiledRenderGraph, RenderError> {
         let out_scratch = take_output_scratch();
-        let compiler = GraphCompiler::new(&mut self.passes, &self.textures, &self.buffers);
+        let compiler = GraphCompiler::new(
+            self.graph_id,
+            &mut self.passes,
+            &self.textures,
+            &self.buffers,
+        );
         let output = compiler.compile(Some((device, pool)), out_scratch)?;
-        Ok(CompiledRenderGraph::from_output(output))
+        Ok(CompiledRenderGraph::from_output(self.graph_id, output))
     }
 }
 
 /// A compiled, fully scheduled render graph ready for execution on a command buffer.
 #[derive(Debug)]
 pub struct CompiledRenderGraph {
+    graph_id: u32,
     passes: Vec<CompiledPass>,
     barrier_pool: Vec<PipelineBarrier>,
     texture_slice: Vec<Option<TextureHandle>>,
@@ -321,8 +366,9 @@ impl Drop for CompiledRenderGraph {
 }
 
 impl CompiledRenderGraph {
-    fn from_output(output: crate::graph::compiler::CompiledGraphOutput) -> Self {
+    fn from_output(graph_id: u32, output: crate::graph::compiler::CompiledGraphOutput) -> Self {
         Self {
+            graph_id,
             passes: output.passes,
             barrier_pool: output.barrier_pool,
             texture_slice: output.texture_slice,
@@ -348,22 +394,44 @@ impl CompiledRenderGraph {
         &self.post_graph_barrier
     }
 
-    /// Resolves a virtual texture handle to its assigned physical handle.
+    /// Attempts to resolve a virtual texture handle to its assigned physical handle (`RND-21`).
+    /// Returns `None` if the resource was dead-pass-culled or originated from a different graph.
     #[inline]
-    pub fn resolve_texture(&self, handle: RenderGraphTextureHandle) -> TextureHandle {
-        if let Some(Some(phys)) = self.texture_slice.get(handle.id() as usize) {
-            return *phys;
+    pub fn try_resolve_texture(&self, handle: RenderGraphTextureHandle) -> Option<TextureHandle> {
+        if handle.graph_id() == self.graph_id {
+            if let Some(Some(phys)) = self.texture_slice.get(handle.id() as usize) {
+                return Some(*phys);
+            }
         }
-        self.texture_map[&handle]
+        self.texture_map.get(&handle).copied()
     }
 
-    /// Resolves a virtual buffer handle to its assigned physical handle.
+    /// Resolves a virtual texture handle to its assigned physical handle, returning an invalid
+    /// handle if `handle` was dead-pass-culled or foreign (`RND-21`).
+    #[inline]
+    pub fn resolve_texture(&self, handle: RenderGraphTextureHandle) -> TextureHandle {
+        self.try_resolve_texture(handle)
+            .unwrap_or_else(|| TextureHandle::new(u32::MAX, 0))
+    }
+
+    /// Attempts to resolve a virtual buffer handle to its assigned physical handle (`RND-21`).
+    /// Returns `None` if the resource was dead-pass-culled or originated from a different graph.
+    #[inline]
+    pub fn try_resolve_buffer(&self, handle: RenderGraphBufferHandle) -> Option<BufferHandle> {
+        if handle.graph_id() == self.graph_id {
+            if let Some(Some(phys)) = self.buffer_slice.get(handle.id() as usize) {
+                return Some(*phys);
+            }
+        }
+        self.buffer_map.get(&handle).copied()
+    }
+
+    /// Resolves a virtual buffer handle to its assigned physical handle, returning an invalid
+    /// handle if `handle` was dead-pass-culled or foreign (`RND-21`).
     #[inline]
     pub fn resolve_buffer(&self, handle: RenderGraphBufferHandle) -> BufferHandle {
-        if let Some(Some(phys)) = self.buffer_slice.get(handle.id() as usize) {
-            return *phys;
-        }
-        self.buffer_map[&handle]
+        self.try_resolve_buffer(handle)
+            .unwrap_or_else(|| BufferHandle::new(u32::MAX, 0))
     }
 
     /// Executes all scheduled passes sequentially on the provided RHI command buffer recorder.
@@ -389,6 +457,7 @@ impl CompiledRenderGraph {
         ) -> Result<(), korppi_rhi::RhiError>,
     {
         let context = PassContext {
+            graph_id: self.graph_id,
             texture_slice: &self.texture_slice,
             buffer_slice: &self.buffer_slice,
             texture_map: &self.texture_map,

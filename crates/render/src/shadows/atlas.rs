@@ -2,7 +2,6 @@
 
 use korppi_math::{Vec2, Vec3};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 
 /// Allocated sub-region (tile) within the 2D shadow atlas texture.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -43,8 +42,8 @@ impl ShadowAtlas {
     pub fn new(size: u32) -> Self {
         Self {
             size,
-            shelves: Vec::new(),
-            free_slots: Vec::new(),
+            shelves: Vec::with_capacity(16),
+            free_slots: Vec::with_capacity(32),
         }
     }
 
@@ -54,9 +53,24 @@ impl ShadowAtlas {
         self.size
     }
 
+    #[inline]
+    fn make_slot(&self, x: u32, y: u32, tile_resolution: u32) -> AtlasSlot {
+        let size_f = self.size as f32;
+        let uv_min = Vec2::new(x as f32 / size_f, y as f32 / size_f);
+        let uv_max = Vec2::new(
+            (x + tile_resolution) as f32 / size_f,
+            (y + tile_resolution) as f32 / size_f,
+        );
+        AtlasSlot {
+            uv_min,
+            uv_max,
+            pixel_rect: [x, y, tile_resolution, tile_resolution],
+        }
+    }
+
     /// Allocates a square shadow tile of the given resolution within the atlas.
     pub fn allocate(&mut self, tile_resolution: u32) -> Option<AtlasSlot> {
-        if tile_resolution > self.size {
+        if tile_resolution == 0 || tile_resolution > self.size {
             return None;
         }
 
@@ -83,52 +97,80 @@ impl ShadowAtlas {
             }
         }
 
-        let (alloc_x, alloc_y) = if let Some(idx) = best_shelf_idx {
+        if let Some(idx) = best_shelf_idx {
             let shelf = &mut self.shelves[idx];
             let x = shelf.current_x;
             let y = shelf.y;
             shelf.current_x += tile_resolution;
-            (x, y)
-        } else {
-            // 2. Open a new shelf at the bottom
-            let next_y = self
-                .shelves
-                .iter()
-                .map(|s| s.y + s.height)
-                .max()
-                .unwrap_or(0);
+            return Some(self.make_slot(x, y, tile_resolution));
+        }
 
-            if next_y + tile_resolution > self.size {
-                return None; // Atlas full
-            }
+        // 2. Open a new shelf at the bottom if vertical space remains
+        let next_y = self
+            .shelves
+            .iter()
+            .map(|s| s.y + s.height)
+            .max()
+            .unwrap_or(0);
 
+        if next_y + tile_resolution <= self.size {
             self.shelves.push(Shelf {
                 y: next_y,
                 height: tile_resolution,
                 current_x: tile_resolution,
             });
+            return Some(self.make_slot(0, next_y, tile_resolution));
+        }
 
-            (0, next_y)
-        };
+        // 3. Quadtree-subdivide the smallest larger free slot that is a power-of-two multiple (`RND-24`)
+        let mut best_free_idx: Option<usize> = None;
+        let mut best_free_size = u32::MAX;
+        for (idx, slot) in self.free_slots.iter().enumerate() {
+            let sz = slot.pixel_rect[2];
+            if sz > tile_resolution
+                && slot.pixel_rect[3] == sz
+                && sz % tile_resolution == 0
+                && (sz / tile_resolution).is_power_of_two()
+                && sz < best_free_size
+            {
+                best_free_size = sz;
+                best_free_idx = Some(idx);
+            }
+        }
 
-        let size_f = self.size as f32;
-        let uv_min = Vec2::new(alloc_x as f32 / size_f, alloc_y as f32 / size_f);
-        let uv_max = Vec2::new(
-            (alloc_x + tile_resolution) as f32 / size_f,
-            (alloc_y + tile_resolution) as f32 / size_f,
-        );
+        if let Some(idx) = best_free_idx {
+            let parent = self.free_slots.swap_remove(idx);
+            let base_x = parent.pixel_rect[0];
+            let base_y = parent.pixel_rect[1];
+            let mut cur_size = parent.pixel_rect[2];
+            while cur_size > tile_resolution {
+                let half = cur_size / 2;
+                let q1 = self.make_slot(base_x + half, base_y, half);
+                let q2 = self.make_slot(base_x, base_y + half, half);
+                let q3 = self.make_slot(base_x + half, base_y + half, half);
+                self.free_slots.push(q3);
+                self.free_slots.push(q2);
+                self.free_slots.push(q1);
+                cur_size = half;
+            }
+            return Some(self.make_slot(base_x, base_y, tile_resolution));
+        }
 
-        Some(AtlasSlot {
-            uv_min,
-            uv_max,
-            pixel_rect: [alloc_x, alloc_y, tile_resolution, tile_resolution],
-        })
+        None
     }
 
-    /// Returns a previously allocated tile slot to the free list so future lights can reuse it (`RND-13`).
+    /// Returns a previously allocated tile slot to the free list so future lights can reuse it (`RND-13`, `RND-24`).
+    ///
+    /// Ignores duplicate deallocations of a slot that is already present in `free_slots`.
     #[inline]
     pub fn deallocate(&mut self, slot: AtlasSlot) {
-        self.free_slots.push(slot);
+        if !self
+            .free_slots
+            .iter()
+            .any(|s| s.pixel_rect == slot.pixel_rect)
+        {
+            self.free_slots.push(slot);
+        }
     }
 
     /// Resets all allocations in the atlas for reuse.
@@ -195,6 +237,7 @@ struct PlanScratchPool {
     static_lights: Option<Vec<(u64, AtlasSlot, Vec<u64>)>>,
     dynamic_lights: Option<Vec<(u64, AtlasSlot, Vec<u64>)>>,
     caster_vecs: Vec<Vec<u64>>,
+    bounds_vecs: Vec<Vec<(u64, Vec3, Vec3)>>,
 }
 
 impl Default for PlanScratchPool {
@@ -204,6 +247,7 @@ impl Default for PlanScratchPool {
             static_lights: None,
             dynamic_lights: None,
             caster_vecs: Vec::with_capacity(128),
+            bounds_vecs: Vec::with_capacity(128),
         }
     }
 }
@@ -231,6 +275,30 @@ fn recycle_caster_vec(mut v: Vec<u64>) {
             let mut pool = cell.borrow_mut();
             if pool.caster_vecs.len() < 128 {
                 pool.caster_vecs.push(v);
+            }
+        });
+    }
+}
+
+fn take_bounds_vec(min_cap: usize) -> Vec<(u64, Vec3, Vec3)> {
+    let mut v = PLAN_SCRATCH
+        .with(|cell| cell.borrow_mut().bounds_vecs.pop())
+        .unwrap_or_default();
+    v.clear();
+    let target = min_cap.max(64);
+    if v.capacity() < target {
+        v.reserve(target - v.capacity());
+    }
+    v
+}
+
+fn recycle_bounds_vec(mut v: Vec<(u64, Vec3, Vec3)>) {
+    if v.capacity() > 0 {
+        v.clear();
+        PLAN_SCRATCH.with(|cell| {
+            let mut pool = cell.borrow_mut();
+            if pool.bounds_vecs.len() < 128 {
+                pool.bounds_vecs.push(v);
             }
         });
     }
@@ -313,17 +381,27 @@ impl Drop for FrameShadowPlan {
 
 /// Two-tier shadow atlas allocator providing static shadow caching and dynamic caster invalidation.
 ///
-/// Uses a `BTreeMap` for deterministic tile iteration order (`RND-13`) and recycles freed tiles
-/// and scratch buffers so steady-state frame preparation performs zero heap allocations (`RND-11`).
+/// Maintains a pre-allocated sorted `(u64, CachedTile)` vector for deterministic tile iteration
+/// order (`RND-13`) and recycles freed tiles and scratch buffers so steady-state frame preparation
+/// and LRU light eviction perform zero heap allocations (`RND-11`, `RND-24`, `RND-26`).
 pub struct CachedShadowAtlas {
     size: u32,
     frame_counter: u64,
     static_atlas: ShadowAtlas,
     dynamic_atlas: ShadowAtlas,
-    cached_tiles: BTreeMap<u64, CachedTile>,
+    cached_tiles: Vec<(u64, CachedTile)>,
     scratch_static_ids: Vec<u64>,
     scratch_static_bounds: Vec<(u64, Vec3, Vec3)>,
     scratch_dynamic_ids: Vec<u64>,
+}
+
+impl Drop for CachedShadowAtlas {
+    fn drop(&mut self) {
+        for (_, tile) in self.cached_tiles.drain(..) {
+            recycle_caster_vec(tile.cached_static_casters);
+            recycle_bounds_vec(tile.cached_static_bounds);
+        }
+    }
 }
 
 impl CachedShadowAtlas {
@@ -334,11 +412,24 @@ impl CachedShadowAtlas {
             frame_counter: 0,
             static_atlas: ShadowAtlas::new(size),
             dynamic_atlas: ShadowAtlas::new(size),
-            cached_tiles: BTreeMap::new(),
+            cached_tiles: Vec::with_capacity(64),
             scratch_static_ids: Vec::with_capacity(64),
             scratch_static_bounds: Vec::with_capacity(64),
             scratch_dynamic_ids: Vec::with_capacity(64),
         }
+    }
+
+    /// Selects a power-of-two shadow tile resolution from a light's world radius (`RND-24`).
+    #[inline]
+    pub fn select_tile_resolution(light_radius: f32, max_atlas_size: u32) -> u32 {
+        let base = if light_radius <= 2.5 {
+            256
+        } else if light_radius <= 25.0 {
+            512
+        } else {
+            1024
+        };
+        base.min(max_atlas_size.max(64))
     }
 
     /// Total atlas dimension in pixels.
@@ -350,15 +441,31 @@ impl CachedShadowAtlas {
     /// Retrieves the cached tile state for a light, if allocated.
     #[inline]
     pub fn get_tile(&self, light_id: u64) -> Option<&CachedTile> {
-        self.cached_tiles.get(&light_id)
+        self.cached_tiles
+            .binary_search_by_key(&light_id, |&(id, _)| id)
+            .ok()
+            .map(|idx| &self.cached_tiles[idx].1)
     }
 
-    /// Removes a light from the atlas and returns its static and dynamic tiles to the free list (`RND-13`).
+    #[inline]
+    fn get_tile_mut(&mut self, light_id: u64) -> Option<&mut CachedTile> {
+        self.cached_tiles
+            .binary_search_by_key(&light_id, |&(id, _)| id)
+            .ok()
+            .map(|idx| &mut self.cached_tiles[idx].1)
+    }
+
+    /// Removes a light from the atlas and returns its static and dynamic tiles to the free list (`RND-13`, `RND-26`).
     pub fn remove_light(&mut self, light_id: u64) -> bool {
-        if let Some(tile) = self.cached_tiles.remove(&light_id) {
+        if let Ok(idx) = self
+            .cached_tiles
+            .binary_search_by_key(&light_id, |&(id, _)| id)
+        {
+            let (_, tile) = self.cached_tiles.remove(idx);
             self.static_atlas.deallocate(tile.static_slot);
             self.dynamic_atlas.deallocate(tile.dynamic_slot);
             recycle_caster_vec(tile.cached_static_casters);
+            recycle_bounds_vec(tile.cached_static_bounds);
             true
         } else {
             false
@@ -369,7 +476,7 @@ impl CachedShadowAtlas {
     fn evict_lru_inactive(&mut self, current_frame: u64, resolution: u32) -> bool {
         let mut victim_id: Option<u64> = None;
         let mut oldest_frame = u64::MAX;
-        for (&id, tile) in &self.cached_tiles {
+        for &(id, ref tile) in &self.cached_tiles {
             if tile.last_active_frame < current_frame
                 && tile.resolution >= resolution
                 && tile.last_active_frame < oldest_frame
@@ -391,15 +498,11 @@ impl CachedShadowAtlas {
         light_id: u64,
         resolution: u32,
     ) -> Result<(), &'static str> {
-        if let Some(existing) = self.cached_tiles.get(&light_id) {
+        if let Some(existing) = self.get_tile(light_id) {
             if existing.resolution == resolution {
                 return Ok(());
             }
-            let old_static = existing.static_slot;
-            let old_dynamic = existing.dynamic_slot;
-            self.static_atlas.deallocate(old_static);
-            self.dynamic_atlas.deallocate(old_dynamic);
-            self.cached_tiles.remove(&light_id);
+            self.remove_light(light_id);
         }
 
         let static_slot = match self.static_atlas.allocate(resolution) {
@@ -417,33 +520,50 @@ impl CachedShadowAtlas {
         let dynamic_slot = match self.dynamic_atlas.allocate(resolution) {
             Some(slot) => slot,
             None => {
-                self.static_atlas.deallocate(static_slot);
-                return Err("Failed to allocate dynamic frame atlas slot");
+                if self.evict_lru_inactive(self.frame_counter, resolution) {
+                    if let Some(slot) = self.dynamic_atlas.allocate(resolution) {
+                        slot
+                    } else {
+                        self.static_atlas.deallocate(static_slot);
+                        return Err("Failed to allocate dynamic frame atlas slot");
+                    }
+                } else {
+                    self.static_atlas.deallocate(static_slot);
+                    return Err("Failed to allocate dynamic frame atlas slot");
+                }
             }
         };
 
-        self.cached_tiles.insert(
+        let tile = CachedTile {
             light_id,
-            CachedTile {
-                light_id,
-                resolution,
-                static_slot,
-                dynamic_slot,
-                is_dirty: true,
-                cached_static_casters: take_caster_vec(0),
-                last_position: None,
-                last_radius: None,
-                cached_static_bounds: Vec::new(),
-                last_active_frame: self.frame_counter,
-            },
-        );
+            resolution,
+            static_slot,
+            dynamic_slot,
+            is_dirty: true,
+            cached_static_casters: take_caster_vec(0),
+            last_position: None,
+            last_radius: None,
+            cached_static_bounds: take_bounds_vec(0),
+            last_active_frame: self.frame_counter,
+        };
+        match self
+            .cached_tiles
+            .binary_search_by_key(&light_id, |&(id, _)| id)
+        {
+            Ok(idx) => {
+                let (_, old) = std::mem::replace(&mut self.cached_tiles[idx], (light_id, tile));
+                recycle_caster_vec(old.cached_static_casters);
+                recycle_bounds_vec(old.cached_static_bounds);
+            }
+            Err(idx) => self.cached_tiles.insert(idx, (light_id, tile)),
+        }
 
         Ok(())
     }
 
     /// Marks a light's cached shadow tile as dirty, forcing static re-rasterization next frame.
     pub fn invalidate_light(&mut self, light_id: u64) {
-        if let Some(tile) = self.cached_tiles.get_mut(&light_id) {
+        if let Some(tile) = self.get_tile_mut(light_id) {
             tile.is_dirty = true;
         }
     }
@@ -455,7 +575,7 @@ impl CachedShadowAtlas {
         caster_aabb_min: Vec3,
         caster_aabb_max: Vec3,
     ) {
-        for tile in self.cached_tiles.values_mut() {
+        for &mut (_, ref mut tile) in &mut self.cached_tiles {
             if tile.cached_static_casters.contains(&caster_id) {
                 tile.is_dirty = true;
                 continue;
@@ -469,7 +589,7 @@ impl CachedShadowAtlas {
     }
 
     /// Prepares shadow rendering for the current frame into a caller-provided `FrameShadowPlan`
-    /// with zero steady-state heap allocations (`RND-11`, `RND-13`).
+    /// with zero steady-state heap allocations (`RND-11`, `RND-13`, `RND-24`, `RND-26`).
     pub fn prepare_frame_into(
         &mut self,
         active_lights: &[(u64, Vec3, f32)],
@@ -496,22 +616,17 @@ impl CachedShadowAtlas {
         // Mark all currently active lights that are already cached with `current_frame`
         // so LRU eviction never evicts a light that is active in the current frame.
         for &(light_id, _, _) in active_lights {
-            if let Some(tile) = self.cached_tiles.get_mut(&light_id) {
+            if let Some(tile) = self.get_tile_mut(light_id) {
                 tile.last_active_frame = current_frame;
             }
         }
 
         // Process all active lights in caller order
         for &(light_id, light_pos, light_radius) in active_lights {
-            if !self.cached_tiles.contains_key(&light_id) {
-                let _ = self.register_or_update_light(light_id, 512);
+            if self.get_tile(light_id).is_none() {
+                let res = Self::select_tile_resolution(light_radius, self.size);
+                let _ = self.register_or_update_light(light_id, res);
             }
-
-            let tile = match self.cached_tiles.get_mut(&light_id) {
-                Some(t) => t,
-                None => continue,
-            };
-            tile.last_active_frame = current_frame;
 
             self.scratch_static_ids.clear();
             self.scratch_static_bounds.clear();
@@ -531,6 +646,16 @@ impl CachedShadowAtlas {
                     }
                 }
             }
+
+            let tile_idx = match self
+                .cached_tiles
+                .binary_search_by_key(&light_id, |&(id, _)| id)
+            {
+                Ok(idx) => idx,
+                Err(_) => continue,
+            };
+            let tile = &mut self.cached_tiles[tile_idx].1;
+            tile.last_active_frame = current_frame;
 
             // Detect light movement/radius change or static caster set/AABB change (`RND-13`)
             let light_moved =

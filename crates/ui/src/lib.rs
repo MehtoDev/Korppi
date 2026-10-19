@@ -23,8 +23,8 @@ pub use input::{
     UiInputDispatcher, UiReceiver,
 };
 pub use layout::{
-    resolve_control_rect, resolve_control_tree, resolve_ui_layout_system, Rect2d, ResolvedRect,
-    SizeFlags,
+    compute_combined_minimum_size, is_effectively_visible, resolve_control_rect,
+    resolve_control_tree, resolve_ui_layout_system, Rect2d, ResolvedRect, SizeFlags,
 };
 pub use render::{add_ui_clear_render_pass, add_ui_render_pass, UiCanvasRenderer, UiDrawCommand};
 pub use theme::{

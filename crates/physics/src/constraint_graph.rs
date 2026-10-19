@@ -90,6 +90,18 @@ impl GraphColor3d {
         self.contact_slots.clear();
         self.contact_pairs.clear();
     }
+
+    fn with_capacity(contact_cap: usize, joint_cap: usize) -> Self {
+        Self {
+            bodies: Vec::with_capacity(8),
+            constraints: Vec::with_capacity(joint_cap),
+            joint_indices: Vec::with_capacity(joint_cap),
+            joint_pairs: Vec::with_capacity(joint_cap),
+            contact_keys: Vec::with_capacity(contact_cap),
+            contact_slots: Vec::with_capacity(contact_cap),
+            contact_pairs: Vec::with_capacity(contact_cap),
+        }
+    }
 }
 
 /// Persistent constraint graph managing independent colors for parallel solving.
@@ -111,7 +123,9 @@ impl ConstraintGraph3d {
     pub fn new(color_count: usize) -> Self {
         assert!(color_count >= 2, "Must have at least 2 graph colors");
         Self {
-            colors: vec![GraphColor3d::default(); color_count],
+            colors: (0..color_count)
+                .map(|_| GraphColor3d::with_capacity(256, 32))
+                .collect(),
             overflow_index: color_count - 1,
         }
     }

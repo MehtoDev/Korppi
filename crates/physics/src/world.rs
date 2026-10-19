@@ -13,9 +13,10 @@ use crate::events::{
     ContactHitEvent3d, JointEvent3d, JointEvents3d, SensorBeginEvent3d, SensorEndEvent3d,
     SensorEvents3d,
 };
-use crate::island::IslandManager3d;
 use crate::joint::Joint;
-use crate::math::{inv_mul_quat, inv_rotate, lerp, modified_cross, nlerp, Transform};
+use crate::math::{
+    delta_quat_to_rotation, inv_mul_quat, inv_rotate, lerp, modified_cross, nlerp, Transform,
+};
 use crate::mesh_contact::{update_mesh_manifolds, MeshPair, MeshScratch};
 use crate::mover::{collide_mover_shape, CapsuleMover, PlaneResult3d};
 use crate::narrowphase::{
@@ -23,7 +24,7 @@ use crate::narrowphase::{
     triangles_of, CollisionBody, ContactManifold, Convex, MAX_MANIFOLD_POINTS,
 };
 use crate::shape::Shape;
-use crate::snapshot::{BodySnapshot3d, WorldSnapshot3d};
+use crate::snapshot::WorldSnapshot3d;
 use crate::solver::{SolverConfig3d, SolverScratch3d};
 use korppi_core::{Handle, IdPool};
 use korppi_math::{Aabb, Mat3, Quat, Ray, Vec3};
@@ -250,17 +251,36 @@ pub struct ShapeCastHit3d {
     pub user_material_id: u64,
 }
 
+const fn all_bits() -> u64 {
+    u64::MAX
+}
+
 /// Definition of an explosive impulse in world space (Box3D `b3ExplosionDef`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ExplosionDef3d {
+    /// Collision category mask bits filtering which colliders are affected (`u64::MAX` by default).
+    #[serde(default = "all_bits")]
+    pub mask_bits: u64,
     /// Center of the explosion in world space.
     pub position: Vec3,
-    /// Radius of the explosion sphere.
+    /// Radius of the unattenuated explosion core sphere.
     pub radius: f32,
-    /// Distance over which the explosion impulse falls off to zero beyond `radius`.
+    /// Distance over which the explosion impulse falls off linearly to zero beyond `radius`.
     pub falloff: f32,
     /// Impulse per unit projected area applied to exposed rigid bodies.
     pub impulse_per_area: f32,
+}
+
+impl Default for ExplosionDef3d {
+    fn default() -> Self {
+        Self {
+            mask_bits: u64::MAX,
+            position: Vec3::ZERO,
+            radius: 1.0,
+            falloff: 0.0,
+            impulse_per_area: 0.0,
+        }
+    }
 }
 
 /// Main 3D physics simulation world.
@@ -307,9 +327,6 @@ pub struct PhysicsWorld {
     pub(crate) joints: Vec<Option<Joint>>,
     #[serde(skip)]
     pub(crate) joint_ids: IdPool<Joint>,
-    /// Island graph manager tracking connected body islands and sleep states.
-    #[serde(skip)]
-    pub island_manager: IslandManager3d,
     /// Solver sets: 0 = static, 1 = disabled, 2 = awake, >= 3 = sleeping islands.
     #[serde(skip)]
     pub(crate) sets: Vec<crate::island::SolverSet3d>,
@@ -388,6 +405,10 @@ pub struct PhysicsWorld {
     #[serde(skip)]
     contact_events: ContactEvents3d,
     #[serde(skip)]
+    pub(crate) pending_end_events: Vec<ContactEndEvent3d>,
+    #[serde(skip)]
+    pub(crate) pending_sensor_end_events: Vec<SensorEndEvent3d>,
+    #[serde(skip)]
     pub(crate) body_events: BodyEvents3d,
     #[serde(skip)]
     joint_events: JointEvents3d,
@@ -416,91 +437,92 @@ impl PhysicsWorld {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            bodies: Vec::with_capacity(64),
+            bodies: Vec::with_capacity(256),
             body_ids: IdPool::new(),
-            colliders: Vec::with_capacity(64),
+            colliders: Vec::with_capacity(256),
             collider_ids: IdPool::new(),
             trees: [DynamicTree::new(), DynamicTree::new(), DynamicTree::new()],
             constraint_graph: crate::constraint_graph::ConstraintGraph3d::new(
                 crate::constraint_graph::GRAPH_COLOR_COUNT,
             ),
-            body_colliders: Vec::with_capacity(64),
+            body_colliders: Vec::with_capacity(256),
             gravity: Vec3::new(0.0, -9.81, 0.0),
             solver_config: SolverConfig3d::default(),
             step_index: 0,
-            contacts: ContactManager3d::with_capacity(64),
+            contacts: ContactManager3d::with_capacity(1024),
             manifolds_cache: std::sync::OnceLock::new(),
             touching_contacts: 0,
             mesh_scratch: MeshScratch::default(),
             recycled_contacts: 0,
-            fast: Vec::with_capacity(64),
+            fast: Vec::with_capacity(256),
             joints: Vec::with_capacity(64),
             joint_ids: IdPool::new(),
-            island_manager: IslandManager3d::new(),
             sets: {
-                let mut sets = Vec::with_capacity(32);
+                let mut sets = Vec::with_capacity(64);
                 sets.push(crate::island::SolverSet3d::with_capacity(
                     crate::island::STATIC_SET,
-                    64,
+                    512,
                 ));
                 sets.push(crate::island::SolverSet3d::with_capacity(
                     crate::island::DISABLED_SET,
-                    64,
+                    512,
                 ));
                 sets.push(crate::island::SolverSet3d::with_capacity(
                     crate::island::AWAKE_SET,
-                    64,
+                    512,
                 ));
-                for id in crate::island::FIRST_SLEEPING_SET..19 {
-                    sets.push(crate::island::SolverSet3d::with_capacity(id, 16));
+                for id in crate::island::FIRST_SLEEPING_SET..35 {
+                    sets.push(crate::island::SolverSet3d::with_capacity(id, 64));
                 }
                 sets
             },
-            free_sets: (crate::island::FIRST_SLEEPING_SET..19).rev().collect(),
-            islands: (0..32)
+            free_sets: (crate::island::FIRST_SLEEPING_SET..35).rev().collect(),
+            islands: (0..256)
                 .map(|_| crate::island::Island3d {
                     set: crate::contact::NULL,
                     local: crate::contact::NULL,
-                    bodies: Vec::with_capacity(16),
-                    contacts: Vec::with_capacity(16),
+                    bodies: Vec::with_capacity(256),
+                    contacts: Vec::with_capacity(512),
                     joints: Vec::with_capacity(16),
                     constraint_remove_count: 0,
                 })
                 .collect(),
-            free_islands: (0..32).rev().collect(),
+            free_islands: (0..256).rev().collect(),
             island_count: 0,
             island_to_split: crate::contact::NULL,
             split_candidate: (crate::contact::NULL, 0.0),
             split_scratch: crate::island::SplitScratch3d::default(),
-            awake_islands: Vec::with_capacity(64),
-            body_links: Vec::with_capacity(64),
+            awake_islands: Vec::with_capacity(256),
+            body_links: Vec::with_capacity(256),
             joint_links: Vec::with_capacity(64),
-            awake_contact_slots: Vec::with_capacity(64),
-            move_buffer: Vec::with_capacity(64),
+            awake_contact_slots: Vec::with_capacity(1024),
+            move_buffer: Vec::with_capacity(256),
             touched_bodies: Vec::with_capacity(64),
-            contact_changes: Vec::with_capacity(64),
-            collide_outcomes: Vec::with_capacity(64),
+            contact_changes: Vec::with_capacity(512),
+            collide_outcomes: Vec::with_capacity(1024),
             executor: None,
             jointed_pairs_dirty: true,
             sensors_dirty: true,
-            pairs_scratch: Vec::with_capacity(128),
-            jointed_pairs: Vec::new(),
-            solver_scratch: SolverScratch3d::default(),
+            pairs_scratch: Vec::with_capacity(1024),
+            jointed_pairs: Vec::with_capacity(64),
+            solver_scratch: SolverScratch3d::with_capacity(256, 1024),
             last_inv_h: 0.0,
             sensor_count: 0,
             hit_event_count: 0,
             sensor_events: SensorEvents3d::default(),
             sensor_overlaps: Vec::with_capacity(64),
-            sensor_scratch: Vec::new(),
-            sensor_candidates: Vec::new(),
-            sensor_hits: Vec::new(),
-            continuous_candidates: Vec::new(),
-            bullets: Vec::new(),
+            sensor_scratch: Vec::with_capacity(64),
+            sensor_candidates: Vec::with_capacity(64),
+            sensor_hits: Vec::with_capacity(64),
+            continuous_candidates: Vec::with_capacity(256),
+            bullets: Vec::with_capacity(64),
             compound_scratch: Vec::with_capacity(32),
-            contact_events: ContactEvents3d::with_capacity(64),
-            body_events: BodyEvents3d::with_capacity(64),
+            contact_events: ContactEvents3d::with_capacity(256),
+            pending_end_events: Vec::with_capacity(64),
+            pending_sensor_end_events: Vec::with_capacity(64),
+            body_events: BodyEvents3d::with_capacity(256),
             joint_events: JointEvents3d::with_capacity(64),
-            was_awake: Vec::with_capacity(64),
+            was_awake: Vec::with_capacity(256),
             friction_callback: crate::material::default_friction_callback,
             restitution_callback: crate::material::default_restitution_callback,
             profile: Profile3d::default(),
@@ -564,6 +586,7 @@ impl PhysicsWorld {
 
     /// Sets whether resting bodies are transitioned to sleep (Box3D `b3World_EnableSleeping`).
     pub fn enable_sleep(&mut self, enable: bool) {
+        self.flush_touched_bodies();
         self.solver_config.enable_sleep = enable;
         if !enable {
             for set_id in crate::island::FIRST_SLEEPING_SET..self.sets.len() as u32 {
@@ -677,21 +700,16 @@ impl PhysicsWorld {
         self.step_index
     }
 
-    /// Returns a reference to the island manager.
-    #[must_use]
-    pub const fn island_manager(&self) -> &IslandManager3d {
-        &self.island_manager
-    }
-
-    /// Returns a mutable reference to the island manager.
-    pub fn island_manager_mut(&mut self) -> &mut IslandManager3d {
-        &mut self.island_manager
-    }
-
     /// Returns a reference to the active constraint graph and color assignments.
     #[must_use]
     pub const fn constraint_graph(&self) -> &crate::constraint_graph::ConstraintGraph3d {
         &self.constraint_graph
+    }
+
+    /// Returns a reference to the persistent contact manager.
+    #[must_use]
+    pub const fn contact_manager(&self) -> &crate::contact::ContactManager3d {
+        &self.contacts
     }
 
     /// Number of awake dynamic/kinematic bodies in `AWAKE_SET`.
@@ -759,12 +777,21 @@ impl PhysicsWorld {
         if !self.body_ids.contains(id) {
             return;
         }
+        self.flush_touched_bodies();
         self.wake_body_slot(id.index());
     }
 
     /// Transitions the specified body and its island to sleep.
     pub fn sleep_body(&mut self, id: impl Into<BodyId3d>) {
         let id: BodyId3d = id.into();
+        if !self.body_ids.contains(id) {
+            return;
+        }
+        self.flush_touched_bodies();
+        self.sleep_body_internal(id);
+    }
+
+    fn sleep_body_internal(&mut self, id: BodyId3d) {
         if !self.body_ids.contains(id) {
             return;
         }
@@ -789,19 +816,32 @@ impl PhysicsWorld {
         let handle = self.body_ids.alloc();
         let slot = handle.index();
         let index = slot as usize;
-        let asleep = body.is_sleeping && body.enable_sleep && self.solver_config.enable_sleep;
+        let enabled = body.enabled;
+        let asleep =
+            enabled && body.is_sleeping && body.enable_sleep && self.solver_config.enable_sleep;
         body.is_sleeping = false;
-        let set = match body.body_type {
-            BodyType::Static => crate::island::STATIC_SET,
-            BodyType::Kinematic | BodyType::Dynamic => {
-                if asleep {
-                    self.alloc_set()
-                } else {
-                    crate::island::AWAKE_SET
+        let set = if !enabled {
+            body.linear_velocity = Vec3::ZERO;
+            body.angular_velocity = Vec3::ZERO;
+            body.force = Vec3::ZERO;
+            body.torque = Vec3::ZERO;
+            crate::island::DISABLED_SET
+        } else {
+            match body.body_type {
+                BodyType::Static => crate::island::STATIC_SET,
+                BodyType::Kinematic | BodyType::Dynamic => {
+                    if asleep {
+                        self.alloc_set()
+                    } else {
+                        crate::island::AWAKE_SET
+                    }
                 }
             }
         };
-        let links = crate::island::BodyLinks3d::default();
+        let links = crate::island::BodyLinks3d {
+            body_type: body.body_type,
+            ..crate::island::BodyLinks3d::default()
+        };
         if index < self.bodies.len() {
             self.bodies[index] = body;
             self.body_colliders[index].clear();
@@ -821,8 +861,6 @@ impl PhysicsWorld {
             b.linear_velocity = Vec3::ZERO;
             b.angular_velocity = Vec3::ZERO;
         }
-        self.island_manager
-            .register_body(slot, self.bodies[index].is_sleeping);
         handle
     }
 
@@ -843,6 +881,7 @@ impl PhysicsWorld {
             "body {} does not exist",
             body.index()
         );
+        self.flush_touched_bodies();
         let body_idx = body.index() as usize;
         if matches!(collider.shape, Shape::Compound(_)) {
             assert!(
@@ -869,8 +908,14 @@ impl PhysicsWorld {
             collider.shape.aabb_margin()
         };
         let fat_aabb = aabb.expand(margin);
-        let proxy_id = self.trees[tree_idx].create_fat_proxy(fat_aabb, handle.index());
-        let proxy = (proxy_id << 2) | (tree_idx as u32);
+        let enabled = self.body_links[body_idx].set != crate::island::DISABLED_SET;
+        let (proxy, moved) = if enabled {
+            let proxy_id = self.trees[tree_idx].create_fat_proxy(fat_aabb, handle.index());
+            self.move_buffer.push(handle.index());
+            ((proxy_id << 2) | (tree_idx as u32), true)
+        } else {
+            (crate::contact::NULL, false)
+        };
         if collider.is_sensor {
             self.sensor_count += 1;
             self.sensors_dirty = true;
@@ -884,9 +929,8 @@ impl PhysicsWorld {
             proxy,
             aabb,
             fat_aabb,
-            moved: true,
+            moved,
         };
-        self.move_buffer.push(handle.index());
         if col_idx < self.colliders.len() {
             self.colliders[col_idx] = Some(slot);
             self.sensor_overlaps[col_idx].clear();
@@ -920,6 +964,7 @@ impl PhysicsWorld {
         let old_center = body.center_of_mass();
         if body.body_type != BodyType::Dynamic {
             body.local_center = Vec3::ZERO;
+            body.recompute_mass_properties();
         } else {
             let masses = || {
                 colliders
@@ -957,6 +1002,21 @@ impl PhysicsWorld {
         body.max_extent = max_extent;
         let new_center = body.center_of_mass();
         body.linear_velocity += body.angular_velocity.cross(new_center - old_center);
+        drop(colliders);
+        self.invalidate_body_contacts(index as u32);
+    }
+
+    /// Invalidates cached relative transforms on contacts touching body slot `body_slot` so
+    /// contact recycling re-evaluates them on the next step.
+    fn invalidate_body_contacts(&mut self, body_slot: u32) {
+        let mut s = self.contacts.body_head(body_slot);
+        while s != crate::contact::NULL {
+            let contact = self.contacts.at_mut(s);
+            let edge = usize::from(contact.body_b == body_slot);
+            let next = contact.edges[edge].next;
+            contact.relative_valid = false;
+            s = next;
+        }
     }
 
     /// Collider `id`.
@@ -1013,6 +1073,15 @@ impl PhysicsWorld {
     /// removes it from its solver set or constraint graph color, removes it from the contact
     /// pool, and wakes both bodies if it was touching outside of `step`.
     pub(crate) fn destroy_contact_slot(&mut self, slot: u32, in_step: bool) {
+        self.destroy_contact_slot_with_wake(slot, in_step, !in_step);
+    }
+
+    pub(crate) fn destroy_contact_slot_with_wake(
+        &mut self,
+        slot: u32,
+        in_step: bool,
+        wake_bodies: bool,
+    ) {
         let Some(contact) = self.contacts.get(slot) else {
             return;
         };
@@ -1026,8 +1095,6 @@ impl PhysicsWorld {
         );
         if touching {
             self.manifolds_cache.take();
-        }
-        if touching && in_step {
             let enable_events = self
                 .colliders
                 .get(col_a as usize)
@@ -1045,12 +1112,17 @@ impl PhysicsWorld {
                     self.body_ids.handle_at(body_a),
                     self.body_ids.handle_at(body_b),
                 ) {
-                    self.contact_events.end.push(ContactEndEvent3d {
+                    let event = ContactEndEvent3d {
                         collider_a: ca,
                         collider_b: cb,
                         body_a: ba,
                         body_b: bb,
-                    });
+                    };
+                    if in_step {
+                        self.contact_events.end.push(event);
+                    } else {
+                        self.pending_end_events.push(event);
+                    }
                 }
             }
         }
@@ -1059,16 +1131,40 @@ impl PhysicsWorld {
         }
         self.remove_contact_from_set(slot);
         self.contacts.remove(slot);
-        if touching && !in_step {
+        if touching && wake_bodies {
             self.wake_body_slot(body_a);
             self.wake_body_slot(body_b);
         }
     }
 
+    /// Destroys all contacts attached to body slot `body_slot` (Box3D `b3DestroyBodyContacts`).
+    fn destroy_body_contacts(&mut self, body_slot: u32, wake_bodies: bool) {
+        let mut s = self.contacts.body_head(body_slot);
+        while s != crate::contact::NULL {
+            let c = self.contacts.at(s);
+            let edge = usize::from(c.body_b == body_slot);
+            let next = c.edges[edge].next;
+            self.destroy_contact_slot_with_wake(s, false, wake_bodies);
+            s = next;
+        }
+    }
+
     /// Creates a joint in the simulation world, returning its ID. Unless the joint allows
     /// its bodies to collide, the contact between them goes at once (Box3D `b3CreateJoint`).
+    ///
+    /// # Panics
+    /// If `body_a == body_b` or if either endpoint body handle does not exist.
     pub fn create_joint(&mut self, joint: Joint) -> JointId3d {
+        self.flush_touched_bodies();
         let (body_a, body_b) = (joint.body_a(), joint.body_b());
+        assert_ne!(
+            body_a, body_b,
+            "create_joint requires two distinct bodies (body_a != body_b)"
+        );
+        assert!(
+            self.body_ids.handle_at(body_a).is_some() && self.body_ids.handle_at(body_b).is_some(),
+            "create_joint requires live endpoint bodies ({body_a}, {body_b})"
+        );
         if !joint.collide_connected() {
             self.jointed_pairs_dirty = true;
             // Every contact between the bodies' colliders.
@@ -1100,7 +1196,9 @@ impl PhysicsWorld {
         let set_b = self.body_links[body_b as usize].set;
         let set = if set_a == crate::island::DISABLED_SET || set_b == crate::island::DISABLED_SET {
             crate::island::DISABLED_SET
-        } else if set_a == crate::island::STATIC_SET && set_b == crate::island::STATIC_SET {
+        } else if self.bodies[body_a as usize].body_type != BodyType::Dynamic
+            && self.bodies[body_b as usize].body_type != BodyType::Dynamic
+        {
             crate::island::STATIC_SET
         } else {
             crate::island::AWAKE_SET
@@ -1122,6 +1220,7 @@ impl PhysicsWorld {
         if !self.body_ids.contains(id) {
             return false;
         }
+        self.flush_touched_bodies();
         let body_slot = id.index();
         let body_idx = body_slot as usize;
 
@@ -1142,14 +1241,7 @@ impl PhysicsWorld {
         }
 
         // 2. Destroy attached contacts
-        let mut s = self.contacts.body_head(body_slot);
-        while s != crate::contact::NULL {
-            let c = self.contacts.at(s);
-            let edge = usize::from(c.body_b == body_slot);
-            let next = c.edges[edge].next;
-            self.destroy_contact_slot(s, false);
-            s = next;
-        }
+        self.destroy_body_contacts(body_slot, true);
 
         // 3. Destroy attached colliders without updating body mass
         let colliders: Vec<ColliderId3d> = self
@@ -1176,6 +1268,7 @@ impl PhysicsWorld {
     /// Detaches and destroys a collider, waking touching bodies and updating the owning body's mass.
     /// Returns `false` if `id` is stale.
     pub fn destroy_collider(&mut self, id: ColliderId3d) -> bool {
+        self.flush_touched_bodies();
         self.destroy_collider_internal(id, true)
     }
 
@@ -1184,29 +1277,15 @@ impl PhysicsWorld {
             return false;
         }
         let slot_idx = id.index() as usize;
-        let slot = self.colliders[slot_idx]
-            .take()
-            .expect("collider slot exists");
-        let body_id = slot.body;
+        let body_id = self.colliders[slot_idx]
+            .as_ref()
+            .expect("collider slot exists")
+            .body;
         let body_idx = body_id.index() as usize;
 
-        // Remove broadphase proxy
-        let tree_idx = (slot.proxy & 3) as usize;
-        let proxy_id = slot.proxy >> 2;
-        self.trees[tree_idx].destroy_proxy(proxy_id);
-        if slot.collider.is_sensor {
-            self.sensor_count = self.sensor_count.saturating_sub(1);
-            self.sensors_dirty = true;
-        }
-        if slot.collider.enable_hit_events {
-            self.hit_event_count = self.hit_event_count.saturating_sub(1);
-        }
-
-        // Destroy contacts on this collider and wake touching bodies
+        // Destroy contacts on this collider while the collider slot is still present so
+        // `destroy_contact_slot` can inspect `enable_contact_events`.
         let cid = id.index();
-        if slot.moved {
-            self.move_buffer.retain(|&c| c != cid);
-        }
         let body_slot = body_id.index();
         let mut s = self.contacts.body_head(body_slot);
         while s != crate::contact::NULL {
@@ -1219,12 +1298,46 @@ impl PhysicsWorld {
             s = next;
         }
 
-        // Clean up sensor overlaps
-        if slot_idx < self.sensor_overlaps.len() {
-            self.sensor_overlaps[slot_idx].clear();
+        let slot = self.colliders[slot_idx]
+            .take()
+            .expect("collider slot exists");
+
+        // Remove broadphase proxy if present
+        if slot.proxy != crate::contact::NULL {
+            let tree_idx = (slot.proxy & 3) as usize;
+            let proxy_id = slot.proxy >> 2;
+            self.trees[tree_idx].destroy_proxy(proxy_id);
         }
-        for overlaps in &mut self.sensor_overlaps {
-            overlaps.retain(|&c| c != id);
+        if slot.collider.is_sensor {
+            self.sensor_count = self.sensor_count.saturating_sub(1);
+            self.sensors_dirty = true;
+        }
+        if slot.collider.enable_hit_events {
+            self.hit_event_count = self.hit_event_count.saturating_sub(1);
+        }
+        if slot.moved {
+            self.move_buffer.retain(|&c| c != cid);
+        }
+
+        // Clean up sensor overlaps and queue SensorEndEvent3d for any active overlaps
+        if slot_idx < self.sensor_overlaps.len() {
+            for visitor in self.sensor_overlaps[slot_idx].drain(..) {
+                self.pending_sensor_end_events.push(SensorEndEvent3d {
+                    sensor: id,
+                    visitor,
+                });
+            }
+        }
+        for (sensor_idx, overlaps) in self.sensor_overlaps.iter_mut().enumerate() {
+            if let Ok(pos) = overlaps.binary_search(&id) {
+                overlaps.remove(pos);
+                if let Some(sensor) = self.collider_ids.handle_at(sensor_idx as u32) {
+                    self.pending_sensor_end_events.push(SensorEndEvent3d {
+                        sensor,
+                        visitor: id,
+                    });
+                }
+            }
         }
 
         // Remove from body colliders list
@@ -1236,7 +1349,7 @@ impl PhysicsWorld {
         self.collider_ids.free(id);
 
         if update_mass && self.body_ids.contains(body_id) {
-            self.wake_body(body_id);
+            self.wake_body_slot(body_slot);
             self.update_body_mass(body_idx);
         }
 
@@ -1249,6 +1362,7 @@ impl PhysicsWorld {
         if !self.joint_ids.contains(id) {
             return None;
         }
+        self.flush_touched_bodies();
         let slot = id.index();
         let slot_idx = slot as usize;
         let (body_a, body_b, collide_connected) = {
@@ -1272,18 +1386,496 @@ impl PhysicsWorld {
     }
 
     fn queue_body_colliders_for_move(&mut self, body_slot: u32) {
+        if self
+            .body_links
+            .get(body_slot as usize)
+            .is_none_or(|l| l.set == crate::island::DISABLED_SET)
+        {
+            return;
+        }
         let Some(colliders) = self.body_colliders.get(body_slot as usize) else {
             return;
         };
         for &cid_handle in colliders {
             let cid = cid_handle.index();
             if let Some(Some(slot)) = self.colliders.get_mut(cid as usize) {
-                if !slot.moved {
+                if slot.proxy != crate::contact::NULL && !slot.moved {
                     slot.moved = true;
                     self.move_buffer.push(cid);
                 }
             }
         }
+    }
+
+    /// Returns the live joint slot indices attached to body slot `slot`, in slot order.
+    fn attached_joints(&self, slot: u32) -> Vec<u32> {
+        self.joint_ids
+            .iter()
+            .filter_map(|jid| {
+                let idx = jid.index();
+                let j = self.joints.get(idx as usize)?.as_ref()?;
+                (j.body_a() == slot || j.body_b() == slot).then_some(idx)
+            })
+            .collect()
+    }
+
+    /// Creates broadphase proxies for all colliders attached to `body_slot` and queues them in
+    /// `move_buffer` for pair discovery.
+    fn create_body_proxies(&mut self, body_slot: u32) {
+        let Some(body) = self.bodies.get(body_slot as usize) else {
+            return;
+        };
+        let (body_pos, body_rot, body_type) = (body.position, body.rotation, body.body_type);
+        let tree_idx = body_type.tree_index();
+        let Some(colliders) = self.body_colliders.get(body_slot as usize) else {
+            return;
+        };
+        for &cid_handle in colliders {
+            let cid = cid_handle.index();
+            let Some(Some(slot)) = self.colliders.get_mut(cid as usize) else {
+                continue;
+            };
+            if slot.proxy != crate::contact::NULL {
+                let old_tree = (slot.proxy & 3) as usize;
+                let old_proxy = slot.proxy >> 2;
+                self.trees[old_tree].destroy_proxy(old_proxy);
+            }
+            let (pos, rot) = slot.collider.world_pose(body_pos, body_rot);
+            let aabb = slot
+                .collider
+                .shape
+                .compute_aabb(pos, rot)
+                .expand(SPECULATIVE_DISTANCE);
+            let margin = if body_type == BodyType::Static {
+                SPECULATIVE_DISTANCE
+            } else {
+                slot.collider.shape.aabb_margin()
+            };
+            let fat_aabb = aabb.expand(margin);
+            let proxy_id = self.trees[tree_idx].create_fat_proxy(fat_aabb, cid);
+            slot.proxy = (proxy_id << 2) | (tree_idx as u32);
+            slot.aabb = aabb;
+            slot.fat_aabb = fat_aabb;
+            if !slot.moved {
+                slot.moved = true;
+                self.move_buffer.push(cid);
+            }
+            if slot.collider.is_sensor {
+                self.sensors_dirty = true;
+            }
+        }
+        if self.sensor_count > 0 {
+            self.sensors_dirty = true;
+        }
+    }
+
+    /// Destroys broadphase proxies for all colliders attached to `body_slot`.
+    fn destroy_body_proxies(&mut self, body_slot: u32) {
+        let Some(colliders) = self.body_colliders.get(body_slot as usize) else {
+            return;
+        };
+        for &cid_handle in colliders {
+            let cid = cid_handle.index();
+            let Some(Some(slot)) = self.colliders.get_mut(cid as usize) else {
+                continue;
+            };
+            if slot.proxy != crate::contact::NULL {
+                let tree_idx = (slot.proxy & 3) as usize;
+                let proxy_id = slot.proxy >> 2;
+                self.trees[tree_idx].destroy_proxy(proxy_id);
+                slot.proxy = crate::contact::NULL;
+            }
+            if slot.moved {
+                slot.moved = false;
+                self.move_buffer.retain(|&c| c != cid);
+            }
+        }
+        if self.sensor_count > 0 {
+            self.sensors_dirty = true;
+        }
+    }
+
+    /// Returns whether body `id` is currently enabled in the simulation (Box3D `b3Body_IsEnabled`).
+    #[must_use]
+    pub fn is_body_enabled(&self, id: impl Into<BodyId3d>) -> bool {
+        let id: BodyId3d = id.into();
+        if !self.body_ids.contains(id) {
+            return false;
+        }
+        let slot = id.index() as usize;
+        if self.body_links.get(slot).is_some_and(|l| l.touched) {
+            return self.bodies.get(slot).is_some_and(|b| b.enabled);
+        }
+        self.body_links
+            .get(slot)
+            .is_some_and(|l| l.set != crate::island::DISABLED_SET)
+    }
+
+    /// Takes a body out of the simulation (Box3D `b3Body_Disable`): its contacts are destroyed,
+    /// waking the bodies it touched, its broadphase proxies are removed, it leaves its island,
+    /// and its joints wait in `DISABLED_SET`. Returns `false` if `id` is stale.
+    pub fn disable_body(&mut self, id: impl Into<BodyId3d>) -> bool {
+        let id: BodyId3d = id.into();
+        if !self.body_ids.contains(id) {
+            return false;
+        }
+        self.flush_touched_bodies();
+        self.disable_body_internal(id)
+    }
+
+    fn disable_body_internal(&mut self, id: BodyId3d) -> bool {
+        if !self.body_ids.contains(id) {
+            return false;
+        }
+        let slot = id.index();
+        let idx = slot as usize;
+        if self.body_links[idx].set == crate::island::DISABLED_SET {
+            self.bodies[idx].enabled = false;
+            return true;
+        }
+        self.destroy_body_contacts(slot, true);
+        for joint in self.attached_joints(slot) {
+            if self.joint_links[joint as usize].set == crate::island::DISABLED_SET {
+                continue;
+            }
+            self.unlink_joint(joint);
+            self.transfer_joint(joint, crate::island::DISABLED_SET);
+        }
+        self.destroy_body_proxies(slot);
+        self.remove_body_from_island(slot);
+        self.transfer_body(slot, crate::island::DISABLED_SET);
+        let body = &mut self.bodies[idx];
+        body.enabled = false;
+        body.is_sleeping = false;
+        body.sleep_time = 0.0;
+        body.linear_velocity = Vec3::ZERO;
+        body.angular_velocity = Vec3::ZERO;
+        body.force = Vec3::ZERO;
+        body.torque = Vec3::ZERO;
+        true
+    }
+
+    /// Returns a disabled body to the simulation (Box3D `b3Body_Enable`), awake and at rest, with
+    /// its broadphase proxies, an island and its joints; a sleeping body jointed to it wakes.
+    /// Returns `false` if `id` is stale.
+    pub fn enable_body(&mut self, id: impl Into<BodyId3d>) -> bool {
+        let id: BodyId3d = id.into();
+        if !self.body_ids.contains(id) {
+            return false;
+        }
+        self.flush_touched_bodies();
+        self.enable_body_internal(id)
+    }
+
+    fn enable_body_internal(&mut self, id: BodyId3d) -> bool {
+        if !self.body_ids.contains(id) {
+            return false;
+        }
+        let slot = id.index();
+        let idx = slot as usize;
+        if self.body_links[idx].set != crate::island::DISABLED_SET {
+            self.bodies[idx].enabled = true;
+            return true;
+        }
+        let body = &mut self.bodies[idx];
+        body.enabled = true;
+        body.is_sleeping = false;
+        body.sleep_time = 0.0;
+        let set = if body.body_type == BodyType::Static {
+            crate::island::STATIC_SET
+        } else {
+            crate::island::AWAKE_SET
+        };
+        self.transfer_body(slot, set);
+        self.create_body_proxies(slot);
+        if set != crate::island::STATIC_SET {
+            self.create_island_for_body(set, slot);
+        }
+        for joint in self.attached_joints(slot) {
+            let Some(j) = self.joints[joint as usize].as_ref() else {
+                continue;
+            };
+            let (a, b) = (j.body_a(), j.body_b());
+            let (set_a, set_b) = (
+                self.body_links[a as usize].set,
+                self.body_links[b as usize].set,
+            );
+            if set_a == crate::island::DISABLED_SET || set_b == crate::island::DISABLED_SET {
+                continue;
+            }
+            let joint_set = if self.bodies[a as usize].body_type != BodyType::Dynamic
+                && self.bodies[b as usize].body_type != BodyType::Dynamic
+            {
+                crate::island::STATIC_SET
+            } else if set_a == crate::island::STATIC_SET {
+                set_b
+            } else {
+                set_a
+            };
+            self.transfer_joint(joint, joint_set);
+            if joint_set != crate::island::STATIC_SET {
+                self.link_joint(joint);
+            }
+        }
+        true
+    }
+
+    /// Changes a body's mobility type (Box3D `b3Body_SetType`): destroys its contacts, wakes it
+    /// and its jointed bodies, moves it between `STATIC_SET` and `AWAKE_SET`, creates or removes
+    /// its island, recreates its broadphase proxies in the new type's tree, relinks its joints,
+    /// and recomputes its mass properties. Returns `false` if `id` is stale or if a non-static
+    /// type is requested on a body holding a `Compound` or `HeightField` collider.
+    pub fn set_body_type(&mut self, id: impl Into<BodyId3d>, body_type: BodyType) -> bool {
+        let id: BodyId3d = id.into();
+        if !self.body_ids.contains(id) {
+            return false;
+        }
+        self.flush_touched_bodies();
+        self.set_body_type_internal(id, body_type)
+    }
+
+    fn set_body_type_internal(&mut self, id: BodyId3d, body_type: BodyType) -> bool {
+        if !self.body_ids.contains(id) {
+            return false;
+        }
+        let slot = id.index();
+        let idx = slot as usize;
+        let old_type = self.body_links[idx].body_type;
+        if old_type == body_type {
+            self.bodies[idx].body_type = body_type;
+            return true;
+        }
+        if body_type != BodyType::Static {
+            let has_unsupported_shape = self.body_colliders[idx].iter().any(|&cid| {
+                self.colliders
+                    .get(cid.index() as usize)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|s| {
+                        matches!(s.collider.shape, Shape::Compound(_) | Shape::HeightField(_))
+                    })
+            });
+            if has_unsupported_shape {
+                self.bodies[idx].body_type = old_type;
+                return false;
+            }
+        }
+        self.body_links[idx].body_type = body_type;
+        if self.body_links[idx].set == crate::island::DISABLED_SET {
+            self.bodies[idx].body_type = body_type;
+            if self.body_colliders[idx].is_empty() {
+                if body_type != BodyType::Dynamic {
+                    self.bodies[idx].local_center = Vec3::ZERO;
+                }
+                self.bodies[idx].recompute_mass_properties();
+            } else {
+                self.update_body_mass(idx);
+            }
+            return true;
+        }
+        self.destroy_body_contacts(slot, false);
+        self.wake_body_slot(slot);
+        let attached = self.attached_joints(slot);
+        for &joint in &attached {
+            if self.joint_links[joint as usize].set == crate::island::DISABLED_SET {
+                continue;
+            }
+            if let Some(j) = self.joints[joint as usize].as_ref() {
+                let (a, b) = (j.body_a(), j.body_b());
+                self.wake_body_slot(a);
+                self.wake_body_slot(b);
+            }
+            self.unlink_joint(joint);
+            self.transfer_joint(joint, crate::island::STATIC_SET);
+        }
+
+        let body = &mut self.bodies[idx];
+        body.body_type = body_type;
+        if old_type == BodyType::Static || body_type == BodyType::Static {
+            body.linear_velocity = Vec3::ZERO;
+            body.angular_velocity = Vec3::ZERO;
+            body.force = Vec3::ZERO;
+            body.torque = Vec3::ZERO;
+            body.is_sleeping = false;
+            body.sleep_time = 0.0;
+        }
+        let target = if body_type == BodyType::Static {
+            crate::island::STATIC_SET
+        } else {
+            crate::island::AWAKE_SET
+        };
+        self.transfer_body(slot, target);
+        if old_type == BodyType::Static {
+            self.create_island_for_body(crate::island::AWAKE_SET, slot);
+        } else if body_type == BodyType::Static {
+            self.remove_body_from_island(slot);
+        }
+        for &joint in &attached {
+            if self.joint_links[joint as usize].set == crate::island::DISABLED_SET {
+                continue;
+            }
+            if let Some(j) = self.joints[joint as usize].as_ref() {
+                let (a, b) = (j.body_a(), j.body_b());
+                if self.bodies[a as usize].body_type == BodyType::Dynamic
+                    || self.bodies[b as usize].body_type == BodyType::Dynamic
+                {
+                    self.transfer_joint(joint, crate::island::AWAKE_SET);
+                }
+            }
+        }
+        self.destroy_body_proxies(slot);
+        self.create_body_proxies(slot);
+        for &joint in &attached {
+            let Some(j) = self.joints[joint as usize].as_ref() else {
+                continue;
+            };
+            let (a, b) = (j.body_a(), j.body_b());
+            let other = if a == slot { b } else { a };
+            if self.body_links[other as usize].set == crate::island::DISABLED_SET
+                || (self.bodies[idx].body_type != BodyType::Dynamic
+                    && self.bodies[other as usize].body_type != BodyType::Dynamic)
+            {
+                continue;
+            }
+            self.link_joint(joint);
+        }
+        if self.body_colliders[idx].is_empty() {
+            if body_type != BodyType::Dynamic {
+                self.bodies[idx].local_center = Vec3::ZERO;
+            }
+            self.bodies[idx].recompute_mass_properties();
+        } else {
+            self.update_body_mass(idx);
+        }
+        true
+    }
+
+    /// Sets a body's linear and angular velocities so that it reaches `target` after `time_step`
+    /// seconds (Box3D `b3Body_SetTargetTransform`), primarily for moving kinematic bodies. A
+    /// sleeping body is left alone unless `wake` is `true` and the motion exceeds its sleep
+    /// threshold. Returns `false` for a stale handle, a static or disabled body, or a
+    /// non-positive/non-finite `time_step`.
+    pub fn set_target_transform(
+        &mut self,
+        id: impl Into<BodyId3d>,
+        target: impl Into<Transform>,
+        time_step: f32,
+        wake: bool,
+    ) -> bool {
+        if !(time_step > 0.0 && time_step.is_finite()) {
+            return false;
+        }
+        let id: BodyId3d = id.into();
+        if !self.body_ids.contains(id) {
+            return false;
+        }
+        let target: Transform = target.into();
+        if !target.p.x.is_finite()
+            || !target.p.y.is_finite()
+            || !target.p.z.is_finite()
+            || !target.q.x.is_finite()
+            || !target.q.y.is_finite()
+            || !target.q.z.is_finite()
+            || !target.q.w.is_finite()
+        {
+            return false;
+        }
+        self.flush_touched_bodies();
+        let slot = id.index();
+        let idx = slot as usize;
+        let set = self.body_links[idx].set;
+        if set == crate::island::DISABLED_SET {
+            return false;
+        }
+        let body = &self.bodies[idx];
+        if body.body_type == BodyType::Static {
+            return false;
+        }
+        if set != crate::island::AWAKE_SET && !wake {
+            return false;
+        }
+        let inv_time_step = 1.0 / time_step;
+        let center1 = body.center_of_mass();
+        let center2 = target.apply(body.local_center);
+        let linear_velocity = (center2 - center1) * inv_time_step;
+        let angular_velocity = delta_quat_to_rotation(body.rotation, target.q) * inv_time_step;
+        if set != crate::island::AWAKE_SET {
+            let max_velocity =
+                linear_velocity.length() + (angular_velocity * body.max_extent).length();
+            if max_velocity < body.sleep_threshold {
+                return false;
+            }
+            self.wake_body_slot(slot);
+        }
+        let body = &mut self.bodies[idx];
+        body.linear_velocity = linear_velocity;
+        body.angular_velocity = angular_velocity;
+        true
+    }
+
+    /// Reconciles any bodies handed out by [`Self::body_mut`] since the last flush.
+    pub(crate) fn flush_touched_bodies(&mut self) {
+        if self.touched_bodies.is_empty() {
+            return;
+        }
+        let mut touched = std::mem::take(&mut self.touched_bodies);
+        for &slot in &touched {
+            if (slot as usize) < self.bodies.len() {
+                self.body_links[slot as usize].touched = false;
+                if self.body_ids.handle_at(slot).is_some() {
+                    self.body_touched(slot);
+                    if self.body_links[slot as usize].set != crate::island::AWAKE_SET {
+                        let b = &mut self.bodies[slot as usize];
+                        b.force = Vec3::ZERO;
+                        b.torque = Vec3::ZERO;
+                    }
+                }
+            }
+        }
+        touched.clear();
+        self.touched_bodies = touched;
+    }
+
+    fn body_touched(&mut self, slot: u32) {
+        let idx = slot as usize;
+        let Some(id) = self.body_ids.handle_at(slot) else {
+            return;
+        };
+        let want_enabled = self.bodies[idx].enabled;
+        let is_disabled = self.body_links[idx].set == crate::island::DISABLED_SET;
+        if !want_enabled && !is_disabled {
+            self.disable_body_internal(id);
+        } else if want_enabled && is_disabled {
+            self.enable_body_internal(id);
+        }
+
+        let new_type = self.bodies[idx].body_type;
+        let old_type = self.body_links[idx].body_type;
+        if new_type != old_type {
+            let (user_mass, user_inertia) = (self.bodies[idx].mass, self.bodies[idx].local_inertia);
+            self.bodies[idx].body_type = old_type;
+            self.set_body_type_internal(id, new_type);
+            if new_type == BodyType::Dynamic && self.body_colliders[idx].is_empty() {
+                self.bodies[idx].mass = user_mass;
+                self.bodies[idx].local_inertia = user_inertia;
+                self.bodies[idx].recompute_mass_properties();
+            }
+        } else {
+            self.bodies[idx].recompute_mass_properties();
+        }
+
+        self.refresh_body_proxies(slot);
+        self.invalidate_body_contacts(slot);
+
+        if self.bodies[idx].is_sleeping
+            && self.body_links[idx].set == crate::island::AWAKE_SET
+            && self.solver_config.enable_sleep
+            && self.bodies[idx].enable_sleep
+        {
+            self.sleep_body_internal(id);
+        }
+        self.bodies[idx].is_sleeping =
+            self.body_links[idx].set >= crate::island::FIRST_SLEEPING_SET;
+        self.bodies[idx].enabled = self.body_links[idx].set != crate::island::DISABLED_SET;
     }
 
     /// Returns a reference to the joint at `id`.
@@ -1302,6 +1894,7 @@ impl PhysicsWorld {
         if !self.joint_ids.contains(id) {
             return None;
         }
+        self.flush_touched_bodies();
         let idx = id.index() as usize;
         if let Some(Some(j)) = self.joints.get(idx) {
             let (ba, bb) = (j.body_a(), j.body_b());
@@ -1419,10 +2012,12 @@ impl PhysicsWorld {
         if !self.body_ids.contains(id) {
             return;
         }
+        self.flush_touched_bodies();
         let slot = id.index();
         self.wake_body_slot(slot);
         self.bodies[slot as usize].position = position;
         self.refresh_body_proxies(slot);
+        self.invalidate_body_contacts(slot);
     }
 
     /// Sets the rotation of body `id`, waking its island and updating its broadphase proxies if it
@@ -1432,10 +2027,31 @@ impl PhysicsWorld {
         if !self.body_ids.contains(id) {
             return;
         }
+        self.flush_touched_bodies();
         let slot = id.index();
         self.wake_body_slot(slot);
         self.bodies[slot as usize].rotation = rotation;
         self.refresh_body_proxies(slot);
+        self.invalidate_body_contacts(slot);
+    }
+
+    /// Sets the sleep velocity threshold of body `id` in m/s (Box3D `b3Body_SetSleepThreshold`).
+    pub fn set_sleep_threshold(&mut self, id: impl Into<BodyId3d>, threshold: f32) -> bool {
+        let id: BodyId3d = id.into();
+        if !self.body_ids.contains(id) || !threshold.is_finite() || threshold < 0.0 {
+            return false;
+        }
+        self.bodies[id.index() as usize].sleep_threshold = threshold;
+        true
+    }
+
+    /// Returns the sleep velocity threshold of body `id` in m/s (Box3D `b3Body_GetSleepThreshold`).
+    #[must_use]
+    pub fn sleep_threshold(&self, id: impl Into<BodyId3d>) -> Option<f32> {
+        let id: BodyId3d = id.into();
+        self.body_ids
+            .contains(id)
+            .then(|| self.bodies[id.index() as usize].sleep_threshold)
     }
 
     /// Returns the total number of contact points across all active manifolds.
@@ -1474,6 +2090,9 @@ impl PhysicsWorld {
     #[must_use]
     pub fn sensor_overlaps(&self, sensor: impl Into<ColliderId3d>) -> &[ColliderId3d] {
         let sensor: ColliderId3d = sensor.into();
+        if !self.collider_ids.contains(sensor) {
+            return &[];
+        }
         self.sensor_overlaps
             .get(sensor.index() as usize)
             .map_or(&[], Vec::as_slice)
@@ -1502,10 +2121,12 @@ impl PhysicsWorld {
         &self,
         body_id: impl Into<BodyId3d>,
     ) -> impl Iterator<Item = &Contact3d> + '_ {
-        let bid = body_id.into().index();
-        self.contacts
-            .iter()
-            .filter(move |c| (c.body_a == bid || c.body_b == bid) && c.is_touching)
+        let body_id: BodyId3d = body_id.into();
+        let body = self.body_ids.contains(body_id).then_some(body_id.index());
+        body.into_iter()
+            .flat_map(move |bid| self.contacts.body_contact_slots(bid))
+            .map(|slot| self.contacts.at(slot))
+            .filter(|c| c.is_touching)
     }
 
     /// Touching contacts touching collider `collider_id` (Box3D `b3Shape_GetContactData`).
@@ -1513,10 +2134,223 @@ impl PhysicsWorld {
         &self,
         collider_id: impl Into<ColliderId3d>,
     ) -> impl Iterator<Item = &Contact3d> + '_ {
-        let cid = collider_id.into().index();
-        self.contacts
-            .iter()
-            .filter(move |c| (c.collider_a == cid || c.collider_b == cid) && c.is_touching)
+        let collider_id: ColliderId3d = collider_id.into();
+        let slot = self
+            .collider_ids
+            .contains(collider_id)
+            .then_some(collider_id.index());
+        let body = slot.and_then(|cid| {
+            self.colliders
+                .get(cid as usize)
+                .and_then(Option::as_ref)
+                .map(|s| s.body.index())
+        });
+        body.into_iter()
+            .flat_map(move |bid| self.contacts.body_contact_slots(bid))
+            .map(|s| self.contacts.at(s))
+            .filter(move |c| {
+                c.is_touching && (Some(c.collider_a) == slot || Some(c.collider_b) == slot)
+            })
+    }
+
+    /// Queries all broadphase trees for collider indices whose fat AABB overlaps `aabb`,
+    /// evaluating un-flushed [`Self::touched_bodies`] at their current pose rather than their
+    /// stale tree leaf.
+    fn query_trees(&self, aabb: &Aabb, mut callback: impl FnMut(u32) -> bool) {
+        let has_touched = !self.touched_bodies.is_empty();
+        for (tree_idx, tree) in self.trees.iter().enumerate() {
+            let mut go_on = true;
+            tree.query(aabb, |collider_idx| {
+                if has_touched {
+                    if let Some(Some(slot)) = self.colliders.get(collider_idx as usize) {
+                        if self.body_links[slot.body.index() as usize].touched {
+                            return true;
+                        }
+                    }
+                }
+                go_on = callback(collider_idx);
+                go_on
+            });
+            if !go_on {
+                return;
+            }
+            if has_touched {
+                for &body_slot in &self.touched_bodies {
+                    if self.body_ids.handle_at(body_slot).is_none() {
+                        continue;
+                    }
+                    let body = &self.bodies[body_slot as usize];
+                    if !body.enabled || body.body_type.tree_index() != tree_idx {
+                        continue;
+                    }
+                    for &cid in &self.body_colliders[body_slot as usize] {
+                        let Some(Some(slot)) = self.colliders.get(cid.index() as usize) else {
+                            continue;
+                        };
+                        let margin = if body.body_type == BodyType::Static {
+                            SPECULATIVE_DISTANCE
+                        } else {
+                            slot.collider.shape.aabb_margin()
+                        };
+                        let fat = slot.bounds(body).expand(SPECULATIVE_DISTANCE + margin);
+                        if fat.intersects(aabb) && !callback(cid.index()) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ray-casts all broadphase trees, evaluating un-flushed [`Self::touched_bodies`] at their
+    /// current pose rather than their stale tree leaf.
+    fn ray_cast_trees(
+        &self,
+        ray: &Ray,
+        max_distance: f32,
+        mut callback: impl FnMut(u32, f32) -> f32,
+    ) {
+        let has_touched = !self.touched_bodies.is_empty();
+        let mut current_max = max_distance;
+        for (tree_idx, tree) in self.trees.iter().enumerate() {
+            tree.ray_cast(ray, current_max, |collider_idx, hit_dist| {
+                if has_touched {
+                    if let Some(Some(slot)) = self.colliders.get(collider_idx as usize) {
+                        if self.body_links[slot.body.index() as usize].touched {
+                            return current_max;
+                        }
+                    }
+                }
+                let next_max = callback(collider_idx, hit_dist);
+                if (0.0..=current_max).contains(&next_max) {
+                    current_max = next_max;
+                }
+                current_max
+            });
+            if current_max == 0.0 {
+                break;
+            }
+            if has_touched {
+                for &body_slot in &self.touched_bodies {
+                    if self.body_ids.handle_at(body_slot).is_none() {
+                        continue;
+                    }
+                    let body = &self.bodies[body_slot as usize];
+                    if !body.enabled || body.body_type.tree_index() != tree_idx {
+                        continue;
+                    }
+                    for &cid in &self.body_colliders[body_slot as usize] {
+                        let Some(Some(slot)) = self.colliders.get(cid.index() as usize) else {
+                            continue;
+                        };
+                        let margin = if body.body_type == BodyType::Static {
+                            SPECULATIVE_DISTANCE
+                        } else {
+                            slot.collider.shape.aabb_margin()
+                        };
+                        let fat = slot.bounds(body).expand(SPECULATIVE_DISTANCE + margin);
+                        if let Some(t) = fat.intersect_ray(ray, 0.0, current_max) {
+                            if t <= current_max {
+                                let next_max = callback(cid.index(), t);
+                                if next_max == 0.0 {
+                                    return;
+                                }
+                                if (0.0..=current_max).contains(&next_max) {
+                                    current_max = next_max;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Box-casts all broadphase trees, evaluating un-flushed [`Self::touched_bodies`] at their
+    /// current pose rather than their stale tree leaf.
+    fn box_cast_trees(
+        &self,
+        origin_aabb: &Aabb,
+        translation: Vec3,
+        mut callback: impl FnMut(u32, f32) -> f32,
+    ) {
+        let has_touched = !self.touched_bodies.is_empty();
+        let mut max_fraction = 1.0f32;
+        let p1 = origin_aabb.center();
+        let extension = origin_aabb.half_extents();
+        let d = translation;
+        let abs_d = d.abs();
+        let total = |fraction: f32| {
+            let t = translation * fraction;
+            Aabb {
+                min: origin_aabb.min.min(origin_aabb.min + t),
+                max: origin_aabb.max.max(origin_aabb.max + t),
+            }
+        };
+        for (tree_idx, tree) in self.trees.iter().enumerate() {
+            tree.box_cast(
+                origin_aabb,
+                translation,
+                max_fraction,
+                |collider_idx, current_max| {
+                    if has_touched {
+                        if let Some(Some(slot)) = self.colliders.get(collider_idx as usize) {
+                            if self.body_links[slot.body.index() as usize].touched {
+                                return current_max;
+                            }
+                        }
+                    }
+                    let ret = callback(collider_idx, current_max);
+                    if (0.0..=1.0).contains(&ret) {
+                        max_fraction = ret;
+                    }
+                    ret
+                },
+            );
+            if max_fraction == 0.0 {
+                break;
+            }
+            if has_touched {
+                for &body_slot in &self.touched_bodies {
+                    if self.body_ids.handle_at(body_slot).is_none() {
+                        continue;
+                    }
+                    let body = &self.bodies[body_slot as usize];
+                    if !body.enabled || body.body_type.tree_index() != tree_idx {
+                        continue;
+                    }
+                    for &cid in &self.body_colliders[body_slot as usize] {
+                        let Some(Some(slot)) = self.colliders.get(cid.index() as usize) else {
+                            continue;
+                        };
+                        let margin = if body.body_type == BodyType::Static {
+                            SPECULATIVE_DISTANCE
+                        } else {
+                            slot.collider.shape.aabb_margin()
+                        };
+                        let fat = slot.bounds(body).expand(SPECULATIVE_DISTANCE + margin);
+                        let swept = total(max_fraction);
+                        if swept.intersects(&fat)
+                            && crate::bvh::test_bounds_ray_overlap(
+                                fat.min - extension,
+                                fat.max + extension,
+                                p1,
+                                d,
+                                abs_d,
+                            )
+                        {
+                            let ret = callback(cid.index(), max_fraction);
+                            if ret == 0.0 {
+                                return;
+                            }
+                            if ret > 0.0 && ret < max_fraction {
+                                max_fraction = ret;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Performs a ray-cast against all bodies in the physics world, returning the closest hit.
@@ -1537,54 +2371,52 @@ impl PhysicsWorld {
         let mut closest_hit: Option<RayHit3d> = None;
         let mut current_max = max_distance;
 
-        for tree in &self.trees {
-            tree.ray_cast(ray, current_max, |collider_id, _| {
-                let Some(Some(slot)) = self.colliders.get(collider_id as usize) else {
-                    return current_max;
-                };
-                if !slot.collider.filter.should_query(filter) {
-                    return current_max;
-                }
-                let (position, rotation) = slot.pose(&self.bodies[slot.body.index() as usize]);
-                let local_ray = Ray::new(
-                    rotation.conjugate() * (ray.origin - position),
-                    rotation.conjugate() * ray.direction,
-                );
-                if let Some((dist, local_normal, tri_or_child)) = slot
-                    .collider
-                    .shape
-                    .ray_cast_detailed(&local_ray, current_max)
-                {
-                    if dist < current_max {
-                        current_max = dist;
-                        let user_mat_id = if !slot.collider.materials.is_empty() {
-                            let mat_idx = match &slot.collider.shape {
-                                Shape::TriangleMesh(m) => m.material_index(tri_or_child) as usize,
-                                Shape::HeightField(hf) => hf.material_index(tri_or_child) as usize,
-                                _ => 0,
-                            };
-                            slot.collider
-                                .materials
-                                .get(mat_idx)
-                                .map(|m| m.user_material_id)
-                                .unwrap_or(slot.collider.user_material_id)
-                        } else {
-                            slot.collider.user_material_id
+        self.ray_cast_trees(ray, max_distance, |collider_id, _| {
+            let Some(Some(slot)) = self.colliders.get(collider_id as usize) else {
+                return current_max;
+            };
+            if !slot.collider.filter.should_query(filter) {
+                return current_max;
+            }
+            let (position, rotation) = slot.pose(&self.bodies[slot.body.index() as usize]);
+            let local_ray = Ray::new(
+                rotation.conjugate() * (ray.origin - position),
+                rotation.conjugate() * ray.direction,
+            );
+            if let Some((dist, local_normal, tri_or_child)) = slot
+                .collider
+                .shape
+                .ray_cast_detailed(&local_ray, current_max)
+            {
+                if dist < current_max {
+                    current_max = dist;
+                    let user_mat_id = if !slot.collider.materials.is_empty() {
+                        let mat_idx = match &slot.collider.shape {
+                            Shape::TriangleMesh(m) => m.material_index(tri_or_child) as usize,
+                            Shape::HeightField(hf) => hf.material_index(tri_or_child) as usize,
+                            _ => 0,
                         };
-                        let cid = self.collider_ids.handle_at(collider_id).unwrap();
-                        closest_hit = Some(RayHit3d {
-                            body_id: slot.body,
-                            collider_id: cid,
-                            point: ray.point_at(dist),
-                            normal: (rotation * local_normal).normalize(),
-                            fraction: dist,
-                            user_material_id: user_mat_id,
-                        });
-                    }
+                        slot.collider
+                            .materials
+                            .get(mat_idx)
+                            .map(|m| m.user_material_id)
+                            .unwrap_or(slot.collider.user_material_id)
+                    } else {
+                        slot.collider.user_material_id
+                    };
+                    let cid = self.collider_ids.handle_at(collider_id).unwrap();
+                    closest_hit = Some(RayHit3d {
+                        body_id: slot.body,
+                        collider_id: cid,
+                        point: ray.point_at(dist),
+                        normal: (rotation * local_normal).normalize(),
+                        fraction: dist,
+                        user_material_id: user_mat_id,
+                    });
                 }
-                current_max
-            });
-        }
+            }
+            current_max
+        });
 
         closest_hit
     }
@@ -1601,20 +2433,18 @@ impl PhysicsWorld {
     #[must_use]
     pub fn query_aabb_filtered(&self, aabb: &Aabb, filter: &QueryFilter3d) -> Vec<BodyId3d> {
         let mut hits = Vec::new();
-        for tree in &self.trees {
-            tree.query(aabb, |collider_id| {
-                if let Some(Some(slot)) = self.colliders.get(collider_id as usize) {
-                    if slot.collider.filter.should_query(filter)
-                        && slot
-                            .bounds(&self.bodies[slot.body.index() as usize])
-                            .intersects(aabb)
-                    {
-                        hits.push(slot.body);
-                    }
+        self.query_trees(aabb, |collider_id| {
+            if let Some(Some(slot)) = self.colliders.get(collider_id as usize) {
+                if slot.collider.filter.should_query(filter)
+                    && slot
+                        .bounds(&self.bodies[slot.body.index() as usize])
+                        .intersects(aabb)
+                {
+                    hits.push(slot.body);
                 }
-                true
-            });
-        }
+            }
+            true
+        });
         // A body with several colliders is listed once.
         hits.sort_unstable();
         hits.dedup();
@@ -1656,64 +2486,59 @@ impl PhysicsWorld {
         let ray = Ray::new(origin, direction);
         let mut max_fraction = 1.0f32;
 
-        for tree in &self.trees {
-            tree.ray_cast(&ray, length * max_fraction, |collider_idx, _| {
-                let Some(Some(slot)) = self.colliders.get(collider_idx as usize) else {
-                    return length * max_fraction;
-                };
-                if !slot.collider.filter.should_query(filter) {
-                    return length * max_fraction;
-                }
+        self.ray_cast_trees(&ray, length, |collider_idx, _| {
+            let Some(Some(slot)) = self.colliders.get(collider_idx as usize) else {
+                return length * max_fraction;
+            };
+            if !slot.collider.filter.should_query(filter) {
+                return length * max_fraction;
+            }
 
-                let (position, rotation) = slot.pose(&self.bodies[slot.body.index() as usize]);
-                let local_ray = Ray::new(
-                    rotation.conjugate() * (ray.origin - position),
-                    rotation.conjugate() * ray.direction,
-                );
+            let (position, rotation) = slot.pose(&self.bodies[slot.body.index() as usize]);
+            let local_ray = Ray::new(
+                rotation.conjugate() * (ray.origin - position),
+                rotation.conjugate() * ray.direction,
+            );
 
-                if let Some((dist, local_normal, tri_or_child)) = slot
-                    .collider
-                    .shape
-                    .ray_cast_detailed(&local_ray, length * max_fraction)
-                {
-                    let fraction = dist / length;
-                    if fraction <= max_fraction {
-                        let user_mat_id = if !slot.collider.materials.is_empty() {
-                            let mat_idx = match &slot.collider.shape {
-                                Shape::TriangleMesh(m) => m.material_index(tri_or_child) as usize,
-                                Shape::HeightField(hf) => hf.material_index(tri_or_child) as usize,
-                                _ => 0,
-                            };
-                            slot.collider
-                                .materials
-                                .get(mat_idx)
-                                .map(|m| m.user_material_id)
-                                .unwrap_or(slot.collider.user_material_id)
-                        } else {
-                            slot.collider.user_material_id
+            if let Some((dist, local_normal, tri_or_child)) = slot
+                .collider
+                .shape
+                .ray_cast_detailed(&local_ray, length * max_fraction)
+            {
+                let fraction = dist / length;
+                if fraction <= max_fraction {
+                    let user_mat_id = if !slot.collider.materials.is_empty() {
+                        let mat_idx = match &slot.collider.shape {
+                            Shape::TriangleMesh(m) => m.material_index(tri_or_child) as usize,
+                            Shape::HeightField(hf) => hf.material_index(tri_or_child) as usize,
+                            _ => 0,
                         };
-                        let cid = self.collider_ids.handle_at(collider_idx).unwrap();
-                        let hit = RayHit3d {
-                            body_id: slot.body,
-                            collider_id: cid,
-                            point: origin + translation * fraction,
-                            normal: (rotation * local_normal).normalize(),
-                            fraction,
-                            user_material_id: user_mat_id,
-                        };
-                        let ret = callback(&hit);
-                        if (0.0..=1.0).contains(&ret) {
-                            max_fraction = ret;
-                        }
+                        slot.collider
+                            .materials
+                            .get(mat_idx)
+                            .map(|m| m.user_material_id)
+                            .unwrap_or(slot.collider.user_material_id)
+                    } else {
+                        slot.collider.user_material_id
+                    };
+                    let cid = self.collider_ids.handle_at(collider_idx).unwrap();
+                    let hit = RayHit3d {
+                        body_id: slot.body,
+                        collider_id: cid,
+                        point: origin + translation * fraction,
+                        normal: (rotation * local_normal).normalize(),
+                        fraction,
+                        user_material_id: user_mat_id,
+                    };
+                    let ret = callback(&hit);
+                    if (0.0..=1.0).contains(&ret) {
+                        max_fraction = ret;
                     }
                 }
-
-                length * max_fraction
-            });
-            if max_fraction == 0.0 {
-                break;
             }
-        }
+
+            length * max_fraction
+        });
     }
 
     /// Casts a convex shape proxy along `translation`, returning the closest hit (Box3D `b3World_CastShapeClosest`).
@@ -1756,60 +2581,42 @@ impl PhysicsWorld {
             max = max.max(pt + r);
         }
         let origin_aabb = Aabb { min, max };
-        let mut max_fraction = 1.0f32;
 
-        for tree in &self.trees {
-            tree.box_cast(
-                &origin_aabb,
-                translation,
-                max_fraction,
-                |collider_idx, current_max| {
-                    let Some(Some(slot)) = self.colliders.get(collider_idx as usize) else {
-                        return current_max;
-                    };
-                    if !slot.collider.filter.should_query(filter) {
-                        return current_max;
-                    }
-
-                    let (position, rotation) = slot.pose(&self.bodies[slot.body.index() as usize]);
-                    let shape_transform = Transform::new(position, rotation);
-
-                    if let Some(cast_out) = shape_cast_shape(
-                        &slot.collider.shape,
-                        &shape_transform,
-                        proxy,
-                        translation,
-                        current_max,
-                    ) {
-                        if cast_out.hit
-                            && cast_out.fraction <= current_max
-                            && cast_out.fraction > 0.0
-                        {
-                            let cid = self.collider_ids.handle_at(collider_idx).unwrap();
-                            let hit_info = ShapeCastHit3d {
-                                body_id: slot.body,
-                                collider_id: cid,
-                                point: cast_out.point,
-                                normal: cast_out.normal,
-                                fraction: cast_out.fraction,
-                                iterations: cast_out.iterations,
-                                user_material_id: slot.collider.user_material_id,
-                            };
-                            let ret = callback(&hit_info);
-                            if (0.0..=1.0).contains(&ret) {
-                                max_fraction = ret;
-                            }
-                            return ret;
-                        }
-                    }
-
-                    current_max
-                },
-            );
-            if max_fraction == 0.0 {
-                break;
+        self.box_cast_trees(&origin_aabb, translation, |collider_idx, current_max| {
+            let Some(Some(slot)) = self.colliders.get(collider_idx as usize) else {
+                return current_max;
+            };
+            if !slot.collider.filter.should_query(filter) {
+                return current_max;
             }
-        }
+
+            let (position, rotation) = slot.pose(&self.bodies[slot.body.index() as usize]);
+            let shape_transform = Transform::new(position, rotation);
+
+            if let Some(cast_out) = shape_cast_shape(
+                &slot.collider.shape,
+                &shape_transform,
+                proxy,
+                translation,
+                current_max,
+            ) {
+                if cast_out.hit && cast_out.fraction <= current_max && cast_out.fraction > 0.0 {
+                    let cid = self.collider_ids.handle_at(collider_idx).unwrap();
+                    let hit_info = ShapeCastHit3d {
+                        body_id: slot.body,
+                        collider_id: cid,
+                        point: cast_out.point,
+                        normal: cast_out.normal,
+                        fraction: cast_out.fraction,
+                        iterations: cast_out.iterations,
+                        user_material_id: slot.collider.user_material_id,
+                    };
+                    return callback(&hit_info);
+                }
+            }
+
+            current_max
+        });
     }
 
     /// Queries the physics world for all colliders overlapping `aabb`, invoking `callback` for each (Box3D `b3World_OverlapAABB`).
@@ -1819,28 +2626,21 @@ impl PhysicsWorld {
         filter: &QueryFilter3d,
         mut callback: impl FnMut(ColliderId3d) -> bool,
     ) {
-        let mut stopped = false;
-        for tree in &self.trees {
-            tree.query(aabb, |collider_idx| {
-                if let Some(Some(slot)) = self.colliders.get(collider_idx as usize) {
-                    if slot.collider.filter.should_query(filter) {
-                        let body = &self.bodies[slot.body.index() as usize];
-                        if slot.bounds(body).intersects(aabb) {
-                            if let Some(cid) = self.collider_ids.handle_at(collider_idx) {
-                                if !callback(cid) {
-                                    stopped = true;
-                                    return false;
-                                }
+        self.query_trees(aabb, |collider_idx| {
+            if let Some(Some(slot)) = self.colliders.get(collider_idx as usize) {
+                if slot.collider.filter.should_query(filter) {
+                    let body = &self.bodies[slot.body.index() as usize];
+                    if slot.bounds(body).intersects(aabb) {
+                        if let Some(cid) = self.collider_ids.handle_at(collider_idx) {
+                            if !callback(cid) {
+                                return false;
                             }
                         }
                     }
                 }
-                true
-            });
-            if stopped {
-                break;
             }
-        }
+            true
+        });
     }
 
     /// Queries the physics world for all colliders overlapping `proxy` placed at `transform` (Box3D `b3World_OverlapShape`).
@@ -1860,35 +2660,28 @@ impl PhysicsWorld {
         }
         let proxy_aabb = Aabb { min, max };
 
-        let mut stopped = false;
-        for tree in &self.trees {
-            tree.query(&proxy_aabb, |collider_idx| {
-                if let Some(Some(slot)) = self.colliders.get(collider_idx as usize) {
-                    if slot.collider.filter.should_query(filter) {
-                        let body = &self.bodies[slot.body.index() as usize];
-                        let (pos, rot) = slot.pose(body);
-                        let shape_transform = Transform::new(pos, rot);
-                        if shape_overlaps_proxy(
-                            &slot.collider.shape,
-                            &shape_transform,
-                            proxy,
-                            transform,
-                        ) {
-                            if let Some(cid) = self.collider_ids.handle_at(collider_idx) {
-                                if !callback(cid) {
-                                    stopped = true;
-                                    return false;
-                                }
+        self.query_trees(&proxy_aabb, |collider_idx| {
+            if let Some(Some(slot)) = self.colliders.get(collider_idx as usize) {
+                if slot.collider.filter.should_query(filter) {
+                    let body = &self.bodies[slot.body.index() as usize];
+                    let (pos, rot) = slot.pose(body);
+                    let shape_transform = Transform::new(pos, rot);
+                    if shape_overlaps_proxy(
+                        &slot.collider.shape,
+                        &shape_transform,
+                        proxy,
+                        transform,
+                    ) {
+                        if let Some(cid) = self.collider_ids.handle_at(collider_idx) {
+                            if !callback(cid) {
+                                return false;
                             }
                         }
                     }
                 }
-                true
-            });
-            if stopped {
-                break;
             }
-        }
+            true
+        });
     }
 
     /// Sweeps a capsule mover along `translation`, returning the fraction in `[0.0, 1.0]` at which it collides (Box3D `b3World_CastMover`).
@@ -1922,183 +2715,176 @@ impl PhysicsWorld {
         mut callback: impl FnMut(ColliderId3d, &PlaneResult3d) -> bool,
     ) {
         let mover_aabb = mover.compute_aabb();
-        let mut stopped = false;
-        for tree in &self.trees {
-            tree.query(&mover_aabb, |collider_idx| {
-                let Some(Some(slot)) = self.colliders.get(collider_idx as usize) else {
-                    return true;
-                };
-                if !slot.collider.filter.should_query(filter) {
-                    return true;
-                }
-
-                let (position, rotation) = slot.pose(&self.bodies[slot.body.index() as usize]);
-                let shape_transform = Transform::new(position, rotation);
-                let cid = self.collider_ids.handle_at(collider_idx).unwrap();
-
-                let keep_going = collide_mover_shape(
-                    &slot.collider.shape,
-                    &shape_transform,
-                    mover,
-                    |plane_res| callback(cid, &plane_res),
-                );
-                if !keep_going {
-                    stopped = true;
-                    return false;
-                }
-                true
-            });
-            if stopped {
-                break;
+        self.query_trees(&mover_aabb, |collider_idx| {
+            let Some(Some(slot)) = self.colliders.get(collider_idx as usize) else {
+                return true;
+            };
+            if !slot.collider.filter.should_query(filter) {
+                return true;
             }
-        }
+
+            let (position, rotation) = slot.pose(&self.bodies[slot.body.index() as usize]);
+            let shape_transform = Transform::new(position, rotation);
+            let cid = self.collider_ids.handle_at(collider_idx).unwrap();
+
+            collide_mover_shape(&slot.collider.shape, &shape_transform, mover, |plane_res| {
+                callback(cid, &plane_res)
+            })
+        });
     }
 
     /// Applies an explosive radial impulse to dynamic bodies within blast radius (Box3D `b3World_Explode`).
     pub fn explode(&mut self, explosion: &ExplosionDef3d) {
+        self.flush_touched_bodies();
         let max_range = explosion.radius + explosion.falloff;
         let blast_aabb = Aabb {
             min: explosion.position - Vec3::splat(max_range),
             max: explosion.position + Vec3::splat(max_range),
         };
 
-        for body_idx in 0..self.bodies.len() {
-            if self.body_ids.handle_at(body_idx as u32).is_none() {
+        let mut hits = std::mem::take(&mut self.continuous_candidates);
+        hits.clear();
+        self.trees[DYNAMIC_TREE].query(&blast_aabb, |slot| {
+            hits.push(slot);
+            true
+        });
+        hits.sort_unstable();
+        hits.dedup();
+
+        for &cid in &hits {
+            let Some(Some(slot)) = self.colliders.get(cid as usize) else {
+                continue;
+            };
+            if (slot.collider.filter.category_bits & explosion.mask_bits) == 0 {
+                continue;
+            }
+            let body_slot = slot.body.index();
+            let body_idx = body_slot as usize;
+            if self.body_ids.handle_at(body_slot).is_none() {
                 continue;
             }
             if self.bodies[body_idx].body_type != BodyType::Dynamic {
                 continue;
             }
 
-            let mut total_impulse = Vec3::ZERO;
-            let mut total_torque_impulse = Vec3::ZERO;
+            let body = &self.bodies[body_idx];
+            let (b_pos, b_rot) = slot.pose(body);
+            let inv_rot = b_rot.conjugate();
+            let local_pos = inv_rot * (explosion.position - b_pos);
 
-            for i in 0..self.body_colliders[body_idx].len() {
-                let cid = self.body_colliders[body_idx][i];
-                let Some(Some(slot)) = self.colliders.get(cid.index() as usize) else {
-                    continue;
-                };
+            let pt = [local_pos];
+            let pt_proxy = ShapeProxy {
+                points: &pt,
+                radius: 0.0,
+            };
 
-                let body = &self.bodies[body_idx];
-                let (b_pos, b_rot) = slot.pose(body);
-                let b_aabb = slot.collider.shape.compute_aabb(b_pos, b_rot);
-                if !b_aabb.intersects(&blast_aabb) {
-                    continue;
+            let corners;
+            let centers;
+            let zero = [Vec3::ZERO];
+            let (shape_proxy_pts, shape_r): (&[Vec3], f32) = match &slot.collider.shape {
+                Shape::Sphere { radius } => (&zero, *radius),
+                Shape::Capsule {
+                    radius,
+                    half_height,
+                } => {
+                    centers = [
+                        Vec3::new(0.0, -half_height, 0.0),
+                        Vec3::new(0.0, *half_height, 0.0),
+                    ];
+                    (&centers, *radius)
                 }
-
-                let inv_rot = b_rot.conjugate();
-                let local_pos = inv_rot * (explosion.position - b_pos);
-
-                let pt = [local_pos];
-                let pt_proxy = ShapeProxy {
-                    points: &pt,
-                    radius: 0.0,
-                };
-
-                let corners;
-                let centers;
-                let zero = [Vec3::ZERO];
-                let (shape_proxy_pts, shape_r): (&[Vec3], f32) = match &slot.collider.shape {
-                    Shape::Sphere { radius } => (&zero, *radius),
-                    Shape::Capsule {
-                        radius,
-                        half_height,
-                    } => {
-                        centers = [
-                            Vec3::new(0.0, -half_height, 0.0),
-                            Vec3::new(0.0, *half_height, 0.0),
-                        ];
-                        (&centers, *radius)
-                    }
-                    Shape::Box { half_extents } => {
-                        let h = *half_extents;
-                        corners = [
-                            Vec3::new(-h.x, -h.y, -h.z),
-                            Vec3::new(h.x, -h.y, -h.z),
-                            Vec3::new(h.x, h.y, -h.z),
-                            Vec3::new(-h.x, h.y, -h.z),
-                            Vec3::new(-h.x, -h.y, h.z),
-                            Vec3::new(h.x, -h.y, h.z),
-                            Vec3::new(h.x, h.y, h.z),
-                            Vec3::new(-h.x, h.y, h.z),
-                        ];
-                        (&corners, 0.0)
-                    }
-                    Shape::ConvexHull(hull) => (hull.points(), 0.0),
-                    Shape::Triangle { a, b, c } => {
-                        corners = [
-                            *a,
-                            *b,
-                            *c,
-                            Vec3::ZERO,
-                            Vec3::ZERO,
-                            Vec3::ZERO,
-                            Vec3::ZERO,
-                            Vec3::ZERO,
-                        ];
-                        (&corners[..3], 0.0)
-                    }
-                    _ => continue,
-                };
-
-                let shape_proxy = ShapeProxy {
-                    points: shape_proxy_pts,
-                    radius: shape_r,
-                };
-
-                let mut cache = SimplexCache::default();
-                let dist_out = shape_distance(
-                    &shape_proxy,
-                    &pt_proxy,
-                    &Transform::IDENTITY,
-                    true,
-                    &mut cache,
-                );
-
-                if dist_out.distance >= explosion.radius {
-                    continue;
+                Shape::Box { half_extents } => {
+                    let h = *half_extents;
+                    corners = [
+                        Vec3::new(-h.x, -h.y, -h.z),
+                        Vec3::new(h.x, -h.y, -h.z),
+                        Vec3::new(h.x, h.y, -h.z),
+                        Vec3::new(-h.x, h.y, -h.z),
+                        Vec3::new(-h.x, -h.y, h.z),
+                        Vec3::new(h.x, -h.y, h.z),
+                        Vec3::new(h.x, h.y, h.z),
+                        Vec3::new(-h.x, h.y, h.z),
+                    ];
+                    (&corners, 0.0)
                 }
-
-                let closest_point = if dist_out.distance == 0.0 {
-                    Vec3::ZERO
-                } else {
-                    dist_out.point_a
-                };
-
-                let mut direction = closest_point - local_pos;
-                if direction.length_squared() > 1e-6 {
-                    direction = direction.normalize();
-                } else {
-                    direction = Vec3::X;
+                Shape::ConvexHull(hull) => (hull.points(), 0.0),
+                Shape::Triangle { a, b, c } => {
+                    corners = [
+                        *a,
+                        *b,
+                        *c,
+                        Vec3::ZERO,
+                        Vec3::ZERO,
+                        Vec3::ZERO,
+                        Vec3::ZERO,
+                        Vec3::ZERO,
+                    ];
+                    (&corners[..3], 0.0)
                 }
+                _ => continue,
+            };
 
-                let area = slot.collider.shape.projected_area(direction);
-                let scale = if explosion.falloff > 0.0 {
-                    (1.0 - dist_out.distance / explosion.radius).powf(explosion.falloff)
-                } else {
-                    1.0
-                };
+            let shape_proxy = ShapeProxy {
+                points: shape_proxy_pts,
+                radius: shape_r,
+            };
 
-                let magnitude = explosion.impulse_per_area * area * scale;
-                let world_impulse = (b_rot * direction) * magnitude;
-                let world_point = b_pos + b_rot * closest_point;
+            let mut cache = SimplexCache::default();
+            let dist_out = shape_distance(
+                &shape_proxy,
+                &pt_proxy,
+                &Transform::IDENTITY,
+                true,
+                &mut cache,
+            );
 
-                total_impulse += world_impulse;
-                total_torque_impulse += (world_point - body.center_of_mass()).cross(world_impulse);
+            if dist_out.distance > max_range {
+                continue;
             }
 
-            if total_impulse != Vec3::ZERO || total_torque_impulse != Vec3::ZERO {
-                self.wake_body_slot(body_idx as u32);
-                let body = &mut self.bodies[body_idx];
-                body.linear_velocity += total_impulse * body.inv_mass;
-                body.angular_velocity += body.world_inv_inertia() * total_torque_impulse;
+            let closest_point = if dist_out.distance == 0.0 {
+                slot.collider.shape.mass_data(1.0).1
+            } else {
+                dist_out.point_a
+            };
+
+            let mut direction = closest_point - local_pos;
+            if direction.length_squared() > 100.0 * f32::EPSILON * f32::EPSILON {
+                direction = direction.normalize();
+            } else {
+                direction = Vec3::X;
             }
+
+            let area = slot.collider.shape.projected_area(direction);
+            let scale = if dist_out.distance > explosion.radius && explosion.falloff > 0.0 {
+                ((max_range - dist_out.distance) / explosion.falloff).clamp(0.0, 1.0)
+            } else if dist_out.distance <= explosion.radius {
+                1.0
+            } else {
+                0.0
+            };
+
+            let magnitude = explosion.impulse_per_area * area * scale;
+            let world_impulse = (b_rot * direction) * magnitude;
+            let world_point = b_pos + b_rot * closest_point;
+            let center_of_mass = self.bodies[body_idx].center_of_mass();
+            let torque_impulse = (world_point - center_of_mass).cross(world_impulse);
+
+            self.wake_body_slot(body_slot);
+            if self.body_links[body_idx].set != crate::island::AWAKE_SET {
+                continue;
+            }
+            let body = &mut self.bodies[body_idx];
+            body.linear_velocity += world_impulse * body.inv_mass;
+            body.angular_velocity += body.world_inv_inertia() * torque_impulse;
         }
+
+        self.continuous_candidates = hits;
     }
 
     /// Steps the physics simulation forward by `dt` seconds deterministically.
     pub fn step(&mut self, dt: f32) {
-        if dt <= 0.0 {
+        if !(dt > 0.0 && dt.is_finite()) {
             return;
         }
 
@@ -2106,6 +2892,11 @@ impl PhysicsWorld {
         self.step_index += 1;
         self.last_inv_h = self.solver_config.sub_steps.max(1) as f32 / dt;
         self.contact_events.clear();
+        self.contact_events.end.append(&mut self.pending_end_events);
+        self.sensor_events.clear();
+        self.sensor_events
+            .end
+            .append(&mut self.pending_sensor_end_events);
         self.body_events.clear();
         self.joint_events.clear();
         let _ = self.manifolds_cache.take();
@@ -2118,28 +2909,8 @@ impl PhysicsWorld {
             }
         }
 
-        // Process bodies mutated via `body_mut` since the last step.
-        let mut t_idx = 0;
-        while t_idx < self.touched_bodies.len() {
-            let slot = self.touched_bodies[t_idx];
-            t_idx += 1;
-            let idx = slot as usize;
-            if idx >= self.bodies.len() {
-                continue;
-            }
-            self.body_links[idx].touched = false;
-            if self.body_ids.handle_at(slot).is_none() {
-                continue;
-            }
-            self.refresh_body_proxies(slot);
-            if self.bodies[idx].is_sleeping && self.body_links[idx].set == crate::island::AWAKE_SET
-            {
-                if let Some(id) = self.body_ids.handle_at(slot) {
-                    self.sleep_body(id);
-                }
-            }
-        }
-        self.touched_bodies.clear();
+        // Reconcile bodies mutated via `body_mut` since the last flush.
+        self.flush_touched_bodies();
 
         let bp_start = std::time::Instant::now();
         // 1. Joints that keep their bodies from colliding
@@ -2232,21 +3003,26 @@ impl PhysicsWorld {
             );
             self.split_candidate = (crate::contact::NULL, 0.0);
 
+            let inv_dt = if dt > 0.0 { 1.0 / dt } else { 0.0 };
             let awake_len = self.sets[crate::island::AWAKE_SET as usize].bodies.len();
             for b_i in 0..awake_len {
                 let slot = self.sets[crate::island::AWAKE_SET as usize].bodies[b_i];
                 let idx = slot as usize;
+                let motion = self.solver_scratch.motion(idx);
                 let body = &mut self.bodies[idx];
                 body.force = Vec3::ZERO;
                 body.torque = Vec3::ZERO;
 
                 if enable_sleep && body.body_type == BodyType::Dynamic {
-                    let lin_sq = body.linear_velocity.length_squared();
-                    let ang_sq = body.angular_velocity.length_squared();
-                    if !body.enable_sleep
-                        || lin_sq > crate::island::SLEEP_LINEAR_TOLERANCE_SQ
-                        || ang_sq > crate::island::SLEEP_ANGULAR_TOLERANCE_SQ
-                    {
+                    let local_omega = inv_rotate(body.rotation, body.angular_velocity);
+                    let dq = motion.delta_rotation;
+                    let local_turn = inv_rotate(body.rotation, Vec3::new(dq.x, dq.y, dq.z));
+                    let max_velocity = body.linear_velocity.length()
+                        + modified_cross(local_omega.abs(), body.max_extent).length();
+                    let max_delta_position = motion.delta_position.length()
+                        + 2.0 * modified_cross(local_turn.abs(), body.max_extent).length();
+                    let sleep_velocity = max_velocity.max(0.5 * inv_dt * max_delta_position);
+                    if !body.enable_sleep || sleep_velocity > body.sleep_threshold {
                         body.sleep_time = 0.0;
                     } else {
                         body.sleep_time += dt;
@@ -2409,7 +3185,6 @@ impl PhysicsWorld {
         }
 
         // 6. Sensor overlaps at the bodies' new poses
-        self.sensor_events.clear();
         if self.sensor_count > 0 && (had_awake_bodies || self.sensors_dirty) {
             self.overlap_sensors();
             self.sensors_dirty = false;
@@ -3181,11 +3956,20 @@ impl PhysicsWorld {
     /// The world's counts (Box3D `b3World_GetCounters`).
     #[must_use]
     pub fn counters(&self) -> Counters3d {
+        let awake_touching: usize = self
+            .constraint_graph
+            .colors()
+            .map(|c| c.contact_slots.len())
+            .sum();
+        let sleeping_touching: usize = self
+            .sets
+            .get(crate::island::FIRST_SLEEPING_SET as usize..)
+            .map_or(0, |sets| sets.iter().map(|s| s.contacts.len()).sum());
         Counters3d {
             body_count: self.body_ids.len(),
             collider_count: self.collider_ids.len(),
             contact_count: self.contacts.len(),
-            touching_contact_count: self.touching_contacts,
+            touching_contact_count: awake_touching + sleeping_touching,
             recycled_contact_count: self.recycled_contacts,
             joint_count: self.joint_ids.len(),
         }
@@ -3380,6 +4164,9 @@ impl PhysicsWorld {
             };
             let new_aabb = slot.bounds(body).expand(SPECULATIVE_DISTANCE);
             slot.aabb = new_aabb;
+            if slot.proxy == crate::contact::NULL {
+                continue;
+            }
             if !slot.fat_aabb.contains(&new_aabb) {
                 let margin = if is_static {
                     SPECULATIVE_DISTANCE
@@ -3417,7 +4204,11 @@ impl PhysicsWorld {
                 .handle_at(sensor_index as u32)
                 .expect("live sensor collider");
             self.sensor_scratch.clear();
-            if sensor.enable_sensor_events {
+            let sensor_enabled = self
+                .body_links
+                .get(sensor_slot.body.index() as usize)
+                .is_some_and(|l| l.set != crate::island::DISABLED_SET);
+            if sensor_enabled && sensor.enable_sensor_events {
                 let body = &self.bodies[sensor_slot.body.index() as usize];
                 let bounds = sensor_slot.bounds(body).expand(SPECULATIVE_DISTANCE);
                 self.sensor_candidates.clear();
@@ -3494,19 +4285,10 @@ impl PhysicsWorld {
         }
     }
 
-    /// Captures a bitwise deterministic snapshot of the simulation world state.
-    #[must_use]
-    pub fn create_snapshot(&self) -> WorldSnapshot3d {
-        let bodies = self
-            .bodies
-            .iter()
-            .enumerate()
-            .map(|(i, b)| BodySnapshot3d::from_body(i as u32, b))
-            .collect();
+    fn create_snapshot_raw(&self) -> WorldSnapshot3d {
         WorldSnapshot3d {
             step_index: self.step_index,
-            bodies,
-            raw_bodies: self.bodies.clone(),
+            bodies: self.bodies.clone(),
             body_ids: self.body_ids.clone(),
             colliders: self.colliders.clone(),
             collider_ids: self.collider_ids.clone(),
@@ -3514,13 +4296,19 @@ impl PhysicsWorld {
             trees: self.trees.clone(),
             move_buffer: self.move_buffer.clone(),
             touched_bodies: self.touched_bodies.clone(),
-            manifolds: self.manifolds().to_vec(),
             contacts: self.contacts.clone(),
+            recycled_contacts: self.recycled_contacts,
             fast: self.fast.clone(),
             joints: self.joints.clone(),
             joint_ids: self.joint_ids.clone(),
+            last_inv_h: self.last_inv_h,
             sensor_overlaps: self.sensor_overlaps.clone(),
-            island_manager: self.island_manager.clone(),
+            sensor_events: self.sensor_events.clone(),
+            pending_sensor_end_events: self.pending_sensor_end_events.clone(),
+            contact_events: self.contact_events.clone(),
+            pending_end_events: self.pending_end_events.clone(),
+            body_events: self.body_events.clone(),
+            joint_events: self.joint_events.clone(),
             sets: self.sets.clone(),
             free_sets: self.free_sets.clone(),
             islands: self.islands.clone(),
@@ -3535,34 +4323,25 @@ impl PhysicsWorld {
         }
     }
 
+    /// Captures a bitwise deterministic snapshot of the simulation world state, flushing any
+    /// un-reconciled `body_mut` changes on the captured state.
+    #[must_use]
+    pub fn create_snapshot(&self) -> WorldSnapshot3d {
+        let raw = self.create_snapshot_raw();
+        if !self.touched_bodies.is_empty() {
+            let mut world = Self::from_snapshot(&raw);
+            world.flush_touched_bodies();
+            return world.create_snapshot_raw();
+        }
+        raw
+    }
+
     /// Restores the simulation world to the exact state captured in `snapshot`.
     pub fn restore_snapshot(&mut self, snapshot: &WorldSnapshot3d) {
         self.step_index = snapshot.step_index;
         self.body_ids = snapshot.body_ids.clone();
         let _ = self.manifolds_cache.take();
-
-        if !snapshot.raw_bodies.is_empty() {
-            self.bodies = snapshot.raw_bodies.clone();
-        } else if self.bodies.len() < snapshot.bodies.len() {
-            self.bodies.resize(
-                snapshot.bodies.len(),
-                RigidBody::new(BodyType::Dynamic, Vec3::ZERO),
-            );
-        }
-
-        for bs in &snapshot.bodies {
-            let id = bs.id as usize;
-            if let Some(b) = self.bodies.get_mut(id) {
-                b.position = bs.position;
-                b.rotation = bs.rotation;
-                b.linear_velocity = bs.linear_velocity;
-                b.angular_velocity = bs.angular_velocity;
-                b.is_sleeping = bs.is_sleeping;
-                b.sleep_time = bs.sleep_time;
-                b.force = Vec3::ZERO;
-                b.torque = Vec3::ZERO;
-            }
-        }
+        self.bodies.clone_from(&snapshot.bodies);
 
         self.colliders = snapshot.colliders.clone();
         self.collider_ids = snapshot.collider_ids.clone();
@@ -3585,6 +4364,7 @@ impl PhysicsWorld {
 
         self.joints = snapshot.joints.clone();
         self.joint_ids = snapshot.joint_ids.clone();
+        self.last_inv_h = snapshot.last_inv_h;
 
         // Rebuild jointed pairs
         self.jointed_pairs.clear();
@@ -3601,8 +4381,8 @@ impl PhysicsWorld {
 
         self.contacts = snapshot.contacts.clone();
         self.contacts.rebuild_index();
+        self.recycled_contacts = snapshot.recycled_contacts;
         self.fast.clone_from(&snapshot.fast);
-        self.island_manager = snapshot.island_manager.clone();
         if !snapshot.sets.is_empty() {
             self.sets.clone_from(&snapshot.sets);
             self.free_sets.clone_from(&snapshot.free_sets);
@@ -3615,6 +4395,14 @@ impl PhysicsWorld {
             self.constraint_graph.clone_from(&snapshot.constraint_graph);
         }
         self.sensor_overlaps = snapshot.sensor_overlaps.clone();
+        self.sensor_events.clone_from(&snapshot.sensor_events);
+        self.pending_sensor_end_events
+            .clone_from(&snapshot.pending_sensor_end_events);
+        self.contact_events.clone_from(&snapshot.contact_events);
+        self.pending_end_events
+            .clone_from(&snapshot.pending_end_events);
+        self.body_events.clone_from(&snapshot.body_events);
+        self.joint_events.clone_from(&snapshot.joint_events);
         if self.sensor_overlaps.len() < self.colliders.len() {
             self.sensor_overlaps
                 .resize_with(self.colliders.len(), Vec::new);
@@ -3624,6 +4412,9 @@ impl PhysicsWorld {
         }
         self.gravity = snapshot.gravity;
         self.solver_config = snapshot.solver_config;
+        if !self.touched_bodies.is_empty() {
+            self.flush_touched_bodies();
+        }
     }
 
     /// Creates a new physics world initialized from a snapshot.
@@ -3637,26 +4428,25 @@ impl PhysicsWorld {
     /// Computes the 64-bit FNV-1a hash of the current simulation state.
     #[must_use]
     pub fn state_hash(&self) -> u64 {
+        if !self.touched_bodies.is_empty() {
+            return self.create_snapshot().state_hash();
+        }
         crate::snapshot::compute_state_hash(crate::snapshot::StateHashInput {
-            body_count: self.bodies.len(),
-            body_active: |slot: u32| self.body_ids.handle_at(slot).is_some(),
-            body_data: |idx: usize| {
-                let b = &self.bodies[idx];
-                (
-                    b.position,
-                    b.rotation,
-                    b.linear_velocity,
-                    b.angular_velocity,
-                    b.sleep_time,
-                    b.is_sleeping,
-                )
-            },
+            bodies: &self.bodies,
+            body_ids: &self.body_ids,
+            body_links: &self.body_links,
             contacts: &self.contacts,
             joints: &self.joints,
             joint_ids: &self.joint_ids,
-            body_ids: &self.body_ids,
+            joint_links: &self.joint_links,
             collider_ids: &self.collider_ids,
             sensor_overlaps: &self.sensor_overlaps,
+            sets: &self.sets,
+            free_sets: &self.free_sets,
+            islands: &self.islands,
+            free_islands: &self.free_islands,
+            island_count: self.island_count,
+            island_to_split: self.island_to_split,
         })
     }
 }

@@ -138,6 +138,10 @@ pub unsafe trait SystemParam {
 
     /// Called after the function returns, with the whole world (applies commands).
     fn apply(_state: &mut Self::State, _world: &mut World) {}
+
+    /// Called if the function unwinds before [`apply`](Self::apply) runs, to discard queued
+    /// work and reclaim reserved entities.
+    fn abort(_state: &mut Self::State, _world: &mut World) {}
 }
 
 /// The item type a parameter `P` hands the function.
@@ -342,6 +346,11 @@ unsafe impl SystemParam for Commands<'_, '_> {
     fn apply(state: &mut Self::State, world: &mut World) {
         state.apply(world);
     }
+
+    fn abort(state: &mut Self::State, world: &mut World) {
+        state.clear();
+        world.reclaim_unplaced_entities();
+    }
 }
 
 /// State owned by one system and kept between its runs, starting from `T::default()`.
@@ -409,6 +418,11 @@ macro_rules! impl_param_tuple {
             fn apply(state: &mut Self::State, world: &mut World) {
                 let ($($p,)*) = state;
                 $($p::apply($p, world);)*
+            }
+
+            fn abort(state: &mut Self::State, world: &mut World) {
+                let ($($p,)*) = state;
+                $($p::abort($p, world);)*
             }
         }
     };
@@ -521,12 +535,30 @@ impl<Marker: 'static, F: SystemParamFunction<Marker>> System for FunctionSystem<
             .unwrap_or(Tick::new(this_run.get().wrapping_sub(MAX_CHANGE_AGE)));
         last_run.clamp_age(this_run);
         let ticks = ChangeTicks { last_run, this_run };
+        struct RunAbortGuard<'a, P: SystemParam> {
+            state: &'a mut P::State,
+            world: &'a mut World,
+            completed: bool,
+        }
+        impl<P: SystemParam> Drop for RunAbortGuard<'_, P> {
+            fn drop(&mut self) {
+                if !self.completed {
+                    P::abort(self.state, self.world);
+                }
+            }
+        }
         {
-            let cell = WorldCell::new(world);
+            let mut guard = RunAbortGuard::<F::Param> {
+                state,
+                world,
+                completed: false,
+            };
+            let cell = WorldCell::new(guard.world);
             // SAFETY: `state` was built for this world, and its accesses were checked for
             // conflicts when it was built.
-            let param = unsafe { F::Param::get_param(state, cell, ticks) };
+            let param = unsafe { F::Param::get_param(guard.state, cell, ticks) };
             self.func.run(param);
+            guard.completed = true;
         }
         self.last_run = Some(this_run);
         F::Param::apply(state, world);

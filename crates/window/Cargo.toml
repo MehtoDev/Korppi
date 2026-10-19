@@ -7,9 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-korppi_core = { path = "../core" }
-korppi_math = { path = "../math" }
-korppi_ecs = { path = "../ecs" }
 winit = { workspace = true }
 raw-window-handle = { workspace = true }
 serde = { workspace = true }

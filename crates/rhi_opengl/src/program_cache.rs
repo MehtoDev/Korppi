@@ -114,26 +114,29 @@ impl ProgramBinaryCache {
         }
         let parsed = (|| {
             let mut rest = data.strip_prefix(MAGIC)?;
-            let mut take = |n: usize| -> Option<&[u8]> {
+            fn take<'a>(rest: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
                 let (head, tail) = rest.split_at_checked(n)?;
-                rest = tail;
+                *rest = tail;
                 Some(head)
-            };
+            }
             let u32_at = |bytes: &[u8]| u32::from_le_bytes(bytes.try_into().unwrap());
-            if u32_at(take(4)?) != VERSION {
+            if u32_at(take(&mut rest, 4)?) != VERSION {
                 return None;
             }
-            let driver_len = u32_at(take(4)?) as usize;
-            if take(driver_len)? != self.driver.as_bytes() {
+            let driver_len = u32_at(take(&mut rest, 4)?) as usize;
+            if take(&mut rest, driver_len)? != self.driver.as_bytes() {
                 return None;
             }
-            let count = u32_at(take(4)?);
-            let mut binaries = Vec::with_capacity(count as usize);
+            let count = u32_at(take(&mut rest, 4)?) as usize;
+            if count > rest.len() / 16 {
+                return None;
+            }
+            let mut binaries = Vec::with_capacity(count);
             for _ in 0..count {
-                let key = u64::from_le_bytes(take(8)?.try_into().unwrap());
-                let format = u32_at(take(4)?);
-                let len = u32_at(take(4)?) as usize;
-                let buffer = take(len)?.to_vec();
+                let key = u64::from_le_bytes(take(&mut rest, 8)?.try_into().unwrap());
+                let format = u32_at(take(&mut rest, 4)?);
+                let len = u32_at(take(&mut rest, 4)?) as usize;
+                let buffer = take(&mut rest, len)?.to_vec();
                 binaries.push((key, glow::ProgramBinary { buffer, format }));
             }
             Some(binaries)

@@ -1450,19 +1450,12 @@ impl GlThread {
                     };
 
                     current_fbo = Some(fbo);
-                    // LoadOp::Clear clears the whole render area regardless of state left by
-                    // earlier pipelines or passes: GL clears honour the scissor test and the
-                    // colour/depth write masks (GL 4.6 §17.4.3), Vulkan clears do not (RGL-09).
-                    // Pipelines re-apply their masks when bound, and draws require a fresh
-                    // `set_scissor`, so resetting here is safe.
-                    // SAFETY: the context is current on this thread.
-                    unsafe {
-                        state.disable_scissor(gl);
-                        state.set_depth_write(gl, true);
-                        for i in 0..desc.color_attachments.len() as u32 {
-                            state.set_color_mask(gl, i, [true; 4]);
-                        }
-                    }
+                    // LoadOp::Clear clears the render area (desc.offset_x..+width,
+                    // desc.offset_y..+height) regardless of state left by earlier pipelines or
+                    // passes: GL clears honour the scissor test and the colour/depth write masks
+                    // (GL 4.6 §17.4.3), Vulkan clears the renderArea ignoring write masks
+                    // (RGL-09, RGL-25). Pipelines re-apply their masks when bound, and draws
+                    // require a fresh `set_scissor`, so resetting here is safe.
                     // SAFETY: the context is current on this thread and `state` is its cache.
                     unsafe {
                         state.set_fbo(gl, Some(fbo));
@@ -1473,6 +1466,17 @@ impl GlThread {
                             desc.width as i32,
                             desc.height as i32,
                         );
+                        state.set_scissor(
+                            gl,
+                            desc.offset_x,
+                            desc.offset_y,
+                            desc.width as i32,
+                            desc.height as i32,
+                        );
+                        state.set_depth_write(gl, true);
+                        for i in 0..desc.color_attachments.len() as u32 {
+                            state.set_color_mask(gl, i, [true; 4]);
+                        }
                     }
 
                     // Process load operations (Clear)
@@ -1536,6 +1540,11 @@ impl GlThread {
                                 (false, false) => {}
                             }
                         }
+                    }
+                    // Leave the scissor test disabled for the pass until `set_scissor` enables it.
+                    // SAFETY: the context is current on this thread and `state` is its cache.
+                    unsafe {
+                        state.disable_scissor(gl);
                     }
                     // Clears reset write masks; a pipeline bound in an earlier pass stays bound.
                     if let Some(handle) = bound_graphics {
@@ -2511,6 +2520,7 @@ impl GraphicsDevice for OpenGlDevice {
         &self,
         desc: &ComputePipelineDescriptor,
     ) -> Result<PipelineHandle, RhiError> {
+        desc.validate()?;
         let bindings = self.pipeline_bindings(&desc.bind_group_layouts, ShaderStages::COMPUTE)?;
         let shader =
             self.pipeline_shader(desc.compute_shader, ShaderStage::Compute, &bindings.table)?;

@@ -384,12 +384,12 @@ unsafe fn column_base<T>(archetype: *mut Archetype, id: ComponentId) -> *mut T {
 /// Marks every row of the column of `id` in `archetype` changed at `tick`, if it has one.
 ///
 /// # Safety
-/// `archetype` must be valid for writes, and no reference into its change ticks may be live.
+/// `archetype` must be valid for reads, and no reference into its change ticks may be live.
 #[inline(always)]
 unsafe fn mark_column_changed(archetype: *mut Archetype, id: ComponentId, tick: Tick) {
-    // SAFETY: the caller guarantees exclusive access to the archetype's change ticks.
-    let arch = unsafe { &mut *archetype };
-    if let Some(column) = arch.column_mut(id) {
+    // SAFETY: the caller guarantees exclusive access to the column's change ticks.
+    let arch = unsafe { &*archetype };
+    if let Some(column) = arch.column(id) {
         column.mark_all_changed(tick);
     }
 }
@@ -400,9 +400,9 @@ unsafe fn mark_column_changed(archetype: *mut Archetype, id: ComponentId, tick: 
 /// As for [`mark_column_changed`]; `row` is below the archetype's length.
 #[inline(always)]
 unsafe fn mark_row_changed(archetype: *mut Archetype, id: ComponentId, row: usize, tick: Tick) {
-    // SAFETY: the caller guarantees exclusive access to the archetype's change ticks.
-    let arch = unsafe { &mut *archetype };
-    if let Some(column) = arch.column_mut(id) {
+    // SAFETY: the caller guarantees exclusive access to this row's change tick.
+    let arch = unsafe { &*archetype };
+    if let Some(column) = arch.column(id) {
         column.mark_changed(row, tick);
     }
 }
@@ -940,7 +940,7 @@ macro_rules! change_filter {
                     && column
                         .bulk_changed()
                         .is_some_and(|tick| tick.is_newer_than(ticks.last_run, ticks.this_run));
-                (column.ticks().as_ptr(), ticks, bulk)
+                (column.ticks_ptr().cast_const(), ticks, bulk)
             }
 
             #[inline(always)]
@@ -1209,13 +1209,27 @@ impl<'w, Q: WorldQuery> QueryIter<'w, Q> {
         }
     }
 
-    /// Runs `finish_fetch` for the active archetype, if any.
+    /// Marks visited rows changed for the active archetype, if any.
+    ///
+    /// When `Q::DENSE` holds and every row of the archetype was visited (`self.row == self.len`),
+    /// `finish_fetch` stamps `bulk_changed` in O(1); when the iterator stopped early, only the
+    /// visited rows `0..self.row` are marked; when `!Q::DENSE`, matched rows were already marked
+    /// individually as they were yielded.
     #[inline(always)]
     fn finish_current(&mut self) {
         if let Some(archetype) = self.current.take() {
-            // SAFETY: `fetch` is not used for this archetype again; the items handed out point
-            // into value columns and entity lists, not into the change ticks it writes.
-            unsafe { Q::finish_fetch(&self.state, archetype, self.ticks) };
+            if Q::DENSE {
+                if self.row == self.len {
+                    // SAFETY: `fetch` is not used for this archetype again; the items handed out
+                    // point into value columns and entity lists, not into the change ticks it writes.
+                    unsafe { Q::finish_fetch(&self.state, archetype, self.ticks) };
+                } else {
+                    for r in 0..self.row {
+                        // SAFETY: `r < self.row < self.len`, so `r` is in bounds of `archetype`.
+                        unsafe { Q::mark_row(&self.state, archetype, r, self.ticks) };
+                    }
+                }
+            }
         }
     }
 
@@ -1269,27 +1283,48 @@ impl<'w, Q: WorldQuery> QueryIter<'w, Q> {
     {
         loop {
             let mut fetch = self.fetch;
-            if self.dense {
-                for _ in self.row..self.len {
-                    let current = fetch;
-                    // SAFETY: `fetch` stays within the active archetype's rows and is dense.
-                    let (item, next) = unsafe { Q::fetch_next_dense(fetch) };
-                    fetch = next;
-                    // SAFETY: `current` is at a row of the active archetype.
-                    if Q::DENSE || unsafe { Q::filter(current) } {
+            if Q::DENSE {
+                if self.dense {
+                    while self.row < self.len {
+                        self.row += 1;
+                        // SAFETY: `fetch` stays within the active archetype's rows and is dense.
+                        let (item, next) = unsafe { Q::fetch_next_dense(fetch) };
+                        fetch = next;
+                        f(item);
+                    }
+                } else {
+                    while self.row < self.len {
+                        self.row += 1;
+                        // SAFETY: `fetch` stays within the active archetype's rows.
+                        let (item, next) = unsafe { Q::fetch_next(fetch) };
+                        fetch = next;
                         f(item);
                     }
                 }
-            } else {
-                for _ in self.row..self.len {
+            } else if let Some(archetype) = self.current {
+                while self.row < self.len {
+                    let row = self.row;
+                    self.row += 1;
                     let current = fetch;
-                    // SAFETY: `fetch` stays within the active archetype's rows.
-                    let (item, next) = unsafe { Q::fetch_next(fetch) };
-                    fetch = next;
                     // SAFETY: `current` is at a row of the active archetype.
-                    if Q::DENSE || unsafe { Q::filter(current) } {
-                        f(item);
+                    if !unsafe { Q::filter(current) } {
+                        // SAFETY: advancing by 1 row stays within the active archetype.
+                        fetch = unsafe { Q::seek(current, 1) };
+                        continue;
                     }
+                    // SAFETY: `current` stays within the active archetype's rows, and `self.dense`
+                    // means every column is owned by this archetype.
+                    let (item, next) = unsafe {
+                        if self.dense {
+                            Q::fetch_next_dense(current)
+                        } else {
+                            Q::fetch_next(current)
+                        }
+                    };
+                    fetch = next;
+                    // SAFETY: `row < self.len` in `archetype`.
+                    unsafe { Q::mark_row(&self.state, archetype, row, self.ticks) };
+                    f(item);
                 }
             }
             if !self.advance() {
@@ -1315,9 +1350,11 @@ impl<'w, Q: WorldQuery> QueryIter<'w, Q> {
         }
         loop {
             if self.row < self.len {
-                // SAFETY: `fetch` is at row `row` of the active archetype, which has `len` rows;
-                // the rows before `row` were yielded by `next` and are not part of the chunk.
-                f(unsafe { Q::fetch_slice(self.fetch, self.len - self.row) });
+                let remaining = self.len - self.row;
+                self.row = self.len;
+                // SAFETY: `fetch` is at the start of the remaining `remaining` rows of the active
+                // archetype; the rows before it were yielded by `next` and are not part of the chunk.
+                f(unsafe { Q::fetch_slice(self.fetch, remaining) });
             }
             if !self.advance() {
                 return;
@@ -1335,15 +1372,25 @@ impl<'w, Q: WorldQuery> Iterator for QueryIter<'w, Q> {
             if self.row == self.len && !self.advance() {
                 return None;
             }
+            let row = self.row;
             self.row += 1;
             let current = self.fetch;
-            // SAFETY: `row <= len`, so `fetch` is at a row of the active archetype.
+            // SAFETY: `row < len`, so `current` is at a row of the active archetype.
+            if !Q::DENSE && !unsafe { Q::filter(current) } {
+                // SAFETY: `row < len`, so advancing by 1 row stays within the active archetype.
+                self.fetch = unsafe { Q::seek(current, 1) };
+                continue;
+            }
+            // SAFETY: `row < len`, so `current` is at a row of the active archetype.
             let (item, next) = unsafe { Q::fetch_next(current) };
             self.fetch = next;
-            // SAFETY: `current` is at a row of the active archetype.
-            if Q::DENSE || unsafe { Q::filter(current) } {
-                return Some(item);
+            if !Q::DENSE {
+                if let Some(archetype) = self.current {
+                    // SAFETY: `row < len` in `archetype`.
+                    unsafe { Q::mark_row(&self.state, archetype, row, self.ticks) };
+                }
             }
+            return Some(item);
         }
     }
 }

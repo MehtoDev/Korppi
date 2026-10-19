@@ -78,14 +78,14 @@ pub(crate) struct OutputScratch {
 impl OutputScratch {
     pub fn new() -> Self {
         Self {
-            passes: Vec::with_capacity(16),
-            barrier_pool: Vec::with_capacity(16),
-            texture_slice: Vec::with_capacity(16),
-            buffer_slice: Vec::with_capacity(16),
-            texture_map: HashMap::with_capacity(16),
-            buffer_map: HashMap::with_capacity(16),
-            texture_allocations: HashMap::with_capacity(16),
-            buffer_allocations: HashMap::with_capacity(16),
+            passes: Vec::with_capacity(32),
+            barrier_pool: Vec::with_capacity(32),
+            texture_slice: Vec::with_capacity(32),
+            buffer_slice: Vec::with_capacity(32),
+            texture_map: HashMap::with_capacity(32),
+            buffer_map: HashMap::with_capacity(32),
+            texture_allocations: HashMap::with_capacity(32),
+            buffer_allocations: HashMap::with_capacity(32),
         }
     }
 
@@ -149,8 +149,9 @@ struct TrackedTextureState {
     handle: TextureHandle,
     mip_levels: u32,
     array_layers: u32,
-    prior_frame_access: Option<TextureAccess>,
-    subresources: SmallVec<[(TextureSubresourceRange, ResourceState); 2]>,
+    uniform_state: ResourceState,
+    uniform_initialized: bool,
+    per_subresource: SmallVec<[(ResourceState, bool); 8]>,
 }
 
 impl TrackedTextureState {
@@ -160,12 +161,21 @@ impl TrackedTextureState {
         array_layers: u32,
         prior_frame_access: Option<TextureAccess>,
     ) -> Self {
+        let (stage, access) = match prior_frame_access {
+            Some(prior) => (prior.stage, prior.access),
+            None => (PipelineStageFlags::TOP_OF_PIPE, AccessFlags::empty()),
+        };
         Self {
             handle,
-            mip_levels,
-            array_layers,
-            prior_frame_access,
-            subresources: SmallVec::new(),
+            mip_levels: mip_levels.max(1),
+            array_layers: array_layers.max(1),
+            uniform_state: ResourceState {
+                stage,
+                access,
+                layout: ImageLayout::Undefined,
+            },
+            uniform_initialized: false,
+            per_subresource: SmallVec::new(),
         }
     }
 
@@ -175,29 +185,17 @@ impl TrackedTextureState {
         array_layers: u32,
         initial: TextureAccess,
     ) -> Self {
-        let mut subresources = SmallVec::new();
-        subresources.push((
-            TextureSubresourceRange::ALL,
-            ResourceState {
+        Self {
+            handle,
+            mip_levels: mip_levels.max(1),
+            array_layers: array_layers.max(1),
+            uniform_state: ResourceState {
                 stage: initial.stage,
                 access: initial.access,
                 layout: initial.layout,
             },
-        ));
-        Self {
-            handle,
-            mip_levels,
-            array_layers,
-            prior_frame_access: None,
-            subresources,
-        }
-    }
-
-    fn effective_range(&self, requested: TextureSubresourceRange) -> TextureSubresourceRange {
-        if self.mip_levels <= 1 && self.array_layers <= 1 {
-            TextureSubresourceRange::ALL
-        } else {
-            requested
+            uniform_initialized: true,
+            per_subresource: SmallVec::new(),
         }
     }
 
@@ -207,115 +205,143 @@ impl TrackedTextureState {
         desired: ResourceState,
         barriers: &mut SmallVec<[ImageMemoryBarrier; 4]>,
     ) {
-        let range = self.effective_range(requested_range);
-        if self.subresources.is_empty() {
-            let (src_stages, src_access) = match self.prior_frame_access.take() {
-                Some(prior) => (prior.stage, prior.access),
-                None => (PipelineStageFlags::TOP_OF_PIPE, AccessFlags::empty()),
+        let m_total = self.mip_levels.max(1);
+        let l_total = self.array_layers.max(1);
+        let mip_start = requested_range.base_mip_level.min(m_total);
+        let mip_end = mip_start
+            .saturating_add(requested_range.mip_level_count)
+            .min(m_total);
+        let layer_start = requested_range.base_array_layer.min(l_total);
+        let layer_end = layer_start
+            .saturating_add(requested_range.array_layer_count)
+            .min(l_total);
+        let is_full_texture =
+            mip_start == 0 && mip_end == m_total && layer_start == 0 && layer_end == l_total;
+
+        if self.per_subresource.is_empty() && is_full_texture {
+            let emit_range = if m_total <= 1 && l_total <= 1 {
+                TextureSubresourceRange::ALL
+            } else {
+                requested_range
             };
-            barriers.push(ImageMemoryBarrier {
-                texture: self.handle,
-                range,
-                old_layout: ImageLayout::Undefined,
-                new_layout: desired.layout,
-                src_stages,
-                dst_stages: desired.stage,
-                src_access,
-                dst_access: desired.access,
-            });
-            self.subresources.push((range, desired));
+            if !self.uniform_initialized || needs_image_barrier(&self.uniform_state, &desired) {
+                barriers.push(ImageMemoryBarrier {
+                    texture: self.handle,
+                    range: emit_range,
+                    old_layout: self.uniform_state.layout,
+                    new_layout: desired.layout,
+                    src_stages: self.uniform_state.stage,
+                    dst_stages: desired.stage,
+                    src_access: self.uniform_state.access,
+                    dst_access: desired.access,
+                });
+                self.uniform_state = desired;
+                self.uniform_initialized = true;
+            } else {
+                self.uniform_state.stage |= desired.stage;
+                self.uniform_state.access |= desired.access;
+            }
             return;
         }
 
-        if range == TextureSubresourceRange::ALL {
-            for (sub_range, prev) in &self.subresources {
-                if needs_image_barrier(prev, &desired) {
+        if self.per_subresource.is_empty() {
+            let count = (m_total * l_total) as usize;
+            self.per_subresource
+                .resize(count, (self.uniform_state, self.uniform_initialized));
+        }
+
+        for layer in layer_start..layer_end {
+            let mut m0 = mip_start;
+            while m0 < mip_end {
+                let idx0 = (layer * m_total + m0) as usize;
+                let (prev_state, prev_init) = self.per_subresource[idx0];
+                let mut m1 = m0 + 1;
+                while m1 < mip_end {
+                    let idx1 = (layer * m_total + m1) as usize;
+                    if self.per_subresource[idx1] != (prev_state, prev_init) {
+                        break;
+                    }
+                    m1 += 1;
+                }
+
+                let need_barrier = !prev_init || needs_image_barrier(&prev_state, &desired);
+                if need_barrier {
                     barriers.push(ImageMemoryBarrier {
                         texture: self.handle,
-                        range: *sub_range,
-                        old_layout: prev.layout,
+                        range: TextureSubresourceRange {
+                            aspect: requested_range.aspect,
+                            base_mip_level: m0,
+                            mip_level_count: m1 - m0,
+                            base_array_layer: layer,
+                            array_layer_count: 1,
+                        },
+                        old_layout: prev_state.layout,
                         new_layout: desired.layout,
-                        src_stages: prev.stage,
+                        src_stages: prev_state.stage,
                         dst_stages: desired.stage,
-                        src_access: prev.access,
+                        src_access: prev_state.access,
                         dst_access: desired.access,
                     });
+                    for m in m0..m1 {
+                        self.per_subresource[(layer * m_total + m) as usize] = (desired, true);
+                    }
+                } else {
+                    for m in m0..m1 {
+                        let entry = &mut self.per_subresource[(layer * m_total + m) as usize];
+                        entry.0.stage |= desired.stage;
+                        entry.0.access |= desired.access;
+                    }
                 }
+                m0 = m1;
             }
-            self.subresources.clear();
-            self.subresources
-                .push((TextureSubresourceRange::ALL, desired));
-            return;
         }
 
-        if let Some((_, prev)) = self.subresources.iter_mut().find(|(r, _)| *r == range) {
-            if needs_image_barrier(prev, &desired) {
-                barriers.push(ImageMemoryBarrier {
-                    texture: self.handle,
-                    range,
-                    old_layout: prev.layout,
-                    new_layout: desired.layout,
-                    src_stages: prev.stage,
-                    dst_stages: desired.stage,
-                    src_access: prev.access,
-                    dst_access: desired.access,
-                });
-                *prev = desired;
-            } else {
-                prev.stage |= desired.stage;
-                prev.access |= desired.access;
+        if let Some(&(first_state, true)) = self.per_subresource.first() {
+            if self
+                .per_subresource
+                .iter()
+                .all(|&(s, init)| init && s == first_state)
+            {
+                self.uniform_state = first_state;
+                self.uniform_initialized = true;
+                self.per_subresource.clear();
             }
-        } else if let Some((_, all_prev)) = self
-            .subresources
-            .iter()
-            .find(|(r, _)| *r == TextureSubresourceRange::ALL)
-            .copied()
-        {
-            if needs_image_barrier(&all_prev, &desired) {
-                barriers.push(ImageMemoryBarrier {
-                    texture: self.handle,
-                    range,
-                    old_layout: all_prev.layout,
-                    new_layout: desired.layout,
-                    src_stages: all_prev.stage,
-                    dst_stages: desired.stage,
-                    src_access: all_prev.access,
-                    dst_access: desired.access,
-                });
-            }
-            self.subresources.push((range, desired));
-        } else {
-            barriers.push(ImageMemoryBarrier {
-                texture: self.handle,
-                range,
-                old_layout: ImageLayout::Undefined,
-                new_layout: desired.layout,
-                src_stages: PipelineStageFlags::TOP_OF_PIPE,
-                dst_stages: desired.stage,
-                src_access: AccessFlags::empty(),
-                dst_access: desired.access,
-            });
-            self.subresources.push((range, desired));
         }
     }
 
     fn summary_access(&self) -> Option<TextureAccess> {
-        let mut stages = PipelineStageFlags::empty();
-        let mut access = AccessFlags::empty();
-        let mut layout = ImageLayout::Undefined;
-        for (_, state) in &self.subresources {
-            stages |= state.stage;
-            access |= state.access;
-            layout = state.layout;
-        }
-        if stages.is_empty() && self.subresources.is_empty() {
-            None
+        if self.per_subresource.is_empty() {
+            if !self.uniform_initialized {
+                None
+            } else {
+                Some(TextureAccess {
+                    stage: self.uniform_state.stage,
+                    access: self.uniform_state.access,
+                    layout: self.uniform_state.layout,
+                })
+            }
         } else {
-            Some(TextureAccess {
-                stage: stages,
-                access,
-                layout,
-            })
+            let mut stages = PipelineStageFlags::empty();
+            let mut access = AccessFlags::empty();
+            let mut layout = ImageLayout::Undefined;
+            let mut any_init = false;
+            for &(state, init) in &self.per_subresource {
+                if init {
+                    any_init = true;
+                    stages |= state.stage;
+                    access |= state.access;
+                    layout = state.layout;
+                }
+            }
+            if !any_init {
+                None
+            } else {
+                Some(TextureAccess {
+                    stage: stages,
+                    access,
+                    layout,
+                })
+            }
         }
     }
 }
@@ -390,6 +416,7 @@ fn needs_buffer_barrier(prev: &BufferState, desired: &BufferState) -> bool {
 
 /// Internal compiler that converts declarative PassNodes into a scheduled execution graph.
 pub(crate) struct GraphCompiler<'a> {
+    graph_id: u32,
     passes: &'a mut [PassNode],
     textures: &'a [VirtualTexture],
     buffers: &'a [VirtualBuffer],
@@ -397,11 +424,13 @@ pub(crate) struct GraphCompiler<'a> {
 
 impl<'a> GraphCompiler<'a> {
     pub fn new(
+        graph_id: u32,
         passes: &'a mut [PassNode],
         textures: &'a [VirtualTexture],
         buffers: &'a [VirtualBuffer],
     ) -> Self {
         Self {
+            graph_id,
             passes,
             textures,
             buffers,
@@ -430,29 +459,157 @@ impl<'a> GraphCompiler<'a> {
             });
         }
 
+        // 0. Validate all resource handles and subresource bounds upfront (`RND-21`, `RND-22`)
+        let mut effective_tex_mips: SmallVec<[u32; 32]> = self
+            .textures
+            .iter()
+            .map(|t| t.extent_and_subresources().2.max(1))
+            .collect();
+        let mut effective_tex_layers: SmallVec<[u32; 32]> = self
+            .textures
+            .iter()
+            .map(|t| t.extent_and_subresources().3.max(1))
+            .collect();
+
+        let validate_tex = |tex_h: RenderGraphTextureHandle,
+                            range: Option<TextureSubresourceRange>,
+                            pass_name: &str,
+                            mips: &mut SmallVec<[u32; 32]>,
+                            layers: &mut SmallVec<[u32; 32]>|
+         -> Result<(), RenderError> {
+            let idx = tex_h.id() as usize;
+            if tex_h.graph_id() != self.graph_id || idx >= self.textures.len() {
+                return Err(RenderError::InvalidHandle(format!(
+                    "pass '{pass_name}' references invalid or foreign texture handle {tex_h:?}"
+                )));
+            }
+            if let Some(r) = range {
+                let req_mips = if r.mip_level_count == u32::MAX {
+                    r.base_mip_level.saturating_add(1)
+                } else {
+                    r.base_mip_level.saturating_add(r.mip_level_count.max(1))
+                };
+                let req_layers = if r.array_layer_count == u32::MAX {
+                    r.base_array_layer.saturating_add(1)
+                } else {
+                    r.base_array_layer
+                        .saturating_add(r.array_layer_count.max(1))
+                };
+                match &self.textures[idx].kind {
+                    VirtualTextureKind::Transient {
+                        mip_levels,
+                        array_layers,
+                        ..
+                    } => {
+                        if req_mips > *mip_levels || req_layers > *array_layers {
+                            return Err(RenderError::ValidationError(format!(
+                                "pass '{pass_name}' subresource {r:?} exceeds transient texture bounds ({mip_levels} mips, {array_layers} layers)"
+                            )));
+                        }
+                    }
+                    VirtualTextureKind::Imported { .. } => {
+                        mips[idx] = mips[idx].max(req_mips);
+                        layers[idx] = layers[idx].max(req_layers);
+                    }
+                }
+            }
+            Ok(())
+        };
+
+        let validate_buf =
+            |buf_h: RenderGraphBufferHandle, pass_name: &str| -> Result<(), RenderError> {
+                let idx = buf_h.id() as usize;
+                if buf_h.graph_id() != self.graph_id || idx >= self.buffers.len() {
+                    return Err(RenderError::InvalidHandle(format!(
+                        "pass '{pass_name}' references invalid or foreign buffer handle {buf_h:?}"
+                    )));
+                }
+                Ok(())
+            };
+
+        for pass in self.passes.iter() {
+            for (tex_h, _, range) in &pass.read_textures {
+                validate_tex(
+                    *tex_h,
+                    Some(*range),
+                    &pass.name,
+                    &mut effective_tex_mips,
+                    &mut effective_tex_layers,
+                )?;
+            }
+            for (tex_h, _, range) in &pass.write_textures {
+                validate_tex(
+                    *tex_h,
+                    Some(*range),
+                    &pass.name,
+                    &mut effective_tex_mips,
+                    &mut effective_tex_layers,
+                )?;
+            }
+            for color_desc in &pass.write_colors {
+                validate_tex(
+                    color_desc.handle,
+                    Some(TextureSubresourceRange::single(
+                        color_desc.mip_level,
+                        color_desc.layer,
+                    )),
+                    &pass.name,
+                    &mut effective_tex_mips,
+                    &mut effective_tex_layers,
+                )?;
+                if let Some(resolve_h) = color_desc.resolve_target {
+                    validate_tex(
+                        resolve_h,
+                        Some(TextureSubresourceRange::single(0, 0)),
+                        &pass.name,
+                        &mut effective_tex_mips,
+                        &mut effective_tex_layers,
+                    )?;
+                }
+            }
+            if let Some(depth_desc) = &pass.write_depth {
+                validate_tex(
+                    depth_desc.handle,
+                    Some(TextureSubresourceRange::single(
+                        depth_desc.mip_level,
+                        depth_desc.layer,
+                    )),
+                    &pass.name,
+                    &mut effective_tex_mips,
+                    &mut effective_tex_layers,
+                )?;
+            }
+            for (buf_h, _) in &pass.read_buffers {
+                validate_buf(*buf_h, &pass.name)?;
+            }
+            for (buf_h, _) in &pass.write_buffers {
+                validate_buf(*buf_h, &pass.name)?;
+            }
+        }
+
         // 1. Versioned Dependency Graph Construction (RND-04: RAW, WAR, WAW, Ping-Pong)
-        let mut tex_versions: SmallVec<[VersionTracker; 16]> = self
+        let mut tex_versions: SmallVec<[VersionTracker; 32]> = self
             .textures
             .iter()
             .map(|t| VersionTracker::new(matches!(t.kind, VirtualTextureKind::Imported { .. })))
             .collect();
-        let mut buf_versions: SmallVec<[VersionTracker; 16]> = self
+        let mut buf_versions: SmallVec<[VersionTracker; 32]> = self
             .buffers
             .iter()
             .map(|b| VersionTracker::new(matches!(b.kind, VirtualBufferKind::Imported { .. })))
             .collect();
 
-        let mut adj: SmallVec<[SmallVec<[usize; 8]>; 16]> =
+        let mut adj: SmallVec<[SmallVec<[usize; 8]>; 32]> =
             (0..pass_count).map(|_| SmallVec::new()).collect();
-        let mut data_rev_adj: SmallVec<[SmallVec<[usize; 8]>; 16]> =
+        let mut data_rev_adj: SmallVec<[SmallVec<[usize; 8]>; 32]> =
             (0..pass_count).map(|_| SmallVec::new()).collect();
 
         let add_edge =
             |u: usize,
              v: usize,
              is_data_dep: bool,
-             adj: &mut SmallVec<[SmallVec<[usize; 8]>; 16]>,
-             data_rev_adj: &mut SmallVec<[SmallVec<[usize; 8]>; 16]>| {
+             adj: &mut SmallVec<[SmallVec<[usize; 8]>; 32]>,
+             data_rev_adj: &mut SmallVec<[SmallVec<[usize; 8]>; 32]>| {
                 if u != v {
                     if !adj[u].contains(&v) {
                         adj[u].push(v);
@@ -466,8 +623,8 @@ impl<'a> GraphCompiler<'a> {
         let record_read =
             |tracker: &mut VersionTracker,
              pass_idx: usize,
-             adj: &mut SmallVec<[SmallVec<[usize; 8]>; 16]>,
-             data_rev_adj: &mut SmallVec<[SmallVec<[usize; 8]>; 16]>| {
+             adj: &mut SmallVec<[SmallVec<[usize; 8]>; 32]>,
+             data_rev_adj: &mut SmallVec<[SmallVec<[usize; 8]>; 32]>| {
                 if let Some(w) = tracker.last_writer {
                     add_edge(w, pass_idx, true, adj, data_rev_adj);
                     if !tracker.current_readers.contains(&pass_idx) {
@@ -485,8 +642,8 @@ impl<'a> GraphCompiler<'a> {
         let record_write =
             |tracker: &mut VersionTracker,
              pass_idx: usize,
-             adj: &mut SmallVec<[SmallVec<[usize; 8]>; 16]>,
-             data_rev_adj: &mut SmallVec<[SmallVec<[usize; 8]>; 16]>| {
+             adj: &mut SmallVec<[SmallVec<[usize; 8]>; 32]>,
+             data_rev_adj: &mut SmallVec<[SmallVec<[usize; 8]>; 32]>| {
                 if !tracker.current_readers.is_empty() {
                     for &r in &tracker.current_readers {
                         add_edge(r, pass_idx, false, adj, data_rev_adj);
@@ -583,8 +740,8 @@ impl<'a> GraphCompiler<'a> {
         }
 
         // 2. Dead-Pass Culling
-        let mut reachable: SmallVec<[bool; 16]> = (0..pass_count).map(|_| false).collect();
-        let mut queue: SmallVec<[usize; 16]> = SmallVec::new();
+        let mut reachable: SmallVec<[bool; 32]> = (0..pass_count).map(|_| false).collect();
+        let mut queue: SmallVec<[usize; 32]> = SmallVec::new();
 
         for (idx, pass) in self.passes.iter().enumerate() {
             let mut rooted = pass.is_root;
@@ -660,7 +817,7 @@ impl<'a> GraphCompiler<'a> {
             }
         }
 
-        let mut active_indices: SmallVec<[usize; 16]> = SmallVec::new();
+        let mut active_indices: SmallVec<[usize; 32]> = SmallVec::new();
         for (i, &is_reach) in reachable.iter().enumerate() {
             if is_reach {
                 active_indices.push(i);
@@ -668,7 +825,7 @@ impl<'a> GraphCompiler<'a> {
         }
 
         // 3. Topological Sort with Cycle Detection on Active Passes
-        let mut in_degrees: SmallVec<[usize; 16]> = (0..pass_count).map(|_| 0).collect();
+        let mut in_degrees: SmallVec<[usize; 32]> = (0..pass_count).map(|_| 0).collect();
         for &u in &active_indices {
             for &v in &adj[u] {
                 if reachable[v] {
@@ -677,14 +834,14 @@ impl<'a> GraphCompiler<'a> {
             }
         }
 
-        let mut ready: SmallVec<[usize; 16]> = SmallVec::new();
+        let mut ready: SmallVec<[usize; 32]> = SmallVec::new();
         for &idx in &active_indices {
             if in_degrees[idx] == 0 {
                 ready.push(idx);
             }
         }
 
-        let mut sorted_pass_indices: SmallVec<[usize; 16]> = SmallVec::new();
+        let mut sorted_pass_indices: SmallVec<[usize; 32]> = SmallVec::new();
         while !ready.is_empty() {
             // Pop smallest pass index to preserve registration order among independent passes
             let mut min_pos = 0;
@@ -718,15 +875,15 @@ impl<'a> GraphCompiler<'a> {
         }
 
         // 4. Lifetime Analysis and Physical Resource Aliasing (RND-02, RND-03, RND-14)
-        let mut tex_lifetimes: SmallVec<[Option<(usize, usize)>; 16]> =
+        let mut tex_lifetimes: SmallVec<[Option<(usize, usize)>; 32]> =
             (0..self.textures.len()).map(|_| None).collect();
-        let mut buf_lifetimes: SmallVec<[Option<(usize, usize)>; 16]> =
+        let mut buf_lifetimes: SmallVec<[Option<(usize, usize)>; 32]> =
             (0..self.buffers.len()).map(|_| None).collect();
 
         let touch_tex =
             |h: RenderGraphTextureHandle,
              sched_idx: usize,
-             lifetimes: &mut SmallVec<[Option<(usize, usize)>; 16]>| {
+             lifetimes: &mut SmallVec<[Option<(usize, usize)>; 32]>| {
                 let slot = &mut lifetimes[h.id() as usize];
                 match slot {
                     Some((_, last)) => *last = sched_idx,
@@ -736,7 +893,7 @@ impl<'a> GraphCompiler<'a> {
         let touch_buf =
             |h: RenderGraphBufferHandle,
              sched_idx: usize,
-             lifetimes: &mut SmallVec<[Option<(usize, usize)>; 16]>| {
+             lifetimes: &mut SmallVec<[Option<(usize, usize)>; 32]>| {
                 let slot = &mut lifetimes[h.id() as usize];
                 match slot {
                     Some((_, last)) => *last = sched_idx,
@@ -794,17 +951,21 @@ impl<'a> GraphCompiler<'a> {
         out.texture_slice.resize(self.textures.len(), None);
         out.buffer_slice.resize(self.buffers.len(), None);
 
-        let mut sorted_v_textures: SmallVec<[(RenderGraphTextureHandle, usize, usize); 16]> =
+        let mut sorted_v_textures: SmallVec<[(RenderGraphTextureHandle, usize, usize); 32]> =
             SmallVec::new();
         for (idx, lifetime) in tex_lifetimes.iter().enumerate() {
             if let Some((first, last)) = *lifetime {
-                sorted_v_textures.push((RenderGraphTextureHandle(idx as u32), first, last));
+                sorted_v_textures.push((
+                    RenderGraphTextureHandle::new(idx as u32, self.graph_id),
+                    first,
+                    last,
+                ));
             }
         }
         sorted_v_textures.sort_unstable_by_key(|&(_, first, _)| first);
 
-        let mut tex_slots: SmallVec<[PhysicalTexSlot; 16]> = SmallVec::new();
-        let mut v_tex_to_slot: SmallVec<[Option<usize>; 16]> =
+        let mut tex_slots: SmallVec<[PhysicalTexSlot; 32]> = SmallVec::new();
+        let mut v_tex_to_slot: SmallVec<[Option<usize>; 32]> =
             (0..self.textures.len()).map(|_| None).collect();
 
         for &(v_handle, first_pass, last_pass) in &sorted_v_textures {
@@ -874,17 +1035,21 @@ impl<'a> GraphCompiler<'a> {
             }
         }
 
-        let mut sorted_v_buffers: SmallVec<[(RenderGraphBufferHandle, usize, usize); 16]> =
+        let mut sorted_v_buffers: SmallVec<[(RenderGraphBufferHandle, usize, usize); 32]> =
             SmallVec::new();
         for (idx, lifetime) in buf_lifetimes.iter().enumerate() {
             if let Some((first, last)) = *lifetime {
-                sorted_v_buffers.push((RenderGraphBufferHandle(idx as u32), first, last));
+                sorted_v_buffers.push((
+                    RenderGraphBufferHandle::new(idx as u32, self.graph_id),
+                    first,
+                    last,
+                ));
             }
         }
         sorted_v_buffers.sort_unstable_by_key(|&(_, first, _)| first);
 
-        let mut buf_slots: SmallVec<[PhysicalBufSlot; 16]> = SmallVec::new();
-        let mut v_buf_to_slot: SmallVec<[Option<usize>; 16]> =
+        let mut buf_slots: SmallVec<[PhysicalBufSlot; 32]> = SmallVec::new();
+        let mut v_buf_to_slot: SmallVec<[Option<usize>; 32]> =
             (0..self.buffers.len()).map(|_| None).collect();
 
         for &(v_handle, first_pass, last_pass) in &sorted_v_buffers {
@@ -1004,9 +1169,9 @@ impl<'a> GraphCompiler<'a> {
             physical_bytes_saved,
         };
 
-        // 5. Automated Barrier Deduction & CompiledPass Generation (RND-05, RND-10)
+        // 5. Automated Barrier Deduction & CompiledPass Generation (RND-05, RND-10, RND-22)
         // Track states per physical slot (for transients) and per virtual handle (for imported resources).
-        let mut transient_tex_states: SmallVec<[TrackedTextureState; 16]> = tex_slots
+        let mut transient_tex_states: SmallVec<[TrackedTextureState; 32]> = tex_slots
             .iter()
             .map(|slot| {
                 TrackedTextureState::new_transient(
@@ -1017,27 +1182,26 @@ impl<'a> GraphCompiler<'a> {
                 )
             })
             .collect();
-        let mut imported_tex_states: SmallVec<[Option<TrackedTextureState>; 16]> = self
+        let mut imported_tex_states: SmallVec<[Option<TrackedTextureState>; 32]> = self
             .textures
             .iter()
-            .map(|t| match &t.kind {
+            .enumerate()
+            .map(|(idx, t)| match &t.kind {
                 VirtualTextureKind::Imported {
                     handle,
                     initial_access,
-                    mip_levels,
-                    array_layers,
                     ..
                 } => Some(TrackedTextureState::new_imported(
                     *handle,
-                    *mip_levels,
-                    *array_layers,
+                    effective_tex_mips[idx],
+                    effective_tex_layers[idx],
                     *initial_access,
                 )),
                 VirtualTextureKind::Transient { .. } => None,
             })
             .collect();
 
-        let mut transient_buf_states: SmallVec<[TrackedBufferState; 16]> = buf_slots
+        let mut transient_buf_states: SmallVec<[TrackedBufferState; 32]> = buf_slots
             .iter()
             .map(|slot| TrackedBufferState {
                 handle: slot.physical_handle,
@@ -1045,7 +1209,7 @@ impl<'a> GraphCompiler<'a> {
                 current: None,
             })
             .collect();
-        let mut imported_buf_states: SmallVec<[Option<TrackedBufferState>; 16]> = self
+        let mut imported_buf_states: SmallVec<[Option<TrackedBufferState>; 32]> = self
             .buffers
             .iter()
             .map(|b| match &b.kind {
@@ -1070,8 +1234,8 @@ impl<'a> GraphCompiler<'a> {
              range: TextureSubresourceRange,
              desired: ResourceState,
              barriers: &mut SmallVec<[ImageMemoryBarrier; 4]>,
-             transient_tex_states: &mut SmallVec<[TrackedTextureState; 16]>,
-             imported_tex_states: &mut SmallVec<[Option<TrackedTextureState>; 16]>| {
+             transient_tex_states: &mut SmallVec<[TrackedTextureState; 32]>,
+             imported_tex_states: &mut SmallVec<[Option<TrackedTextureState>; 32]>| {
                 if let Some(slot_idx) = v_tex_to_slot[v_handle.id() as usize] {
                     transient_tex_states[slot_idx].transition(range, desired, barriers);
                 } else if let Some(state) = &mut imported_tex_states[v_handle.id() as usize] {
@@ -1083,8 +1247,8 @@ impl<'a> GraphCompiler<'a> {
             |v_handle: RenderGraphBufferHandle,
              desired: BufferState,
              barriers: &mut SmallVec<[BufferMemoryBarrier; 4]>,
-             transient_buf_states: &mut SmallVec<[TrackedBufferState; 16]>,
-             imported_buf_states: &mut SmallVec<[Option<TrackedBufferState>; 16]>| {
+             transient_buf_states: &mut SmallVec<[TrackedBufferState; 32]>,
+             imported_buf_states: &mut SmallVec<[Option<TrackedBufferState>; 32]>| {
                 if let Some(slot_idx) = v_buf_to_slot[v_handle.id() as usize] {
                     transient_buf_states[slot_idx].transition(desired, barriers);
                 } else if let Some(state) = &mut imported_buf_states[v_handle.id() as usize] {

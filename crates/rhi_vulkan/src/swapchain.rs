@@ -29,9 +29,9 @@ use crate::resource::{TextureStorage, VulkanTexture};
 use ash::vk;
 use korppi_rhi::SmallVec;
 use korppi_rhi::{
-    PresentMode, PresentTarget, RhiError, SampleCount, SubmissionId, SwapchainDescriptor,
-    SwapchainHandle, SwapchainImage, SwapchainInfo, TextureDimension, TextureFormat, TextureHandle,
-    TextureInfo, TextureUsage,
+    BoundResource, PresentMode, PresentTarget, RhiError, SampleCount, SubmissionId,
+    SwapchainDescriptor, SwapchainHandle, SwapchainImage, SwapchainInfo, TextureDimension,
+    TextureFormat, TextureHandle, TextureInfo, TextureUsage, TextureViewHandle,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
@@ -306,16 +306,21 @@ impl VulkanDevice {
         }
     }
 
-    /// The id of a swapchain handle of this device; a handle of another device is rejected
-    /// (RHI-15), since swapchains are kept by id, not in a slot map.
+    /// The id of a swapchain handle of this device; a handle of another device or with a forged
+    /// generation is rejected (RHI-15, RVK-20), since swapchains are kept by id, not in a slot
+    /// map.
     fn swapchain_key(&self, handle: SwapchainHandle) -> Result<u32, RhiError> {
-        if handle.device() == self.resources.device {
-            Ok(handle.id())
-        } else {
-            Err(RhiError::InvalidHandle(format!(
+        if handle.device() != self.resources.device {
+            return Err(RhiError::InvalidHandle(format!(
                 "swapchain {handle:?} belongs to another device"
-            )))
+            )));
         }
+        if handle.generation() != 1 {
+            return Err(RhiError::InvalidHandle(format!(
+                "swapchain {handle:?} not found"
+            )));
+        }
+        Ok(handle.id())
     }
 
     fn swapchain_entry(
@@ -597,19 +602,39 @@ impl VulkanDevice {
         }
     }
 
-    /// Removes the swapchain's images from the registry and returns its native objects.
+    /// Removes the swapchain's images and any child views from the registries, invalidates bind
+    /// groups referencing them, and returns the native objects to destroy (RVK-20).
     fn take_swapchain_objects(&self, sc: &mut VulkanSwapchain) -> RetiredSwapchain {
-        let mut textures = lock(&self.resources.textures);
+        let mut destroyed: Vec<BoundResource> = Vec::with_capacity(sc.slots.len());
+        let mut child_views: Vec<TextureViewHandle> = Vec::new();
         let mut retired = RetiredSwapchain {
             surface: sc.surface,
             swapchain: std::mem::replace(&mut sc.swapchain, vk::SwapchainKHR::null()),
             views: Vec::with_capacity(sc.slots.len()),
             semaphores: Vec::with_capacity(sc.slots.len()),
         };
-        for slot in sc.slots.drain(..) {
-            textures.remove(slot.texture);
-            retired.views.push(slot.view);
-            retired.semaphores.push(slot.present_semaphore);
+        {
+            let mut textures = lock(&self.resources.textures);
+            for slot in sc.slots.drain(..) {
+                destroyed.push(BoundResource::Texture(slot.texture));
+                if let Some((texture, _)) = textures.remove(slot.texture) {
+                    destroyed.extend(texture.views.iter().map(|&view| BoundResource::View(view)));
+                    child_views.extend(texture.views);
+                }
+                retired.views.push(slot.view);
+                retired.semaphores.push(slot.present_semaphore);
+            }
+        }
+        if !child_views.is_empty() {
+            let mut registry = lock(&self.resources.texture_views);
+            for view_handle in child_views {
+                if let Some((view, _)) = registry.remove(view_handle) {
+                    retired.views.push(view.view);
+                }
+            }
+        }
+        if !destroyed.is_empty() {
+            self.invalidate_bind_groups(&destroyed);
         }
         retired
     }

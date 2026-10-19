@@ -46,9 +46,9 @@ pub fn fit_child_in_rect(child: &Control, available_rect: Rect2d) -> Rect2d {
     };
 
     Rect2d {
-        x,
-        y,
-        width,
-        height,
+        x: x.round(),
+        y: y.round(),
+        width: width.round(),
+        height: height.round(),
     }
 }

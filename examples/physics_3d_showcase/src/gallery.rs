@@ -117,7 +117,7 @@ impl Gallery3d for HeavyStackingGallery {
 
         // 3. Multi-shape column at x = 12.0 (spheres, capsules, boxes)
         for i in 0..12 {
-            let y = i as f32 * 1.1 + 0.6;
+            let y = i as f32 * 0.82 + 0.41;
             let b = world.create_body(RigidBody {
                 body_type: BodyType::Dynamic,
                 position: Vec3::new(12.0, y, 0.0),
@@ -132,7 +132,7 @@ impl Gallery3d for HeavyStackingGallery {
                 1 => Shape::Sphere { radius: 0.4 },
                 _ => Shape::Capsule {
                     radius: 0.3,
-                    half_height: 0.25,
+                    half_height: 0.1,
                 },
             };
 
@@ -171,14 +171,13 @@ impl Gallery3d for SoftStepTuningGallery {
             .with_friction(0.7),
         );
 
-        // Left Tower: Default Stacking (x = -4.0)
+        // Left Tower: Uniform Stiff Stacking (x = -4.0)
         let box_h = 0.5;
         for i in 0..12 {
-            let y = i as f32 * 1.05 + box_h;
+            let y = i as f32 * 1.02 + box_h;
             let b = world.create_body(RigidBody {
                 body_type: BodyType::Dynamic,
                 position: Vec3::new(-4.0, y, 0.0),
-                mass: 2.0,
                 ..Default::default()
             });
             world.create_collider(
@@ -186,25 +185,33 @@ impl Gallery3d for SoftStepTuningGallery {
                 Collider::new(Shape::Box {
                     half_extents: Vec3::splat(box_h),
                 })
+                .with_mass(2.0)
                 .with_friction(0.6),
             );
         }
 
-        // Right Tower: Compliant Stacking (x = 4.0)
+        // Right Tower: High-Mass-Ratio Compliant Drop Stacking (x = 4.0)
+        let right_h = 0.45;
         for i in 0..12 {
-            let y = i as f32 * 1.05 + box_h;
+            let y = i as f32 * 1.08 + right_h + 0.15;
+            let mass = if i == 11 {
+                40.0
+            } else {
+                1.0 + (i as f32) * 0.25
+            };
             let b = world.create_body(RigidBody {
                 body_type: BodyType::Dynamic,
                 position: Vec3::new(4.0, y, 0.0),
-                mass: 2.0,
                 ..Default::default()
             });
             world.create_collider(
                 b,
                 Collider::new(Shape::Box {
-                    half_extents: Vec3::splat(box_h),
+                    half_extents: Vec3::new(0.5, right_h, 0.5),
                 })
-                .with_friction(0.6),
+                .with_mass(mass)
+                .with_friction(0.6)
+                .with_restitution(0.15),
             );
         }
     }

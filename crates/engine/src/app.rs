@@ -15,7 +15,8 @@ use korppi_ecs::{Entity, Schedule, Stage, World};
 use korppi_input::InputManager;
 use korppi_math::{Quat, Transform, Vec3};
 use korppi_physics::joint::{
-    DistanceJoint, Joint as Joint3d, PrismaticJoint, RevoluteJoint, SphericalJoint, WeldJoint,
+    DistanceJoint, FilterJoint, Joint as Joint3d, MotorJoint, ParallelJoint, PrismaticJoint,
+    RevoluteJoint, SphericalJoint, WeldJoint, WheelJoint,
 };
 use korppi_physics::{BodyId3d, BodyType, Collider, JointId3d, PhysicsWorld, RigidBody};
 use korppi_physics2d::joint::Joint2d;
@@ -45,9 +46,22 @@ pub struct EntityJoint3d {
     pub config: Joint3dConfig,
 }
 
+impl EntityJoint3d {
+    /// Creates an [`EntityJoint3d`] connecting `entity_a` and `entity_b` from any [`Joint3dConfig`] or 3D joint definition.
+    #[must_use]
+    pub fn new(entity_a: Entity, entity_b: Entity, config: impl Into<Joint3dConfig>) -> Self {
+        Self {
+            entity_a,
+            entity_b,
+            config: config.into(),
+        }
+    }
+}
+
 impl korppi_ecs::Component for EntityJoint3d {}
 
-/// 3D joint constraint geometric configurations.
+/// 3D joint constraint geometric and solver configurations.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Joint3dConfig {
     /// Spherical (ball-and-socket) joint: constrains anchor points to coincide in 3D.
@@ -91,6 +105,136 @@ pub enum Joint3dConfig {
         /// Local-space anchor on body B.
         local_anchor_b: Vec3,
     },
+    /// Full 3D physics joint specification preserving all limits, motors, springs, frames, and joint types (`ENG-12`).
+    Full(Joint3d),
+}
+
+impl Joint3dConfig {
+    /// Materializes a [`Joint3d`] bound to `body_a` and `body_b` with cold solver impulses.
+    #[must_use]
+    pub fn to_joint(&self, body_a: BodyId3d, body_b: BodyId3d) -> Joint3d {
+        match *self {
+            Self::Spherical {
+                local_anchor_a,
+                local_anchor_b,
+            } => Joint3d::Spherical(SphericalJoint::new(
+                body_a,
+                body_b,
+                local_anchor_a,
+                local_anchor_b,
+            )),
+            Self::Revolute {
+                local_anchor_a,
+                local_anchor_b,
+                local_axis_a,
+            } => Joint3d::Revolute(RevoluteJoint::new(
+                body_a,
+                body_b,
+                local_anchor_a,
+                local_anchor_b,
+                local_axis_a,
+            )),
+            Self::Prismatic {
+                local_anchor_a,
+                local_anchor_b,
+                local_axis_a,
+            } => Joint3d::Prismatic(PrismaticJoint::new(
+                body_a,
+                body_b,
+                local_anchor_a,
+                local_anchor_b,
+                local_axis_a,
+            )),
+            Self::Distance {
+                local_anchor_a,
+                local_anchor_b,
+                distance,
+            } => Joint3d::Distance(DistanceJoint::new(
+                body_a,
+                body_b,
+                local_anchor_a,
+                local_anchor_b,
+                distance,
+            )),
+            Self::Weld {
+                local_anchor_a,
+                local_anchor_b,
+            } => Joint3d::Weld(WeldJoint::new(
+                body_a,
+                body_b,
+                local_anchor_a,
+                local_anchor_b,
+            )),
+            Self::Full(ref joint) => {
+                let mut cloned = joint.clone();
+                let base = cloned.base_mut();
+                base.body_a = body_a.index();
+                base.body_b = body_b.index();
+                cloned.reset_impulses();
+                cloned
+            }
+        }
+    }
+}
+
+impl From<Joint3d> for Joint3dConfig {
+    fn from(joint: Joint3d) -> Self {
+        Self::Full(joint)
+    }
+}
+
+impl From<SphericalJoint> for Joint3dConfig {
+    fn from(joint: SphericalJoint) -> Self {
+        Self::Full(Joint3d::Spherical(joint))
+    }
+}
+
+impl From<RevoluteJoint> for Joint3dConfig {
+    fn from(joint: RevoluteJoint) -> Self {
+        Self::Full(Joint3d::Revolute(joint))
+    }
+}
+
+impl From<PrismaticJoint> for Joint3dConfig {
+    fn from(joint: PrismaticJoint) -> Self {
+        Self::Full(Joint3d::Prismatic(joint))
+    }
+}
+
+impl From<DistanceJoint> for Joint3dConfig {
+    fn from(joint: DistanceJoint) -> Self {
+        Self::Full(Joint3d::Distance(joint))
+    }
+}
+
+impl From<WeldJoint> for Joint3dConfig {
+    fn from(joint: WeldJoint) -> Self {
+        Self::Full(Joint3d::Weld(joint))
+    }
+}
+
+impl From<WheelJoint> for Joint3dConfig {
+    fn from(joint: WheelJoint) -> Self {
+        Self::Full(Joint3d::Wheel(joint))
+    }
+}
+
+impl From<MotorJoint> for Joint3dConfig {
+    fn from(joint: MotorJoint) -> Self {
+        Self::Full(Joint3d::Motor(joint))
+    }
+}
+
+impl From<ParallelJoint> for Joint3dConfig {
+    fn from(joint: ParallelJoint) -> Self {
+        Self::Full(Joint3d::Parallel(joint))
+    }
+}
+
+impl From<FilterJoint> for Joint3dConfig {
+    fn from(joint: FilterJoint) -> Self {
+        Self::Full(Joint3d::Filter(joint))
+    }
 }
 
 /// 2D joint constraint connecting two ECS entities.
@@ -105,6 +249,28 @@ pub struct EntityJoint2d {
 }
 
 impl korppi_ecs::Component for EntityJoint2d {}
+
+impl korppi_scene::EntityRemap for EntityJoint3d {
+    fn remap_entities(&mut self, map: &HashMap<Entity, Entity>) {
+        if let Some(&new_a) = map.get(&self.entity_a) {
+            self.entity_a = new_a;
+        }
+        if let Some(&new_b) = map.get(&self.entity_b) {
+            self.entity_b = new_b;
+        }
+    }
+}
+
+impl korppi_scene::EntityRemap for EntityJoint2d {
+    fn remap_entities(&mut self, map: &HashMap<Entity, Entity>) {
+        if let Some(&new_a) = map.get(&self.entity_a) {
+            self.entity_a = new_a;
+        }
+        if let Some(&new_b) = map.get(&self.entity_b) {
+            self.entity_b = new_b;
+        }
+    }
+}
 
 /// Central engine application orchestrator unifying all engine subsystems.
 pub struct EngineApp {
@@ -153,6 +319,10 @@ pub struct EngineApp {
     ui_roots_scratch: Vec<Entity>,
     /// Lazily initialized GPU quad renderer for offscreen `RenderGraph` UI passes.
     offscreen_ui_quads: Option<QuadBatchRenderer>,
+    /// Persistent render graph reused across `render_ui_graph` invocations (`ENG-14`).
+    ui_render_graph: RenderGraph,
+    /// Last cursor position forwarded into `ui_dispatcher` (`ENG-10`).
+    last_dispatched_mouse_pos: Option<korppi_math::Vec2>,
     /// Currently active RHI graphics device.
     pub graphics_device: Option<Arc<dyn GraphicsDevice>>,
     /// Active window presenter when attached to an OS window.
@@ -161,12 +331,18 @@ pub struct EngineApp {
     pub is_running: bool,
     /// Entity to 3D physics body index mapping.
     entity_to_body3d: HashMap<Entity, BodyId3d>,
+    /// Reverse 3D physics body to Entity mapping (`ENG-09`).
+    body3d_to_entity: HashMap<BodyId3d, Entity>,
     /// Entity to 2D physics body mapping.
     entity_to_body2d: HashMap<Entity, BodyId2d>,
     /// Entity to 3D joint index mapping.
     entity_to_joint3d: HashMap<Entity, JointId3d>,
+    /// Last synchronized 3D joint state per entity (`ENG-12`).
+    synced_joints_3d: HashMap<Entity, EntityJoint3d>,
     /// Entity to 2D joint mapping.
     entity_to_joint2d: HashMap<Entity, JointId2d>,
+    /// Last synchronized 2D joint state per entity (`ENG-12`).
+    synced_joints_2d: HashMap<Entity, EntityJoint2d>,
     /// Reusable scratch buffer for 3D body mutation and stale-body sweeps (Rule 4).
     scratch_bodies_3d: Vec<(Entity, BodyId3d)>,
     /// Reusable scratch buffer for stale 3D joint sweeps (Rule 4).
@@ -175,6 +351,18 @@ pub struct EngineApp {
     scratch_bodies_2d: Vec<(Entity, BodyId2d)>,
     /// Reusable scratch buffer for stale 2D joint sweeps (Rule 4).
     scratch_joints_2d: Vec<(Entity, JointId2d)>,
+    /// Reusable scratch buffer for newly spawned 3D `(RigidBody, Collider)` entities (`ENG-09`).
+    new_bodies_3d: Vec<(Entity, RigidBody, Collider)>,
+    /// Reusable scratch buffer for newly spawned bare 3D `RigidBody` entities (`ENG-09`).
+    new_bare_bodies_3d: Vec<(Entity, RigidBody)>,
+    /// Reusable scratch buffer for newly spawned 3D joints (`ENG-09`, `ENG-12`).
+    new_joints_3d: Vec<(Entity, EntityJoint3d, Joint3d)>,
+    /// Reusable scratch buffer for newly spawned 2D `(RigidBody2d, Collider2d)` entities (`ENG-09`).
+    new_bodies_2d: Vec<(Entity, RigidBody2d, Collider2d)>,
+    /// Reusable scratch buffer for newly spawned bare 2D `RigidBody2d` entities (`ENG-09`).
+    new_bare_bodies_2d: Vec<(Entity, RigidBody2d)>,
+    /// Reusable scratch buffer for newly spawned 2D joints (`ENG-09`, `ENG-12`).
+    new_joints_2d: Vec<(Entity, EntityJoint2d, BodyId2d, BodyId2d)>,
 }
 
 impl QuadBatchSource for EngineApp {
@@ -184,6 +372,23 @@ impl QuadBatchSource for EngineApp {
 }
 
 impl EngineApp {
+    /// Builds a [`korppi_scene::SceneRegistry`] pre-registered with standard engine, scene,
+    /// physics, and audio components.
+    #[must_use]
+    pub fn default_scene_registry() -> korppi_scene::SceneRegistry {
+        let mut registry = korppi_scene::SceneRegistry::default();
+        registry.register::<RigidBody>("RigidBody");
+        registry.register::<Collider>("Collider");
+        registry.register::<RigidBody2d>("RigidBody2d");
+        registry.register::<Collider2d>("Collider2d");
+        registry.register_remappable::<EntityJoint3d>("EntityJoint3d");
+        registry.register_remappable::<EntityJoint2d>("EntityJoint2d");
+        registry.register::<korppi_audio::AudioListener>("AudioListener");
+        registry.register::<korppi_audio::AcousticMaterialComponent>("AcousticMaterialComponent");
+        registry.register::<AcousticMaterial>("AcousticMaterial");
+        registry
+    }
+
     /// Creates a new `EngineApp` configured with default parameters.
     pub fn new() -> Result<Self, RhiError> {
         Self::with_config(EngineConfig::default())
@@ -191,7 +396,27 @@ impl EngineApp {
 
     /// Creates a new `EngineApp` configured with custom parameters.
     pub fn with_config(config: EngineConfig) -> Result<Self, RhiError> {
-        let clock = FixedClock::new(config.tick_rate);
+        if config.tick_rate == 0 {
+            return Err(RhiError::ValidationError(
+                "EngineConfig::tick_rate must be greater than zero".into(),
+            ));
+        }
+        if config.max_sub_steps == 0 {
+            return Err(RhiError::ValidationError(
+                "EngineConfig::max_sub_steps must be greater than zero".into(),
+            ));
+        }
+        if !config.window_size.x.is_finite()
+            || !config.window_size.y.is_finite()
+            || config.window_size.x <= 0.0
+            || config.window_size.y <= 0.0
+        {
+            return Err(RhiError::ValidationError(
+                "EngineConfig::window_size dimensions must be finite and positive".into(),
+            ));
+        }
+        let mut clock = FixedClock::new(config.tick_rate);
+        clock.set_max_sub_steps(config.max_sub_steps);
         let physics_3d = PhysicsWorld::new();
         let physics_2d = PhysicsWorld2d::new();
         let input = InputManager::new();
@@ -239,17 +464,28 @@ impl EngineApp {
             clear_color: [0.05, 0.06, 0.08, 1.0],
             ui_roots_scratch: Vec::with_capacity(16),
             offscreen_ui_quads: None,
+            ui_render_graph: RenderGraph::new(),
+            last_dispatched_mouse_pos: None,
             graphics_device: None,
             presenter: None,
             is_running: true,
-            entity_to_body3d: HashMap::new(),
-            entity_to_body2d: HashMap::new(),
-            entity_to_joint3d: HashMap::new(),
-            entity_to_joint2d: HashMap::new(),
+            entity_to_body3d: HashMap::with_capacity(64),
+            body3d_to_entity: HashMap::with_capacity(64),
+            entity_to_body2d: HashMap::with_capacity(64),
+            entity_to_joint3d: HashMap::with_capacity(16),
+            synced_joints_3d: HashMap::with_capacity(16),
+            entity_to_joint2d: HashMap::with_capacity(16),
+            synced_joints_2d: HashMap::with_capacity(16),
             scratch_bodies_3d: Vec::with_capacity(64),
             scratch_joints_3d: Vec::with_capacity(16),
             scratch_bodies_2d: Vec::with_capacity(64),
             scratch_joints_2d: Vec::with_capacity(16),
+            new_bodies_3d: Vec::with_capacity(64),
+            new_bare_bodies_3d: Vec::with_capacity(64),
+            new_joints_3d: Vec::with_capacity(16),
+            new_bodies_2d: Vec::with_capacity(64),
+            new_bare_bodies_2d: Vec::with_capacity(64),
+            new_joints_2d: Vec::with_capacity(16),
         };
 
         app.set_graphics_backend(app.config.backend)?;
@@ -385,11 +621,13 @@ impl EngineApp {
                             let new_body = ecs_body.clone();
                             let new_col = self.world.get::<Collider>(entity).cloned();
                             self.physics_3d.destroy_body(body_id);
+                            self.body3d_to_entity.remove(&body_id);
                             let new_id = self.physics_3d.create_body(new_body);
                             if let Some(col) = new_col {
                                 self.physics_3d.create_collider(new_id, col);
                             }
                             self.entity_to_body3d.insert(entity, new_id);
+                            self.body3d_to_entity.insert(new_id, entity);
                             body_type_recreated = true;
                             continue;
                         }
@@ -475,144 +713,231 @@ impl EngineApp {
                 let physics = &self.physics_3d;
                 self.entity_to_joint3d
                     .retain(|_, &mut jid| physics.joint(jid).is_some());
+                let joint_map = &self.entity_to_joint3d;
+                self.synced_joints_3d
+                    .retain(|entity, _| joint_map.contains_key(entity));
             }
         }
 
         self.remove_stale_physics_3d();
 
         // Collect new entities with (RigidBody, Collider)
-        let mut new_bodies = Vec::new();
+        self.new_bodies_3d.clear();
         {
+            let entity_to_body3d = &self.entity_to_body3d;
+            let new_bodies = &mut self.new_bodies_3d;
             let mut query = self.world.query_mut::<(Entity, &RigidBody, &Collider)>();
             for (entity, body, collider) in &mut query {
-                if !self.entity_to_body3d.contains_key(&entity) {
+                if !entity_to_body3d.contains_key(&entity) {
                     new_bodies.push((entity, body.clone(), collider.clone()));
                 }
             }
         }
+        self.new_bodies_3d
+            .sort_unstable_by_key(|&(entity, _, _)| entity);
 
-        for (entity, body, collider) in new_bodies {
+        for (entity, body, collider) in self.new_bodies_3d.drain(..) {
             self.acoustics_stale |= body.body_type == BodyType::Static;
             let body_id = self.physics_3d.create_body(body);
             self.physics_3d.create_collider(body_id, collider);
             self.entity_to_body3d.insert(entity, body_id);
+            self.body3d_to_entity.insert(body_id, entity);
         }
 
         // Also check entities with only RigidBody (no collider)
-        let mut new_bare_bodies = Vec::new();
+        self.new_bare_bodies_3d.clear();
         {
+            let entity_to_body3d = &self.entity_to_body3d;
+            let new_bare_bodies = &mut self.new_bare_bodies_3d;
             let mut query = self.world.query_mut::<(Entity, &RigidBody)>();
             for (entity, body) in &mut query {
-                if !self.entity_to_body3d.contains_key(&entity) {
+                if !entity_to_body3d.contains_key(&entity) {
                     new_bare_bodies.push((entity, body.clone()));
                 }
             }
         }
-        for (entity, body) in new_bare_bodies {
+        self.new_bare_bodies_3d
+            .sort_unstable_by_key(|&(entity, _)| entity);
+        for (entity, body) in self.new_bare_bodies_3d.drain(..) {
             let body_id = self.physics_3d.create_body(body);
             self.entity_to_body3d.insert(entity, body_id);
+            self.body3d_to_entity.insert(body_id, entity);
         }
 
-        // Synchronize 3D joints
-        let mut new_joints = Vec::new();
+        // Synchronize mutations on existing 3D joints (`ENG-12`)
+        self.scratch_joints_3d.clear();
         {
+            let world = &self.world;
+            let synced = &self.synced_joints_3d;
+            self.scratch_joints_3d.extend(
+                self.entity_to_joint3d
+                    .iter()
+                    .filter(|&(&entity, _)| {
+                        world.get::<EntityJoint3d>(entity) != synced.get(&entity)
+                    })
+                    .map(|(&entity, &jid)| (entity, jid)),
+            );
+        }
+        if !self.scratch_joints_3d.is_empty() {
+            self.scratch_joints_3d
+                .sort_unstable_by_key(|&(entity, _)| entity);
+            for i in 0..self.scratch_joints_3d.len() {
+                let (entity, jid) = self.scratch_joints_3d[i];
+                let Some(ecs_joint) = self.world.get::<EntityJoint3d>(entity).cloned() else {
+                    continue;
+                };
+                if let (Some(&body_a), Some(&body_b)) = (
+                    self.entity_to_body3d.get(&ecs_joint.entity_a),
+                    self.entity_to_body3d.get(&ecs_joint.entity_b),
+                ) {
+                    let phys_joint = ecs_joint.config.to_joint(body_a, body_b);
+                    let same_bodies = self.physics_3d.joint(jid).is_some_and(|j| {
+                        j.body_a() == body_a.index() && j.body_b() == body_b.index()
+                    });
+                    if same_bodies {
+                        if let Some(j) = self.physics_3d.joint_mut(jid) {
+                            *j = phys_joint;
+                        }
+                    } else {
+                        self.physics_3d.destroy_joint(jid);
+                        let new_jid = self.physics_3d.create_joint(phys_joint);
+                        self.entity_to_joint3d.insert(entity, new_jid);
+                    }
+                    self.synced_joints_3d.insert(entity, ecs_joint);
+                }
+            }
+        }
+
+        // Synchronize newly spawned 3D joints
+        self.new_joints_3d.clear();
+        {
+            let entity_to_joint3d = &self.entity_to_joint3d;
+            let entity_to_body3d = &self.entity_to_body3d;
+            let new_joints = &mut self.new_joints_3d;
             let mut query = self.world.query_mut::<(Entity, &EntityJoint3d)>();
             for (entity, joint) in &mut query {
-                if !self.entity_to_joint3d.contains_key(&entity) {
+                if !entity_to_joint3d.contains_key(&entity) {
                     if let (Some(&body_a), Some(&body_b)) = (
-                        self.entity_to_body3d.get(&joint.entity_a),
-                        self.entity_to_body3d.get(&joint.entity_b),
+                        entity_to_body3d.get(&joint.entity_a),
+                        entity_to_body3d.get(&joint.entity_b),
                     ) {
-                        let phys_joint = match joint.config {
-                            Joint3dConfig::Spherical {
-                                local_anchor_a,
-                                local_anchor_b,
-                            } => Joint3d::Spherical(SphericalJoint::new(
-                                body_a,
-                                body_b,
-                                local_anchor_a,
-                                local_anchor_b,
-                            )),
-                            Joint3dConfig::Revolute {
-                                local_anchor_a,
-                                local_anchor_b,
-                                local_axis_a,
-                            } => Joint3d::Revolute(RevoluteJoint::new(
-                                body_a,
-                                body_b,
-                                local_anchor_a,
-                                local_anchor_b,
-                                local_axis_a,
-                            )),
-                            Joint3dConfig::Prismatic {
-                                local_anchor_a,
-                                local_anchor_b,
-                                local_axis_a,
-                            } => Joint3d::Prismatic(PrismaticJoint::new(
-                                body_a,
-                                body_b,
-                                local_anchor_a,
-                                local_anchor_b,
-                                local_axis_a,
-                            )),
-                            Joint3dConfig::Distance {
-                                local_anchor_a,
-                                local_anchor_b,
-                                distance,
-                            } => Joint3d::Distance(DistanceJoint::new(
-                                body_a,
-                                body_b,
-                                local_anchor_a,
-                                local_anchor_b,
-                                distance,
-                            )),
-                            Joint3dConfig::Weld {
-                                local_anchor_a,
-                                local_anchor_b,
-                            } => Joint3d::Weld(WeldJoint::new(
-                                body_a,
-                                body_b,
-                                local_anchor_a,
-                                local_anchor_b,
-                            )),
-                        };
-                        new_joints.push((entity, phys_joint));
+                        let phys_joint = joint.config.to_joint(body_a, body_b);
+                        new_joints.push((entity, joint.clone(), phys_joint));
                     }
                 }
             }
         }
-        for (entity, phys_joint) in new_joints {
+        self.new_joints_3d
+            .sort_unstable_by_key(|&(entity, _, _)| entity);
+        for (entity, ecs_joint, phys_joint) in self.new_joints_3d.drain(..) {
             let j_id = self.physics_3d.create_joint(phys_joint);
             self.entity_to_joint3d.insert(entity, j_id);
+            self.synced_joints_3d.insert(entity, ecs_joint);
         }
     }
 
-    /// Synchronizes 3D simulation results back into ECS components after physics stepping.
+    /// Computes the world-space transform matrix of `entity`'s parent hierarchy (`None` if root).
+    fn parent_world_matrix(world: &World, entity: Entity) -> Option<korppi_math::Mat4> {
+        let _ = world.parent_of(entity)?;
+        let mut acc = korppi_math::Mat4::IDENTITY;
+        for anc in world.ancestors(entity) {
+            let anc_mat = if let Some(local) = world.get::<LocalTransform>(anc) {
+                local.compute_matrix()
+            } else if let Some(global) = world.get::<GlobalTransform>(anc) {
+                global.matrix
+            } else {
+                korppi_math::Mat4::IDENTITY
+            };
+            acc = anc_mat * acc;
+        }
+        Some(acc)
+    }
+
+    /// Synchronizes 3D simulation results back into ECS components after physics stepping (`ENG-11`).
     fn sync_physics_3d_after_step(&mut self) {
-        for (&entity, &body_id) in &self.entity_to_body3d {
+        self.scratch_bodies_3d.clear();
+        self.scratch_bodies_3d
+            .extend(self.entity_to_body3d.iter().map(|(&e, &b)| (e, b)));
+        {
+            let world = &self.world;
+            self.scratch_bodies_3d
+                .sort_unstable_by_key(|&(entity, _)| (world.ancestors(entity).count(), entity));
+        }
+
+        for i in 0..self.scratch_bodies_3d.len() {
+            let (entity, body_id) = self.scratch_bodies_3d[i];
             if let Some(phys_body) = self.physics_3d.body(body_id) {
                 let pos = phys_body.position;
                 let rot = phys_body.rotation;
-                let phys_snapshot = phys_body.clone();
 
-                if let Some(rb) = self.world.get_mut::<RigidBody>(entity) {
-                    *rb = phys_snapshot;
+                if self.world.get::<RigidBody>(entity) != Some(phys_body) {
+                    let phys_snapshot = phys_body.clone();
+                    if let Some(rb) = self.world.get_mut::<RigidBody>(entity) {
+                        *rb = phys_snapshot;
+                    }
                 }
 
+                let parent_mat = Self::parent_world_matrix(&self.world, entity);
                 let mut local_scale = None;
-                if let Some(local) = self.world.get_mut::<LocalTransform>(entity) {
-                    local.translation = pos;
-                    local.rotation = rot;
-                    local_scale = Some(local.scale);
+                let mut target_world_mat = None;
+                if let Some(&current_local) = self.world.get::<LocalTransform>(entity) {
+                    local_scale = Some(current_local.scale);
+                    let desired_local = if let Some(p_mat) = parent_mat {
+                        let p_rot = GlobalTransform::from_matrix(p_mat).rotation();
+                        LocalTransform {
+                            translation: p_mat.inverse().transform_point3(pos),
+                            rotation: (p_rot.inverse() * rot).normalize(),
+                            scale: current_local.scale,
+                        }
+                    } else {
+                        LocalTransform {
+                            translation: pos,
+                            rotation: rot,
+                            scale: current_local.scale,
+                        }
+                    };
+                    let current_world_mat = parent_mat.map_or_else(
+                        || current_local.compute_matrix(),
+                        |p| p * current_local.compute_matrix(),
+                    );
+                    let cur_global = GlobalTransform::from_matrix(current_world_mat);
+                    let pose_changed = if parent_mat.is_some() {
+                        (cur_global.translation() - pos).length_squared() > 1e-12
+                            || cur_global.rotation().dot(rot).abs() < 1.0 - 1e-6
+                    } else {
+                        current_local != desired_local
+                    };
+                    let final_local = if pose_changed {
+                        if let Some(local) = self.world.get_mut::<LocalTransform>(entity) {
+                            *local = desired_local;
+                        }
+                        desired_local
+                    } else {
+                        current_local
+                    };
+                    target_world_mat = Some(parent_mat.map_or_else(
+                        || final_local.compute_matrix(),
+                        |p| p * final_local.compute_matrix(),
+                    ));
                 }
 
-                if let Some(global) = self.world.get_mut::<GlobalTransform>(entity) {
-                    let scale = local_scale.unwrap_or_else(|| global.scale());
-                    *global = GlobalTransform::from_transform(Transform {
-                        translation: pos,
-                        rotation: rot,
-                        scale,
-                    });
+                if let Some(&current_global) = self.world.get::<GlobalTransform>(entity) {
+                    let desired_global = match target_world_mat {
+                        Some(mat) => GlobalTransform::from_matrix(mat),
+                        None => {
+                            let scale = local_scale.unwrap_or_else(|| current_global.scale());
+                            GlobalTransform::from_transform(Transform {
+                                translation: pos,
+                                rotation: rot,
+                                scale,
+                            })
+                        }
+                    };
+                    if current_global != desired_global {
+                        if let Some(global) = self.world.get_mut::<GlobalTransform>(entity) {
+                            *global = desired_global;
+                        }
+                    }
                 }
             }
         }
@@ -646,6 +971,7 @@ impl EngineApp {
                     .is_some_and(|body| body.body_type == BodyType::Static);
                 self.physics_3d.destroy_body(body);
                 self.entity_to_body3d.remove(&entity);
+                self.body3d_to_entity.remove(&body);
             }
         }
 
@@ -671,6 +997,7 @@ impl EngineApp {
                 let (entity, joint) = self.scratch_joints_3d[i];
                 self.physics_3d.destroy_joint(joint);
                 self.entity_to_joint3d.remove(&entity);
+                self.synced_joints_3d.remove(&entity);
                 if self.world.is_alive(entity) && self.world.get::<EntityJoint3d>(entity).is_some()
                 {
                     self.world.remove_component::<EntityJoint3d>(entity);
@@ -797,59 +1124,124 @@ impl EngineApp {
 
         self.remove_stale_physics_2d();
 
-        let mut new_bodies = Vec::new();
+        self.new_bodies_2d.clear();
         {
+            let entity_to_body2d = &self.entity_to_body2d;
+            let entity_to_body3d = &self.entity_to_body3d;
+            let new_bodies = &mut self.new_bodies_2d;
             let mut query = self
                 .world
                 .query_mut::<(Entity, &RigidBody2d, &Collider2d)>();
             for (entity, body, collider) in &mut query {
-                if !self.entity_to_body2d.contains_key(&entity)
-                    && !self.entity_to_body3d.contains_key(&entity)
+                if !entity_to_body2d.contains_key(&entity)
+                    && !entity_to_body3d.contains_key(&entity)
                 {
                     new_bodies.push((entity, body.clone(), *collider));
                 }
             }
         }
+        self.new_bodies_2d
+            .sort_unstable_by_key(|&(entity, _, _)| entity);
 
-        for (entity, body, collider) in new_bodies {
+        for (entity, body, collider) in self.new_bodies_2d.drain(..) {
             let body_id = self.physics_2d.create_body(body);
             self.physics_2d.create_collider(body_id, collider);
             self.entity_to_body2d.insert(entity, body_id);
         }
 
-        let mut new_bare_bodies = Vec::new();
+        self.new_bare_bodies_2d.clear();
         {
+            let entity_to_body2d = &self.entity_to_body2d;
+            let entity_to_body3d = &self.entity_to_body3d;
+            let new_bare_bodies = &mut self.new_bare_bodies_2d;
             let mut query = self.world.query_mut::<(Entity, &RigidBody2d)>();
             for (entity, body) in &mut query {
-                if !self.entity_to_body2d.contains_key(&entity)
-                    && !self.entity_to_body3d.contains_key(&entity)
+                if !entity_to_body2d.contains_key(&entity)
+                    && !entity_to_body3d.contains_key(&entity)
                 {
                     new_bare_bodies.push((entity, body.clone()));
                 }
             }
         }
-        for (entity, body) in new_bare_bodies {
+        self.new_bare_bodies_2d
+            .sort_unstable_by_key(|&(entity, _)| entity);
+        for (entity, body) in self.new_bare_bodies_2d.drain(..) {
             let body_id = self.physics_2d.create_body(body);
             self.entity_to_body2d.insert(entity, body_id);
         }
 
-        let mut new_joints = Vec::new();
+        // Synchronize mutations on existing 2D joints (`ENG-12`)
+        self.scratch_joints_2d.clear();
         {
+            let world = &self.world;
+            let synced = &self.synced_joints_2d;
+            self.scratch_joints_2d.extend(
+                self.entity_to_joint2d
+                    .iter()
+                    .filter(|&(&entity, _)| {
+                        world.get::<EntityJoint2d>(entity) != synced.get(&entity)
+                    })
+                    .map(|(&entity, &jid)| (entity, jid)),
+            );
+        }
+        if !self.scratch_joints_2d.is_empty() {
+            self.scratch_joints_2d
+                .sort_unstable_by_key(|&(entity, _)| entity);
+            for i in 0..self.scratch_joints_2d.len() {
+                let (entity, jid) = self.scratch_joints_2d[i];
+                let Some(ecs_joint) = self.world.get::<EntityJoint2d>(entity).cloned() else {
+                    continue;
+                };
+                if let (Some(&body_a), Some(&body_b)) = (
+                    self.entity_to_body2d.get(&ecs_joint.entity_a),
+                    self.entity_to_body2d.get(&ecs_joint.entity_b),
+                ) {
+                    let same_bodies = self
+                        .physics_2d
+                        .joint(jid)
+                        .is_some_and(|inst| inst.body_a == body_a && inst.body_b == body_b);
+                    if same_bodies {
+                        if let Some(inst) = self.physics_2d.joint_mut(jid) {
+                            inst.joint = ecs_joint.joint;
+                        }
+                    } else {
+                        self.physics_2d.destroy_joint(jid);
+                        let new_jid = self
+                            .physics_2d
+                            .create_joint(body_a, body_b, ecs_joint.joint);
+                        self.entity_to_joint2d.insert(entity, new_jid);
+                    }
+                    self.synced_joints_2d.insert(entity, ecs_joint);
+                }
+            }
+        }
+
+        // Synchronize newly spawned 2D joints
+        self.new_joints_2d.clear();
+        {
+            let entity_to_joint2d = &self.entity_to_joint2d;
+            let entity_to_body2d = &self.entity_to_body2d;
+            let new_joints = &mut self.new_joints_2d;
             let mut query = self.world.query_mut::<(Entity, &EntityJoint2d)>();
             for (entity, joint) in &mut query {
-                if !self.entity_to_joint2d.contains_key(&entity) {
+                if !entity_to_joint2d.contains_key(&entity) {
                     if let (Some(&body_a), Some(&body_b)) = (
-                        self.entity_to_body2d.get(&joint.entity_a),
-                        self.entity_to_body2d.get(&joint.entity_b),
+                        entity_to_body2d.get(&joint.entity_a),
+                        entity_to_body2d.get(&joint.entity_b),
                     ) {
-                        new_joints.push((entity, body_a, body_b, joint.joint));
+                        new_joints.push((entity, joint.clone(), body_a, body_b));
                     }
                 }
             }
         }
-        for (entity, body_a, body_b, joint_spec) in new_joints {
-            let j_id = self.physics_2d.create_joint(body_a, body_b, joint_spec);
+        self.new_joints_2d
+            .sort_unstable_by_key(|&(entity, _, _, _)| entity);
+        for (entity, ecs_joint, body_a, body_b) in self.new_joints_2d.drain(..) {
+            let j_id = self
+                .physics_2d
+                .create_joint(body_a, body_b, ecs_joint.joint);
             self.entity_to_joint2d.insert(entity, j_id);
+            self.synced_joints_2d.insert(entity, ecs_joint);
         }
     }
 
@@ -905,6 +1297,7 @@ impl EngineApp {
                 let (entity, joint) = self.scratch_joints_2d[i];
                 self.physics_2d.destroy_joint(joint);
                 self.entity_to_joint2d.remove(&entity);
+                self.synced_joints_2d.remove(&entity);
                 if self.world.is_alive(entity) && self.world.get::<EntityJoint2d>(entity).is_some()
                 {
                     self.world.remove_component::<EntityJoint2d>(entity);
@@ -920,35 +1313,98 @@ impl EngineApp {
         }
     }
 
-    /// Synchronizes 2D simulation results back into ECS components after physics stepping.
+    /// Synchronizes 2D simulation results back into ECS components after physics stepping (`ENG-11`).
     fn sync_physics_2d_after_step(&mut self) {
-        for (&entity, &body_id) in &self.entity_to_body2d {
+        self.scratch_bodies_2d.clear();
+        self.scratch_bodies_2d
+            .extend(self.entity_to_body2d.iter().map(|(&e, &b)| (e, b)));
+        {
+            let world = &self.world;
+            self.scratch_bodies_2d
+                .sort_unstable_by_key(|&(entity, _)| (world.ancestors(entity).count(), entity));
+        }
+
+        for i in 0..self.scratch_bodies_2d.len() {
+            let (entity, body_id) = self.scratch_bodies_2d[i];
             if let Some(phys_body) = self.physics_2d.body(body_id) {
                 let pos = phys_body.position;
                 let rot = phys_body.rotation;
                 let rot_quat = Quat::from_axis_angle(Vec3::Z, rot.angle());
-                let phys_snapshot = phys_body.clone();
 
-                if let Some(rb) = self.world.get_mut::<RigidBody2d>(entity) {
-                    *rb = phys_snapshot;
+                if self.world.get::<RigidBody2d>(entity) != Some(phys_body) {
+                    let phys_snapshot = phys_body.clone();
+                    if let Some(rb) = self.world.get_mut::<RigidBody2d>(entity) {
+                        *rb = phys_snapshot;
+                    }
                 }
 
+                let parent_mat = Self::parent_world_matrix(&self.world, entity);
                 let mut local_z_and_scale = None;
-                if let Some(local) = self.world.get_mut::<LocalTransform>(entity) {
-                    local.translation.x = pos.x;
-                    local.translation.y = pos.y;
-                    local.rotation = rot_quat;
-                    local_z_and_scale = Some((local.translation.z, local.scale));
+                let mut target_world_mat = None;
+                if let Some(&current_local) = self.world.get::<LocalTransform>(entity) {
+                    local_z_and_scale = Some((current_local.translation.z, current_local.scale));
+                    let desired_local = if let Some(p_mat) = parent_mat {
+                        let current_world = p_mat * current_local.compute_matrix();
+                        let world_z = current_world.col(3).z;
+                        let world_pos = Vec3::new(pos.x, pos.y, world_z);
+                        let p_rot = GlobalTransform::from_matrix(p_mat).rotation();
+                        LocalTransform {
+                            translation: p_mat.inverse().transform_point3(world_pos),
+                            rotation: (p_rot.inverse() * rot_quat).normalize(),
+                            scale: current_local.scale,
+                        }
+                    } else {
+                        LocalTransform {
+                            translation: Vec3::new(pos.x, pos.y, current_local.translation.z),
+                            rotation: rot_quat,
+                            scale: current_local.scale,
+                        }
+                    };
+                    let current_world_mat = parent_mat.map_or_else(
+                        || current_local.compute_matrix(),
+                        |p| p * current_local.compute_matrix(),
+                    );
+                    let cur_global = GlobalTransform::from_matrix(current_world_mat);
+                    let cur_t = cur_global.translation();
+                    let pose_changed = if parent_mat.is_some() {
+                        (cur_t.x - pos.x).powi(2) + (cur_t.y - pos.y).powi(2) > 1e-12
+                            || cur_global.rotation().dot(rot_quat).abs() < 1.0 - 1e-6
+                    } else {
+                        current_local != desired_local
+                    };
+                    let final_local = if pose_changed {
+                        if let Some(local) = self.world.get_mut::<LocalTransform>(entity) {
+                            *local = desired_local;
+                        }
+                        desired_local
+                    } else {
+                        current_local
+                    };
+                    target_world_mat = Some(parent_mat.map_or_else(
+                        || final_local.compute_matrix(),
+                        |p| p * final_local.compute_matrix(),
+                    ));
                 }
 
-                if let Some(global) = self.world.get_mut::<GlobalTransform>(entity) {
-                    let (z, scale) = local_z_and_scale
-                        .unwrap_or_else(|| (global.translation().z, global.scale()));
-                    *global = GlobalTransform::from_transform(Transform {
-                        translation: Vec3::new(pos.x, pos.y, z),
-                        rotation: rot_quat,
-                        scale,
-                    });
+                if let Some(&current_global) = self.world.get::<GlobalTransform>(entity) {
+                    let desired_global = match target_world_mat {
+                        Some(mat) => GlobalTransform::from_matrix(mat),
+                        None => {
+                            let (z, scale) = local_z_and_scale.unwrap_or_else(|| {
+                                (current_global.translation().z, current_global.scale())
+                            });
+                            GlobalTransform::from_transform(Transform {
+                                translation: Vec3::new(pos.x, pos.y, z),
+                                rotation: rot_quat,
+                                scale,
+                            })
+                        }
+                    };
+                    if current_global != desired_global {
+                        if let Some(global) = self.world.get_mut::<GlobalTransform>(entity) {
+                            *global = desired_global;
+                        }
+                    }
                 }
             }
         }
@@ -974,6 +1430,50 @@ impl EngineApp {
         self.metrics.fixed_updates_this_frame += 1;
     }
 
+    /// Dispatches current frame [`InputManager`] transitions into [`UiInputDispatcher`] (`ENG-10`).
+    fn dispatch_input_to_ui(&mut self) {
+        use korppi_input::{KeyCode, MouseButton};
+
+        let pos = self.input.mouse.position();
+        let buttons = [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
+        let any_button_edge = buttons
+            .iter()
+            .any(|&b| self.input.mouse.is_just_pressed(b) || self.input.mouse.is_just_released(b));
+        let wheel = self.input.mouse.wheel_delta();
+        let moved = self.last_dispatched_mouse_pos != Some(pos)
+            || self.input.mouse.delta() != korppi_math::Vec2::ZERO;
+
+        if moved || any_button_edge || wheel != korppi_math::Vec2::ZERO {
+            if moved || any_button_edge {
+                self.ui_dispatcher.inject_mouse_move(&mut self.world, pos);
+                self.last_dispatched_mouse_pos = Some(pos);
+            }
+            for &button in &buttons {
+                if self.input.mouse.is_just_pressed(button) {
+                    self.ui_dispatcher
+                        .inject_mouse_button(&mut self.world, pos, button, true);
+                }
+                if self.input.mouse.is_just_released(button) {
+                    self.ui_dispatcher
+                        .inject_mouse_button(&mut self.world, pos, button, false);
+                }
+            }
+            if wheel != korppi_math::Vec2::ZERO {
+                self.ui_dispatcher
+                    .inject_mouse_wheel(&mut self.world, pos, wheel);
+            }
+        }
+
+        for &key in KeyCode::ALL {
+            if self.input.keyboard.is_just_pressed(key) {
+                self.ui_dispatcher.inject_key(&mut self.world, key, true);
+            }
+            if self.input.keyboard.is_just_released(key) {
+                self.ui_dispatcher.inject_key(&mut self.world, key, false);
+            }
+        }
+    }
+
     /// Advances the engine simulation and rendering pipeline by `delta` time.
     pub fn update(&mut self, delta: Duration) {
         self.metrics.fixed_updates_this_frame = 0;
@@ -981,7 +1481,6 @@ impl EngineApp {
 
         // 1. PreUpdate Stage
         self.frame_arena.reset();
-        self.input.tick();
         self.schedule.run_stage(Stage::PreUpdate, &mut self.world);
 
         // 2. FixedUpdate Stage(s)
@@ -992,7 +1491,7 @@ impl EngineApp {
         // 3. Update Stage (Gameplay logic)
         self.schedule.run_stage(Stage::Update, &mut self.world);
 
-        // 4. PostUpdate Stage (Hierarchy, transforms, audio, UI layout)
+        // 4. PostUpdate Stage (Hierarchy, transforms, audio, UI layout & UI input dispatch)
         self.schedule.run_stage(Stage::PostUpdate, &mut self.world);
         propagate_transforms(&mut self.world);
         if self.acoustics_stale {
@@ -1011,6 +1510,7 @@ impl EngineApp {
                 self.config.window_size.y,
             ),
         );
+        self.dispatch_input_to_ui();
 
         // 5. Render Stage
         self.metrics.alpha = self.clock.alpha();
@@ -1021,6 +1521,21 @@ impl EngineApp {
         );
         self.ui_renderer
             .compile_into_quad_batch(&self.ui_draw_commands, &mut self.ui_quad_batch);
+        self.metrics.ui_quad_count = self.ui_quad_batch.quad_count() as u32;
+        self.metrics.draw_calls = self.ui_quad_batch.draws().len() as u32
+            + u32::from(
+                self.ui_quad_batch.draws().is_empty() && !self.ui_quad_batch.indices().is_empty(),
+            );
+        self.metrics.froxel_light_count = if let Some(culling) =
+            self.world
+                .resource::<korppi_render::clustered::CullingOutput>()
+        {
+            culling.global_light_indices.len() as u32
+        } else if let Some(scene) = self.world.resource::<korppi_render::ForwardScene>() {
+            (scene.point_lights.len() + scene.spot_lights.len()) as u32
+        } else {
+            0
+        };
         self.schedule.run_stage(Stage::Render, &mut self.world);
         if let Some(ref mut presenter) = self.presenter {
             let canvas = (self.config.window_size.x, self.config.window_size.y);
@@ -1031,8 +1546,45 @@ impl EngineApp {
             }
         }
         self.metrics.allocated_scratch_bytes = self.frame_arena.allocated_bytes();
+        self.input.tick();
 
         self.metrics.record_frame(delta);
+    }
+
+    /// Forwards an OS [`korppi_window::WindowEvent`] into the engine's input and UI subsystems (`ENG-10`).
+    pub fn handle_window_event(&mut self, event: &korppi_window::WindowEvent) {
+        match *event {
+            korppi_window::WindowEvent::Resized { width, height } => {
+                if width > 0 && height > 0 {
+                    self.config.window_size = korppi_math::Vec2::new(width as f32, height as f32);
+                }
+            }
+            korppi_window::WindowEvent::Focused(focused) => {
+                self.input.on_focused(focused);
+            }
+            korppi_window::WindowEvent::CloseRequested => {
+                self.is_running = false;
+            }
+            korppi_window::WindowEvent::CursorMoved { x, y } => {
+                self.input.on_cursor_moved(x, y);
+            }
+            korppi_window::WindowEvent::CursorLeft => {
+                self.input.on_cursor_left();
+            }
+            korppi_window::WindowEvent::MouseWheel { delta_x, delta_y } => {
+                self.input.on_mouse_wheel(delta_x, delta_y);
+            }
+            korppi_window::WindowEvent::MouseInput { button, pressed } => {
+                self.input.on_mouse_input(button, pressed);
+            }
+            korppi_window::WindowEvent::KeyboardInput { key_code, pressed } => {
+                self.input.on_key_input(key_code, pressed);
+            }
+            korppi_window::WindowEvent::ScaleFactorChanged { .. }
+            | korppi_window::WindowEvent::Moved { .. }
+            | korppi_window::WindowEvent::RedrawRequested
+            | korppi_window::WindowEvent::CursorEntered => {}
+        }
     }
 
     /// Executes the UI canvas pass for the current [`Self::ui_quad_batch`] through a
@@ -1065,8 +1617,8 @@ impl EngineApp {
             self.offscreen_ui_quads = Some(QuadBatchRenderer::new(device.as_ref(), format)?);
         }
 
-        let mut graph = RenderGraph::new();
-        let color_target = graph.import_texture(
+        self.ui_render_graph.clear();
+        let color_target = self.ui_render_graph.import_texture(
             target,
             TextureAccess {
                 stage: korppi_rhi::PipelineStageFlags::TOP_OF_PIPE,
@@ -1076,16 +1628,17 @@ impl EngineApp {
             width,
             height,
         );
-        add_ui_clear_render_pass(&mut graph, color_target, self.clear_color);
-        let mut compiled = graph
-            .compile()
+        add_ui_clear_render_pass(&mut self.ui_render_graph, color_target, self.clear_color);
+        let mut compiled = self
+            .ui_render_graph
+            .compile_reusable()
             .map_err(|e| RhiError::ValidationError(e.to_string()))?;
 
         let frame = device.begin_frame()?;
         let mut recorder = device.create_command_recorder()?;
         recorder.begin()?;
 
-        let canvas_size = (self.config.window_size.x, self.config.window_size.y);
+        let canvas_size = (width as f32, height as f32);
         let batch = &self.ui_quad_batch;
         let quads = self.offscreen_ui_quads.as_mut().expect("created above");
         let recorded = compiled.execute_with(recorder.as_mut(), |pass_name, _ctx, cmd| {
@@ -1111,11 +1664,7 @@ impl EngineApp {
     /// Snapshots the static 3D colliders for the acoustics, each with its entity's
     /// `AcousticMaterial` (or the default), and points the world's `AudioOcclusion` at it.
     fn rebuild_acoustic_geometry(&mut self) {
-        let body_entities: HashMap<BodyId3d, Entity> = self
-            .entity_to_body3d
-            .iter()
-            .map(|(&entity, &body)| (body, entity))
-            .collect();
+        let body_entities = &self.body3d_to_entity;
         let world = &self.world;
         let physics = &self.physics_3d;
         let geometry = Arc::new(AcousticGeometry::from_physics(physics, |collider| {

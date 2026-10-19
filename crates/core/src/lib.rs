@@ -20,25 +20,3 @@ pub use pod::{
 pub use slot_map::{Handle, SlotMap};
 pub use smallvec::{Array as SmallVecArray, IntoIter as SmallVecIntoIter, SmallVec};
 pub use task::{parallel_for, spin_until, SerialExecutor, TaskExecutor, WorkerPool};
-
-/// Adds two unsigned 64-bit integers together.
-///
-/// # Examples
-/// ```
-/// use korppi_core::add;
-/// assert_eq!(add(2, 3), 5);
-/// ```
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}

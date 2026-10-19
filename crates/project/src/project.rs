@@ -40,10 +40,7 @@ impl Project {
             fs::create_dir_all(parent)?;
         }
         if !start_scene_path.exists() {
-            fs::write(
-                &start_scene_path,
-                b"{\n  \"name\": \"Main Scene\",\n  \"entities\": []\n}\n",
-            )?;
+            fs::write(&start_scene_path, b"{\n  \"entities\": []\n}\n")?;
         }
 
         Ok(Self {
@@ -71,7 +68,12 @@ impl Project {
         })
     }
 
-    /// Validates the project directory structure, manifest settings, and critical files.
+    /// Alias for [`Self::load`].
+    pub fn open(root: &Path) -> Result<Self, ProjectError> {
+        Self::load(root)
+    }
+
+    /// Validates the project directory structure, manifest settings, and critical files (`PRJ-04`).
     pub fn validate(&self) -> Result<(), ProjectError> {
         if !self.root_dir.is_dir() {
             return Err(ProjectError::Validation(format!(
@@ -79,13 +81,52 @@ impl Project {
                 self.root_dir.display()
             )));
         }
+        let canonical_root = fs::canonicalize(&self.root_dir)?;
+        self.manifest.validate()?;
 
-        let start_scene = self.root_dir.join(&self.manifest.entry_points.start_scene);
-        if !start_scene.is_file() {
-            return Err(ProjectError::Validation(format!(
-                "Declared start scene not found: {}",
-                start_scene.display()
-            )));
+        let validate_on_disk_path =
+            |rel: &str, must_exist_file: bool, label: &str| -> Result<(), ProjectError> {
+                let candidate = self.root_dir.join(rel);
+                match fs::symlink_metadata(&candidate) {
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() {
+                            return Err(ProjectError::Validation(format!(
+                                "Declared {label} must not be a symlink: {}",
+                                candidate.display()
+                            )));
+                        }
+                        if must_exist_file && !meta.is_file() {
+                            return Err(ProjectError::Validation(format!(
+                                "Declared {label} is not a regular file: {}",
+                                candidate.display()
+                            )));
+                        }
+                        let canon = fs::canonicalize(&candidate)?;
+                        if !canon.starts_with(&canonical_root) {
+                            return Err(ProjectError::Validation(format!(
+                                "Declared {label} escapes project root: {}",
+                                candidate.display()
+                            )));
+                        }
+                        Ok(())
+                    }
+                    Err(_) if must_exist_file => Err(ProjectError::Validation(format!(
+                        "Declared {label} not found: {}",
+                        candidate.display()
+                    ))),
+                    Err(_) => Ok(()),
+                }
+            };
+
+        validate_on_disk_path(&self.manifest.entry_points.start_scene, true, "start scene")?;
+        if let Some(ref script) = self.manifest.entry_points.main_script {
+            validate_on_disk_path(script, false, "main_script")?;
+        }
+        if let Some(ref splash) = self.manifest.entry_points.splash_screen {
+            validate_on_disk_path(splash, false, "splash_screen")?;
+        }
+        for mount in &self.manifest.subsystems.vfs_mounts {
+            validate_on_disk_path(&mount.physical_path, false, "vfs_mount.physical_path")?;
         }
 
         Ok(())

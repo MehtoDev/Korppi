@@ -518,15 +518,27 @@ impl ValidatingRecorder {
         info
     }
 
-    /// Checks one attachment's subresource and that its sample count matches the pass so far.
+    /// Checks one attachment's usage, subresource, render-area bounds, and that its sample count
+    /// matches the pass so far.
+    #[allow(clippy::too_many_arguments)]
     fn check_attachment(
         &mut self,
         texture: TextureHandle,
         mip: u32,
         layer: u32,
+        needed_usage: TextureUsage,
+        offset_x: i32,
+        offset_y: i32,
+        width: u32,
+        height: u32,
         samples: &mut Option<SampleCount>,
     ) -> Option<TextureInfo> {
         let info = self.texture_info("begin_rendering", texture)?;
+        if !info.usage.contains(needed_usage) {
+            self.fail("begin_rendering", || {
+                format!("attachment {texture:?} lacks {needed_usage:?} usage")
+            });
+        }
         if mip >= info.mip_levels || layer >= info.attachment_layers(mip) {
             self.fail("begin_rendering", || {
                 format!(
@@ -536,6 +548,23 @@ impl ValidatingRecorder {
                     info.attachment_layers(mip.min(info.mip_levels.saturating_sub(1)))
                 )
             });
+        } else if offset_x >= 0 && offset_y >= 0 {
+            let mip_width = (info.width >> mip).max(1);
+            let mip_height = (info.height >> mip).max(1);
+            if (offset_x as u32)
+                .checked_add(width)
+                .is_none_or(|end_x| end_x > mip_width)
+                || (offset_y as u32)
+                    .checked_add(height)
+                    .is_none_or(|end_y| end_y > mip_height)
+            {
+                self.fail("begin_rendering", || {
+                    format!(
+                        "render area ({offset_x}, {offset_y}, {width}x{height}) exceeds attachment \
+                         {texture:?} mip {mip} extent ({mip_width}x{mip_height})"
+                    )
+                });
+            }
         }
         match *samples {
             None => *samples = Some(info.sample_count),
@@ -643,6 +672,23 @@ impl CommandBufferRecorder for ValidatingRecorder {
                 "a render pass is already active".into()
             });
         }
+        if desc.color_attachments.len() > crate::descriptor::MAX_COLOR_ATTACHMENTS {
+            self.fail("begin_rendering", || {
+                format!(
+                    "{} colour attachments exceed the maximum of {}",
+                    desc.color_attachments.len(),
+                    crate::descriptor::MAX_COLOR_ATTACHMENTS
+                )
+            });
+        }
+        if desc.offset_x < 0 || desc.offset_y < 0 || desc.width == 0 || desc.height == 0 {
+            self.fail("begin_rendering", || {
+                format!(
+                    "render area ({}, {}, {}x{}) must have non-negative offsets and non-zero extent",
+                    desc.offset_x, desc.offset_y, desc.width, desc.height
+                )
+            });
+        }
         let mut color_formats = [None; MAX_VALIDATED_COLOR_TARGETS];
         let mut samples = None;
         for (index, attachment) in desc.color_attachments.iter().enumerate() {
@@ -650,6 +696,11 @@ impl CommandBufferRecorder for ValidatingRecorder {
                 attachment.texture,
                 attachment.mip_level,
                 attachment.layer,
+                TextureUsage::COLOR_ATTACHMENT,
+                desc.offset_x,
+                desc.offset_y,
+                desc.width,
+                desc.height,
                 &mut samples,
             );
             if let Some(slot) = color_formats.get_mut(index) {
@@ -657,15 +708,32 @@ impl CommandBufferRecorder for ValidatingRecorder {
             }
             if let (Some(info), Some(resolve)) = (info, attachment.resolve_target) {
                 if let Some(target) = self.texture_info("begin_rendering", resolve) {
+                    let mip = attachment.mip_level.min(info.mip_levels.saturating_sub(1));
+                    let mip_width = (info.width >> mip).max(1);
+                    let mip_height = (info.height >> mip).max(1);
+                    if !target.usage.contains(TextureUsage::COLOR_ATTACHMENT) {
+                        self.fail("begin_rendering", || {
+                            format!("resolve target {resolve:?} lacks COLOR_ATTACHMENT usage")
+                        });
+                    }
                     if info.sample_count == SampleCount::Count1
                         || target.sample_count != SampleCount::Count1
                         || target.format != info.format
+                        || target.width != mip_width
+                        || target.height != mip_height
                     {
                         self.fail("begin_rendering", || {
                             format!(
-                                "resolve target {resolve:?} ({:?}, {:?}) must be single-sample \
-                                 with the format of the multisampled attachment ({:?}, {:?})",
-                                target.format, target.sample_count, info.format, info.sample_count
+                                "resolve target {resolve:?} ({:?}, {:?}, {}x{}) must be single-sample \
+                                 with the format and extent of the multisampled attachment ({:?}, {:?}, {}x{})",
+                                target.format,
+                                target.sample_count,
+                                target.width,
+                                target.height,
+                                info.format,
+                                info.sample_count,
+                                mip_width,
+                                mip_height
                             )
                         });
                     }
@@ -673,19 +741,37 @@ impl CommandBufferRecorder for ValidatingRecorder {
             }
         }
         let depth_format = desc.depth_attachment.as_ref().and_then(|depth| {
-            self.check_attachment(depth.texture, depth.mip_level, depth.layer, &mut samples)
-                .map(|info| info.format)
+            self.check_attachment(
+                depth.texture,
+                depth.mip_level,
+                depth.layer,
+                TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+                desc.offset_x,
+                desc.offset_y,
+                desc.width,
+                desc.height,
+                &mut samples,
+            )
+            .map(|info| info.format)
         });
         if !self.passed(before) {
             return Ok(());
         }
-        self.pass = Some(PassState {
-            color_formats,
-            color_count: desc.color_attachments.len(),
-            depth_format,
-            samples,
-        });
-        self.inner().begin_rendering(desc)
+        let result = self.inner().begin_rendering(desc);
+        match &result {
+            Ok(()) => {
+                self.pass = Some(PassState {
+                    color_formats,
+                    color_count: desc.color_attachments.len(),
+                    depth_format,
+                    samples,
+                });
+            }
+            Err(error) => {
+                self.fail("begin_rendering", || error.to_string());
+            }
+        }
+        result
     }
 
     fn end_rendering(&mut self) -> Result<(), RhiError> {
@@ -765,8 +851,22 @@ impl CommandBufferRecorder for ValidatingRecorder {
                 format!("{} buffers but {} offsets", buffers.len(), offsets.len())
             });
         }
-        for &buffer in buffers {
-            self.check_buffer("bind_vertex_buffers", buffer);
+        for (i, &buffer) in buffers.iter().enumerate() {
+            let size = self.check_buffer_usage(
+                "bind_vertex_buffers",
+                buffer,
+                crate::types::BufferUsage::VERTEX,
+                "VERTEX",
+            );
+            if let (Some(size), Some(&offset)) = (size, offsets.get(i)) {
+                if offset > size {
+                    self.fail("bind_vertex_buffers", || {
+                        format!(
+                            "vertex buffer {i} ({buffer:?}) offset {offset} exceeds buffer size {size}"
+                        )
+                    });
+                }
+            }
         }
         if self.passed(before) {
             self.inner()
@@ -776,7 +876,30 @@ impl CommandBufferRecorder for ValidatingRecorder {
 
     fn bind_index_buffer(&mut self, buffer: BufferHandle, offset: u64, index_type: IndexType) {
         let before = self.command("bind_index_buffer");
-        self.check_buffer("bind_index_buffer", buffer);
+        let size = self.check_buffer_usage(
+            "bind_index_buffer",
+            buffer,
+            crate::types::BufferUsage::INDEX,
+            "INDEX",
+        );
+        let align = match index_type {
+            IndexType::Uint16 => 2,
+            IndexType::Uint32 => 4,
+        };
+        if !offset.is_multiple_of(align) {
+            self.fail("bind_index_buffer", || {
+                format!(
+                    "index buffer offset {offset} is not a multiple of {align} for {index_type:?}"
+                )
+            });
+        }
+        if let Some(size) = size {
+            if offset > size {
+                self.fail("bind_index_buffer", || {
+                    format!("index buffer ({buffer:?}) offset {offset} exceeds buffer size {size}")
+                });
+            }
+        }
         if self.passed(before) {
             self.index_buffer = Some(offset);
             self.inner().bind_index_buffer(buffer, offset, index_type);
@@ -815,7 +938,11 @@ impl CommandBufferRecorder for ValidatingRecorder {
                             )
                         });
                     }
-                    if binding.end + offset > binding.buffer_size {
+                    if binding
+                        .end
+                        .checked_add(offset)
+                        .is_none_or(|end| end > binding.buffer_size)
+                    {
                         self.fail(NAME, || {
                             format!(
                                 "dynamic offset {i} ({offset}) moves the range past the buffer's \
@@ -1567,10 +1694,16 @@ mod tests {
             handle == BUFFER
         }
         fn texture_info(&self, handle: TextureHandle) -> Option<TextureInfo> {
-            let format = match handle {
-                RGBA8_TARGET => TextureFormat::Rgba8Unorm,
-                DEPTH_TARGET => TextureFormat::Depth32Float,
-                D24S8_TARGET => TextureFormat::Depth24PlusStencil8,
+            let (format, attachment_usage) = match handle {
+                RGBA8_TARGET => (TextureFormat::Rgba8Unorm, TextureUsage::COLOR_ATTACHMENT),
+                DEPTH_TARGET => (
+                    TextureFormat::Depth32Float,
+                    TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+                ),
+                D24S8_TARGET => (
+                    TextureFormat::Depth24PlusStencil8,
+                    TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+                ),
                 _ => return None,
             };
             Some(TextureInfo {
@@ -1582,9 +1715,7 @@ mod tests {
                 array_layers: 1,
                 depth: 1,
                 sample_count: SampleCount::Count1,
-                usage: TextureUsage::COLOR_ATTACHMENT
-                    | TextureUsage::COPY_SRC
-                    | TextureUsage::COPY_DST,
+                usage: attachment_usage | TextureUsage::COPY_SRC | TextureUsage::COPY_DST,
             })
         }
         fn sampler_exists(&self, handle: SamplerHandle) -> bool {

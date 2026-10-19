@@ -97,7 +97,7 @@ impl DynamicTree {
     pub fn new() -> Self {
         Self {
             root: NULL_NODE,
-            nodes: Vec::with_capacity(64),
+            nodes: Vec::with_capacity(512),
             free_head: NULL_NODE,
             node_count: 0,
         }
@@ -705,7 +705,7 @@ impl DynamicTree {
 /// Box3D `b3TestBoundsRayOverlap`: separating-axis test between the line of ray `(ray_start, ray_delta)`
 /// and the axis-aligned box `[node_min, node_max]`.
 #[inline]
-fn test_bounds_ray_overlap(
+pub(crate) fn test_bounds_ray_overlap(
     node_min: Vec3,
     node_max: Vec3,
     ray_start: Vec3,

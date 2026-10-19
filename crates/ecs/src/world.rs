@@ -247,9 +247,13 @@ impl World {
             }
         };
 
-        let observed = components
-            .iter()
-            .fold(0, |mask, &c| mask | self.observers.mask(c));
+        let observed = components.iter().fold(0, |mask, &c| {
+            let rel_mask = self
+                .components
+                .id_to_pair(c)
+                .map_or(0, |(rel, _)| self.observers.mask(rel));
+            mask | self.observers.mask(c) | rel_mask
+        });
         self.archetypes[id].set_observed(observed);
         // `Prefab` and `IsA` are looked up rather than registered up front, so that the world
         // assigns component IDs in the order the game registers them.
@@ -327,6 +331,11 @@ impl World {
         self.entities.flush_reserved();
     }
 
+    /// Frees any entities reserved by commands that were never placed into an archetype.
+    pub(crate) fn reclaim_unplaced_entities(&mut self) {
+        self.entities.reclaim_unplaced();
+    }
+
     /// The observers, for the observer module.
     pub(crate) fn observers_mut(&mut self) -> &mut Observers {
         &mut self.observers
@@ -339,11 +348,15 @@ impl World {
 
     /// Recomputes each archetype's mask of observed events.
     pub(crate) fn refresh_observed_masks(&mut self) {
+        let components = &self.components;
+        let observers = &self.observers;
         for archetype in &mut self.archetypes {
-            let mask = archetype
-                .components()
-                .iter()
-                .fold(0, |mask, &c| mask | self.observers.mask(c));
+            let mask = archetype.components().iter().fold(0, |mask, &c| {
+                let rel_mask = components
+                    .id_to_pair(c)
+                    .map_or(0, |(rel, _)| observers.mask(rel));
+                mask | observers.mask(c) | rel_mask
+            });
             archetype.set_observed(mask);
         }
     }
@@ -458,6 +471,9 @@ impl World {
         if arch.observed() & EventKind::Remove.bit() != 0 {
             for &component in arch.components() {
                 self.observers.record(EventKind::Remove, component, entity);
+                if let Some((rel, _)) = self.components.id_to_pair(component) {
+                    self.observers.record(EventKind::Remove, rel, entity);
+                }
             }
         }
     }
@@ -526,6 +542,8 @@ impl World {
                     if !self.entities.is_marked(source) {
                         self.remove_component_by_id_raw(source, pair_id);
                         self.relationships.remove(source, relation, target);
+                        self.observers.record(EventKind::Remove, pair_id, source);
+                        self.observers.record(EventKind::Remove, relation, source);
                     }
                 }
             }
@@ -660,6 +678,18 @@ impl World {
         unsafe { Some(col.get::<T>(loc.row)) }
     }
 
+    /// Returns an immutable reference to a component owned directly by `entity`, ignoring any
+    /// inherited prefab components.
+    #[must_use]
+    pub fn get_owned<T: Component>(&self, entity: Entity) -> Option<&T> {
+        let loc = self.entities.location(entity)?;
+        let id = self.components.id_of::<T>()?;
+        let arch = &self.archetypes[loc.archetype_id];
+        let col = arch.column(id)?;
+        // SAFETY: `id` corresponds to `T: Component` in `self.components`, and `loc.row` is valid for `arch`.
+        unsafe { Some(col.get::<T>(loc.row)) }
+    }
+
     /// Returns a mutable reference to an entity's component, or `None` if not present. Only
     /// owned components are reachable: an instance never writes its prefab's value.
     pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<&mut T> {
@@ -684,21 +714,25 @@ impl World {
         self.archetypes[loc.archetype_id].has_or_inherits(id)
     }
 
-    /// Returns `true` if the entity currently possesses the component corresponding to `comp_id`.
+    /// Returns `true` if the entity owns or inherits the component corresponding to `comp_id`.
     #[must_use]
     pub fn has_component_id(&self, entity: Entity, comp_id: ComponentId) -> bool {
         let Some(loc) = self.entities.location(entity) else {
             return false;
         };
-        self.archetypes[loc.archetype_id].has_component(comp_id)
+        self.archetypes[loc.archetype_id].has_or_inherits(comp_id)
     }
 
     /// Returns an immutable reference to a component by its raw [`ComponentId`], or `None` if the
     /// entity lacks it or `T` is not its type.
+    ///
+    /// An instance of a prefab that does not own `comp_id` reads the prefab's value.
     #[must_use]
     pub fn get_by_id<T: 'static>(&self, entity: Entity, comp_id: ComponentId) -> Option<&T> {
         let loc = self.entities.location(entity)?;
-        let col = self.archetypes[loc.archetype_id].column(comp_id)?;
+        let Some(col) = self.archetypes[loc.archetype_id].column(comp_id) else {
+            return self.inherited_component(loc.archetype_id, comp_id);
+        };
         if col.info().type_id() != Some(TypeId::of::<T>()) {
             return None;
         }
@@ -823,6 +857,9 @@ impl World {
                 .expect("column type differs from the registry");
             *slot = component;
             self.observers.record(EventKind::Set, added_id, entity);
+            if let Some((rel, _)) = self.components.id_to_pair(added_id) {
+                self.observers.record(EventKind::Set, rel, entity);
+            }
             return;
         }
 
@@ -847,6 +884,10 @@ impl World {
         }
         self.observers.record(EventKind::Add, added_id, entity);
         self.observers.record(EventKind::Set, added_id, entity);
+        if let Some((rel, _)) = self.components.id_to_pair(added_id) {
+            self.observers.record(EventKind::Add, rel, entity);
+            self.observers.record(EventKind::Set, rel, entity);
+        }
     }
 
     /// Moves `entity` (at `location`) to archetype `dst`, which is its archetype plus `added`,
@@ -901,6 +942,9 @@ impl World {
         let (removed, _) = unsafe { removed_col.swap_remove_and_take::<T>(loc.row) };
         self.finish_move(entity, loc, dst, dst_row);
         self.observers.record(EventKind::Remove, comp_id, entity);
+        if let Some((rel, _)) = self.components.id_to_pair(comp_id) {
+            self.observers.record(EventKind::Remove, rel, entity);
+        }
         Some(removed)
     }
 
@@ -1028,8 +1072,13 @@ impl World {
                 self.relationships
                     .insert(entity, rel_id, target, R::EXCLUSIVE, R::CLEANUP)
             {
-                if let Some(old_pair_id) = self.components.pair_to_id(rel_id, replaced) {
-                    self.remove_component_by_id_raw(entity, old_pair_id);
+                if replaced != target {
+                    if let Some(old_pair_id) = self.components.pair_to_id(rel_id, replaced) {
+                        self.remove_component_by_id_raw(entity, old_pair_id);
+                        self.observers
+                            .record(EventKind::Remove, old_pair_id, entity);
+                        self.observers.record(EventKind::Remove, rel_id, entity);
+                    }
                 }
             }
         } else {
@@ -1040,6 +1089,7 @@ impl World {
         // SAFETY: size_of::<R>() is checked above to be 0, so zeroed bytes represent a valid instance of zero-sized type R.
         let value: R = unsafe { std::mem::zeroed() };
         self.insert_by_id(entity, pair_id, value);
+        self.flush_observers();
 
         Ok(())
     }
@@ -1093,8 +1143,13 @@ impl World {
                 self.relationships
                     .insert(entity, rel_id, target, R::EXCLUSIVE, R::CLEANUP)
             {
-                if let Some(old_pair_id) = self.components.pair_to_id(rel_id, replaced) {
-                    self.remove_component_by_id_raw(entity, old_pair_id);
+                if replaced != target {
+                    if let Some(old_pair_id) = self.components.pair_to_id(rel_id, replaced) {
+                        self.remove_component_by_id_raw(entity, old_pair_id);
+                        self.observers
+                            .record(EventKind::Remove, old_pair_id, entity);
+                        self.observers.record(EventKind::Remove, rel_id, entity);
+                    }
                 }
             }
         } else {
@@ -1102,13 +1157,8 @@ impl World {
                 .insert(entity, rel_id, target, R::EXCLUSIVE, R::CLEANUP);
         }
 
-        if self.has_component_id(entity, pair_id) {
-            if let Some(val) = self.get_mut_by_id::<R>(entity, pair_id) {
-                *val = data;
-            }
-        } else {
-            self.insert_by_id(entity, pair_id, data);
-        }
+        self.insert_by_id(entity, pair_id, data);
+        self.flush_observers();
 
         Ok(())
     }
@@ -1116,6 +1166,9 @@ impl World {
     /// Returns an immutable reference to the data of pair `(R, target)` on `entity`.
     #[must_use]
     pub fn get_pair<R: Relation>(&self, entity: Entity, target: Entity) -> Option<&R> {
+        if !self.is_alive(target) {
+            return None;
+        }
         let rel_id = self.components.id_of::<R>()?;
         let pair_id = self.components.pair_to_id(rel_id, target)?;
         self.get_by_id::<R>(entity, pair_id)
@@ -1123,6 +1176,9 @@ impl World {
 
     /// Returns a mutable reference to the data of pair `(R, target)` on `entity`.
     pub fn get_pair_mut<R: Relation>(&mut self, entity: Entity, target: Entity) -> Option<&mut R> {
+        if !self.is_alive(target) {
+            return None;
+        }
         let rel_id = self.components.id_of::<R>()?;
         let pair_id = self.components.pair_to_id(rel_id, target)?;
         self.get_mut_by_id::<R>(entity, pair_id)
@@ -1130,6 +1186,9 @@ impl World {
 
     /// Removes a relationship pair `(R, target)` from `entity`, returning `true` if it was present.
     pub fn remove_pair<R: Relation>(&mut self, entity: Entity, target: Entity) -> bool {
+        if !self.is_alive(entity) || !self.is_alive(target) {
+            return false;
+        }
         let Some(rel_id) = self.components.id_of::<R>() else {
             return false;
         };
@@ -1137,7 +1196,13 @@ impl World {
             return false;
         };
         if self.relationships.remove(entity, rel_id, target) {
-            self.remove_component_by_id_raw(entity, pair_id)
+            let removed = self.remove_component_by_id_raw(entity, pair_id);
+            if removed {
+                self.observers.record(EventKind::Remove, pair_id, entity);
+                self.observers.record(EventKind::Remove, rel_id, entity);
+                self.flush_observers();
+            }
+            removed
         } else {
             false
         }
@@ -1145,10 +1210,15 @@ impl World {
 
     /// Removes a relationship pair `(R, target)` from `entity` and returns its data payload.
     pub fn remove_pair_data<R: Relation>(&mut self, entity: Entity, target: Entity) -> Option<R> {
+        if !self.is_alive(entity) || !self.is_alive(target) {
+            return None;
+        }
         let rel_id = self.components.id_of::<R>()?;
         let pair_id = self.components.pair_to_id(rel_id, target)?;
         if self.relationships.remove(entity, rel_id, target) {
-            self.take_by_id::<R>(entity, pair_id)
+            let removed = self.take_by_id::<R>(entity, pair_id);
+            self.flush_observers();
+            removed
         } else {
             None
         }
@@ -1157,6 +1227,9 @@ impl World {
     /// Returns `true` if `entity` possesses the relationship pair `(R, target)`.
     #[must_use]
     pub fn has_pair<R: Relation>(&self, entity: Entity, target: Entity) -> bool {
+        if !self.is_alive(entity) || !self.is_alive(target) {
+            return false;
+        }
         let Some(rel_id) = self.components.id_of::<R>() else {
             return false;
         };
@@ -1166,6 +1239,9 @@ impl World {
     /// Returns `true` if `entity` possesses any relationship with relation `R` (wildcard check).
     #[must_use]
     pub fn has_relation<R: Relation>(&self, entity: Entity) -> bool {
+        if !self.is_alive(entity) {
+            return false;
+        }
         let Some(rel_id) = self.components.id_of::<R>() else {
             return false;
         };
@@ -1175,6 +1251,9 @@ impl World {
     /// Returns the single target of relation `R` for `entity`, or `None` if absent.
     #[must_use]
     pub fn target_of<R: Relation>(&self, entity: Entity) -> Option<Entity> {
+        if !self.is_alive(entity) {
+            return None;
+        }
         let rel_id = self.components.id_of::<R>()?;
         self.relationships.target_of(entity, rel_id)
     }
@@ -1182,6 +1261,9 @@ impl World {
     /// Returns all target entities for `entity` under relation `R`.
     #[must_use]
     pub fn targets_of<R: Relation>(&self, entity: Entity) -> Vec<Entity> {
+        if !self.is_alive(entity) {
+            return Vec::new();
+        }
         let Some(rel_id) = self.components.id_of::<R>() else {
             return Vec::new();
         };
@@ -1191,6 +1273,9 @@ impl World {
     /// Returns all source entities targeting `target` under relation `R`.
     #[must_use]
     pub fn sources_of<R: Relation>(&self, target: Entity) -> Vec<Entity> {
+        if !self.is_alive(target) {
+            return Vec::new();
+        }
         let Some(rel_id) = self.components.id_of::<R>() else {
             return Vec::new();
         };
@@ -1211,6 +1296,9 @@ impl World {
     /// order they were attached; empty if it has none.
     #[must_use]
     pub fn children(&self, parent: Entity) -> &[Entity] {
+        if !self.is_alive(parent) {
+            return &[];
+        }
         match self.components.id_of::<crate::relation::ChildOf>() {
             Some(child_of) => self.relationships.sources(parent, child_of),
             None => &[],
@@ -1229,19 +1317,16 @@ impl World {
     pub fn ancestors(&self, entity: Entity) -> AncestorIter<'_> {
         AncestorIter {
             world: self,
-            current: Some(entity),
+            current: self.is_alive(entity).then_some(entity),
         }
     }
 
     /// Returns an iterator walking down the descendant subtree of `entity` via [`crate::relation::ChildOf`].
     #[must_use]
     pub fn descendants(&self, entity: Entity) -> DescendantIter<'_> {
-        let mut children = self.children_of(entity);
-        children.reverse();
-        DescendantIter {
-            world: self,
-            stack: children,
-        }
+        let mut stack = Vec::new();
+        stack.extend(self.children(entity).iter().rev().copied());
+        DescendantIter { world: self, stack }
     }
 
     /// Returns the slice of all archetypes in the world.
@@ -1328,11 +1413,8 @@ impl<'a> Iterator for DescendantIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let next = self.stack.pop()?;
-        let mut children = self.world.children_of(next);
-        children.reverse();
-        for child in children {
-            self.stack.push(child);
-        }
+        self.stack
+            .extend(self.world.children(next).iter().rev().copied());
         Some(next)
     }
 }

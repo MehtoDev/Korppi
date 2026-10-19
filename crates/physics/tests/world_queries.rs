@@ -315,9 +315,10 @@ fn explosion_pushes_dynamic_bodies_radially() {
     );
 
     world.explode(&ExplosionDef3d {
+        mask_bits: u64::MAX,
         position: Vec3::ZERO,
-        radius: 10.0,
-        falloff: 2.0,
+        radius: 2.0,
+        falloff: 8.0,
         impulse_per_area: 50.0,
     });
 

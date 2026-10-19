@@ -133,6 +133,8 @@ pub struct Control {
     pub visible: bool,
     /// Whether children are clipped to this control's bounding box.
     pub clip_contents: bool,
+    /// Relative Z-order layering offset among sibling or root controls.
+    pub z_index: i32,
 }
 
 impl Default for Control {
@@ -167,6 +169,7 @@ impl Default for Control {
             focus_mode: FocusMode::None,
             visible: true,
             clip_contents: false,
+            z_index: 0,
         }
     }
 }

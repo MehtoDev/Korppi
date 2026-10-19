@@ -3,6 +3,7 @@
 use crate::component::ComponentInfo;
 use crate::tick::{ComponentTicks, Tick};
 use std::alloc::{alloc, dealloc, realloc, Layout};
+use std::cell::Cell;
 use std::ptr::NonNull;
 
 /// Contiguous type-erased columnar memory for storing instances of a single component type.
@@ -17,7 +18,8 @@ pub struct Column {
     capacity: usize,
     len: usize,
     ticks: Vec<ComponentTicks>,
-    bulk_changed: Option<Tick>,
+    ticks_ptr: NonNull<ComponentTicks>,
+    bulk_changed: Cell<Option<Tick>>,
 }
 
 // SAFETY: All component types implement Component: 'static + Send + Sync, so Column can be safely sent across threads.
@@ -28,7 +30,7 @@ unsafe impl Sync for Column {}
 impl Column {
     /// Creates an empty column for storing the component described by `info`.
     #[must_use]
-    pub fn new(info: ComponentInfo) -> Self {
+    pub(crate) fn new(info: ComponentInfo) -> Self {
         let is_zst = info.layout().size() == 0;
         Self {
             info,
@@ -43,8 +45,14 @@ impl Column {
             capacity: if is_zst { usize::MAX } else { 0 },
             len: 0,
             ticks: Vec::new(),
-            bulk_changed: None,
+            ticks_ptr: NonNull::dangling(),
+            bulk_changed: Cell::new(None),
         }
+    }
+
+    #[inline(always)]
+    fn sync_ticks_ptr(&mut self) {
+        self.ticks_ptr = NonNull::new(self.ticks.as_mut_ptr()).unwrap_or(NonNull::dangling());
     }
 
     /// Makes this empty column store the component `info` describes, keeping its buffer.
@@ -55,7 +63,7 @@ impl Column {
         assert!(self.len == 0, "reset of a non-empty column");
         assert_eq!(info.layout(), self.info.layout(), "reset to another layout");
         self.info = info;
-        self.bulk_changed = None;
+        self.bulk_changed.set(None);
     }
 
     /// Returns the number of component instances stored in the column.
@@ -86,7 +94,7 @@ impl Column {
             self.capacity = usize::MAX;
             if self.ptr.is_none() {
                 self.ptr = Some(
-                    NonNull::new(item_layout.align() as *mut u8)
+                    NonNull::new(std::ptr::without_provenance_mut(item_layout.align()))
                         .expect("Alignment must be non-zero"),
                 );
             }
@@ -134,7 +142,7 @@ impl Column {
     ///
     /// # Safety
     /// `T` must match the component type associated with this column.
-    pub unsafe fn push<T>(&mut self, value: T, tick: Tick) {
+    pub(crate) unsafe fn push<T>(&mut self, value: T, tick: Tick) {
         debug_assert_eq!(Layout::new::<T>(), self.item_layout());
         if self.len == self.capacity {
             self.grow();
@@ -154,6 +162,7 @@ impl Column {
         }
         self.settle_bulk_changed(tick);
         self.ticks.push(ComponentTicks::new(tick));
+        self.sync_ticks_ptr();
         self.len += 1;
     }
 
@@ -176,6 +185,7 @@ impl Column {
         }
         self.settle_bulk_changed(tick);
         self.ticks.push(ComponentTicks::new(tick));
+        self.sync_ticks_ptr();
         self.len += 1;
     }
 
@@ -192,7 +202,7 @@ impl Column {
             self.info.drop_in_place(slot);
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot, size);
         }
-        self.ticks[row].changed = tick;
+        self.mark_changed(row, tick);
     }
 
     /// The bytes of the value at `row`.
@@ -248,7 +258,7 @@ impl Column {
     ///
     /// # Safety
     /// `T` must match the component type and `row` must be `< self.len`.
-    pub unsafe fn get_mut<T>(&mut self, row: usize) -> &mut T {
+    pub(crate) unsafe fn get_mut<T>(&mut self, row: usize) -> &mut T {
         debug_assert!(row < self.len);
         let ptr = self.ptr.expect("Column data is unallocated").as_ptr();
         let item_size = self.item_layout().size();
@@ -270,6 +280,13 @@ impl Column {
         self.ptr.map_or(std::ptr::null_mut(), NonNull::as_ptr)
     }
 
+    /// Returns the raw pointer to the base of the column's tick buffer.
+    #[must_use]
+    #[inline(always)]
+    pub(crate) const fn ticks_ptr(&self) -> *mut ComponentTicks {
+        self.ticks_ptr.as_ptr()
+    }
+
     /// Returns a typed immutable slice of the column's contiguous component elements.
     ///
     /// # Safety
@@ -286,26 +303,9 @@ impl Column {
         }
     }
 
-    /// Returns a typed mutable slice of the column's contiguous component elements.
-    ///
-    /// # Safety
-    /// `T` must match the component type associated with this column.
-    #[must_use]
-    #[inline(always)]
-    pub unsafe fn as_mut_slice<T>(&mut self) -> &mut [T] {
-        if self.len == 0 {
-            &mut []
-        } else {
-            let ptr = self.raw_ptr() as *mut T;
-            // SAFETY: caller guarantees T matches column component type; elements 0..self.len are initialized;
-            // exclusive borrow ensures no aliasing.
-            unsafe { std::slice::from_raw_parts_mut(ptr, self.len) }
-        }
-    }
-
     /// Removes the component at `row` by swapping it with the last element and dropping it.
     /// Returns `true` if a swap occurred (i.e. `row < self.len - 1`).
-    pub fn swap_remove(&mut self, row: usize) -> bool {
+    pub(crate) fn swap_remove(&mut self, row: usize) -> bool {
         assert!(row < self.len);
         let item_size = self.item_layout().size();
         let last_idx = self.len - 1;
@@ -325,6 +325,7 @@ impl Column {
             self.info.drop_in_place(ptr.add(last_idx * item_size));
         }
         self.ticks.swap_remove(row);
+        self.sync_ticks_ptr();
         row != last_idx
     }
 
@@ -336,7 +337,7 @@ impl Column {
     ///
     /// # Safety
     /// `self` and `dst` must describe identical component layouts.
-    pub unsafe fn move_row_to(&mut self, row: usize, dst: &mut Self, now: Tick) -> bool {
+    pub(crate) unsafe fn move_row_to(&mut self, row: usize, dst: &mut Self, now: Tick) -> bool {
         assert!(row < self.len);
         let item_size = self.item_layout().size();
         let last_idx = self.len - 1;
@@ -370,8 +371,10 @@ impl Column {
             changed: self.changed_tick(row, now),
         };
         self.ticks.swap_remove(row);
+        self.sync_ticks_ptr();
         dst.settle_bulk_changed(now);
         dst.ticks.push(ticks);
+        dst.sync_ticks_ptr();
         dst.len += 1;
         self.len -= 1;
         row != last_idx
@@ -382,17 +385,18 @@ impl Column {
     ///
     /// # Safety
     /// `T` must match the component type and `row` must be `< self.len`.
-    pub unsafe fn swap_remove_and_take<T>(&mut self, row: usize) -> (T, bool) {
+    pub(crate) unsafe fn swap_remove_and_take<T>(&mut self, row: usize) -> (T, bool) {
         assert!(row < self.len);
         let item_size = self.item_layout().size();
         let last_idx = self.len - 1;
 
         self.ticks.swap_remove(row);
+        self.sync_ticks_ptr();
         if item_size == 0 {
             self.len -= 1;
             // SAFETY: T is zero-sized; read from dangling aligned pointer is safe and creates a valid ZST value.
             let value = unsafe { std::ptr::read(NonNull::<T>::dangling().as_ptr()) };
-            return (value, false);
+            return (value, row != last_idx);
         }
 
         let ptr = self.ptr.expect("Column data is unallocated").as_ptr();
@@ -417,9 +421,10 @@ impl Column {
     }
 
     /// Clears all elements from the column and drops them.
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.ticks.clear();
-        self.bulk_changed = None;
+        self.sync_ticks_ptr();
+        self.bulk_changed.set(None);
         let len = std::mem::replace(&mut self.len, 0);
         if self.info.needs_drop() {
             if let Some(ptr) = self.ptr {
@@ -437,20 +442,27 @@ impl Column {
     /// The added and own changed tick of each row.
     #[must_use]
     pub fn ticks(&self) -> &[ComponentTicks] {
-        &self.ticks
+        if self.len == 0 {
+            &[]
+        } else {
+            // SAFETY: `self.ticks_ptr` points to `self.len` initialized `ComponentTicks` elements.
+            unsafe { std::slice::from_raw_parts(self.ticks_ptr.as_ptr(), self.len) }
+        }
     }
 
     /// The tick a mutable query last changed every row at, if one did.
     #[must_use]
-    pub const fn bulk_changed(&self) -> Option<Tick> {
-        self.bulk_changed
+    pub fn bulk_changed(&self) -> Option<Tick> {
+        self.bulk_changed.get()
     }
 
     /// The tick the value at `row` last changed at, as seen from `now`.
     #[must_use]
     pub fn changed_tick(&self, row: usize, now: Tick) -> Tick {
-        let own = self.ticks[row].changed;
-        match self.bulk_changed {
+        assert!(row < self.len);
+        // SAFETY: `row < self.len`, so `self.ticks_ptr.add(row)` is valid for reads.
+        let own = unsafe { (*self.ticks_ptr.as_ptr().add(row)).changed };
+        match self.bulk_changed.get() {
             Some(bulk) if bulk.is_newer_than(own, now) => bulk,
             _ => own,
         }
@@ -460,32 +472,49 @@ impl Column {
     /// bulk change applies only to the rows present when it was made.
     fn settle_bulk_changed(&mut self, now: Tick) {
         if let Some(bulk) = self.bulk_changed.take() {
-            for ticks in &mut self.ticks {
-                if bulk.is_newer_than(ticks.changed, now) {
-                    ticks.changed = bulk;
+            let base = self.ticks_ptr.as_ptr();
+            for i in 0..self.len {
+                // SAFETY: `i < self.len`, so `base.add(i)` is valid for reads and writes.
+                unsafe {
+                    let ticks = &mut *base.add(i);
+                    if bulk.is_newer_than(ticks.changed, now) {
+                        ticks.changed = bulk;
+                    }
                 }
             }
         }
     }
 
     /// Records that the value at `row` changed at `tick`.
-    pub(crate) fn mark_changed(&mut self, row: usize, tick: Tick) {
-        self.ticks[row].changed = tick;
+    #[inline(always)]
+    pub(crate) fn mark_changed(&self, row: usize, tick: Tick) {
+        debug_assert!(row < self.len);
+        // SAFETY: `row < self.len` and caller ensures exclusive access to this row's change tick.
+        unsafe {
+            (*self.ticks_ptr.as_ptr().add(row)).changed = tick;
+        }
     }
 
     /// Records that every value changed at `tick`.
-    pub(crate) fn mark_all_changed(&mut self, tick: Tick) {
-        self.bulk_changed = Some(tick);
+    #[inline(always)]
+    pub(crate) fn mark_all_changed(&self, tick: Tick) {
+        self.bulk_changed.set(Some(tick));
     }
 
     /// Clamps every tick to at most [`MAX_CHANGE_AGE`](crate::tick::MAX_CHANGE_AGE) before `now`.
     pub(crate) fn clamp_ticks(&mut self, now: Tick) {
-        for ticks in &mut self.ticks {
-            ticks.added.clamp_age(now);
-            ticks.changed.clamp_age(now);
+        let base = self.ticks_ptr.as_ptr();
+        for i in 0..self.len {
+            // SAFETY: `i < self.len`, so `base.add(i)` is valid for reads and writes.
+            unsafe {
+                let ticks = &mut *base.add(i);
+                ticks.added.clamp_age(now);
+                ticks.changed.clamp_age(now);
+            }
         }
-        if let Some(bulk) = &mut self.bulk_changed {
+        if let Some(mut bulk) = self.bulk_changed.get() {
             bulk.clamp_age(now);
+            self.bulk_changed.set(Some(bulk));
         }
     }
 }
@@ -505,6 +534,39 @@ impl Drop for Column {
                     dealloc(ptr.as_ptr(), layout);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::{Component, ComponentRegistry};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ZstTag;
+    impl Component for ZstTag {}
+
+    #[test]
+    fn zst_swap_remove_and_take_reports_when_a_later_row_is_swapped_in() {
+        let mut reg = ComponentRegistry::new();
+        let id = reg.register::<ZstTag>();
+        let info = *reg.get_info(id).unwrap();
+        let mut col = Column::new(info);
+        // SAFETY: `col` stores `ZstTag`.
+        unsafe {
+            col.push(ZstTag, Tick::new(1));
+            col.push(ZstTag, Tick::new(2));
+            let (val, swapped) = col.swap_remove_and_take::<ZstTag>(0);
+            assert_eq!(val, ZstTag);
+            assert!(swapped);
+            assert_eq!(col.len(), 1);
+            assert_eq!(col.ticks()[0].added, Tick::new(2));
+
+            let (val_last, swapped_last) = col.swap_remove_and_take::<ZstTag>(0);
+            assert_eq!(val_last, ZstTag);
+            assert!(!swapped_last);
+            assert_eq!(col.len(), 0);
         }
     }
 }

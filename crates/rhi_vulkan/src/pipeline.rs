@@ -542,6 +542,7 @@ impl VulkanDevice {
         &self,
         desc: &ComputePipelineDescriptor,
     ) -> Result<PipelineHandle, RhiError> {
+        desc.validate()?;
         let (module, entry) = self.shader_stage(desc.compute_shader, "compute")?;
         let AcquiredLayout {
             layout,

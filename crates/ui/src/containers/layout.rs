@@ -7,12 +7,13 @@ use crate::containers::fitting::fit_child_in_rect;
 use crate::containers::grid_container::GridContainer;
 use crate::containers::margin_container::MarginContainer;
 use crate::containers::panel_container::PanelContainer;
-use crate::containers::scroll_container::ScrollContainer;
-use crate::containers::split_container::SplitContainer;
+use crate::containers::scroll_container::{ScrollContainer, ScrollMode};
+use crate::containers::split_container::{DraggerVisibility, SplitContainer};
 use crate::control::Control;
 use crate::layout::flags::SizeFlags;
-use crate::layout::hierarchy::ResolvedRect;
+use crate::layout::hierarchy::{effective_control, ResolvedRect};
 use crate::layout::rect::Rect2d;
+use crate::theme::get_theme_stylebox;
 use korppi_ecs::{Entity, World};
 
 /// Attempts to sort and fit the children of a container entity.
@@ -43,7 +44,7 @@ pub fn resolve_container_layout(
 
     // 4. PanelContainer
     if let Some(panel) = world.get::<PanelContainer>(container_entity).copied() {
-        resolve_panel_layout(world, panel, container_rect, children);
+        resolve_panel_layout(world, container_entity, panel, container_rect, children);
         return true;
     }
 
@@ -74,10 +75,53 @@ pub fn resolve_container_layout(
     false
 }
 
+/// Returns the effective `[left, top, right, bottom]` padding of a `PanelContainer`, falling back
+/// to the theme `"Panel"` `"panel"` StyleBox content margins when explicit padding is zero.
+#[must_use]
+pub(crate) fn panel_effective_padding(
+    world: &World,
+    container_entity: Entity,
+    panel: PanelContainer,
+) -> [f32; 4] {
+    if panel.padding_left == 0.0
+        && panel.padding_top == 0.0
+        && panel.padding_right == 0.0
+        && panel.padding_bottom == 0.0
+    {
+        get_theme_stylebox(world, container_entity, "Panel", "panel")
+            .map(|sb| sb.get_content_margin())
+            .unwrap_or([0.0; 4])
+    } else {
+        [
+            panel.padding_left,
+            panel.padding_top,
+            panel.padding_right,
+            panel.padding_bottom,
+        ]
+    }
+}
+
+fn collect_visible_children(
+    world: &World,
+    children: &[Entity],
+) -> korppi_core::SmallVec<[(Entity, Control); 16]> {
+    children
+        .iter()
+        .filter_map(|&e| effective_control(world, e).map(|c| (e, c)))
+        .filter(|(_, c)| c.visible)
+        .collect()
+}
+
 fn set_child_resolved_rect(world: &mut World, child: Entity, global: Rect2d, parent_rect: Rect2d) {
+    let global = Rect2d {
+        x: global.x.round(),
+        y: global.y.round(),
+        width: global.width.round(),
+        height: global.height.round(),
+    };
     let local = Rect2d {
-        x: global.x - parent_rect.x,
-        y: global.y - parent_rect.y,
+        x: (global.x - parent_rect.x.round()).round(),
+        y: (global.y - parent_rect.y.round()).round(),
         width: global.width,
         height: global.height,
     };
@@ -95,11 +139,7 @@ fn resolve_box_layout(
     parent_rect: Rect2d,
     children: &[Entity],
 ) {
-    let valid_children: Vec<(Entity, Control)> = children
-        .iter()
-        .filter_map(|&e| world.get::<Control>(e).cloned().map(|c| (e, c)))
-        .filter(|(_, c)| c.visible)
-        .collect();
+    let valid_children = collect_visible_children(world, children);
 
     let count = valid_children.len();
     if count == 0 {
@@ -125,7 +165,7 @@ fn resolve_box_layout(
         min_s: f32,
         final_s: f32,
     }
-    let mut items = Vec::with_capacity(count);
+    let mut items = korppi_core::SmallVec::<[ChildStretch; 16]>::with_capacity(count);
 
     for (_, c) in &valid_children {
         let (min_s, expand, ratio) = if is_horizontal {
@@ -188,39 +228,41 @@ fn resolve_box_layout(
         }
     }
 
-    let allocated_sizes: Vec<f32> = items.iter().map(|item| item.final_s).collect();
-
     // Compute initial offset from alignment
-    let total_used: f32 = allocated_sizes.iter().sum::<f32>() + total_separation;
+    let total_used: f32 = items.iter().map(|item| item.final_s).sum::<f32>() + total_separation;
     let remaining = (total_available - total_used).max(0.0);
-    let mut offset = match box_container.alignment {
+    let mut exact_offset = match box_container.alignment {
         BoxAlignment::Begin => 0.0,
         BoxAlignment::Center => (remaining * 0.5).floor(),
         BoxAlignment::End => remaining,
     };
 
-    // Fit each child
+    // Fit each child, snapping cell start/end to integer pixels so adjacent children tile cleanly
     for (i, (entity, control)) in valid_children.iter().enumerate() {
-        let size = allocated_sizes[i];
+        let size = items[i].final_s;
         let available_cell = if is_horizontal {
+            let x0 = (parent_rect.x + exact_offset).round();
+            let x1 = (parent_rect.x + exact_offset + size).round();
             Rect2d {
-                x: parent_rect.x + offset,
+                x: x0,
                 y: parent_rect.y,
-                width: size,
+                width: (x1 - x0).max(0.0),
                 height: parent_rect.height,
             }
         } else {
+            let y0 = (parent_rect.y + exact_offset).round();
+            let y1 = (parent_rect.y + exact_offset + size).round();
             Rect2d {
                 x: parent_rect.x,
-                y: parent_rect.y + offset,
+                y: y0,
                 width: parent_rect.width,
-                height: size,
+                height: (y1 - y0).max(0.0),
             }
         };
 
         let fitted = fit_child_in_rect(control, available_cell);
         set_child_resolved_rect(world, *entity, fitted, parent_rect);
-        offset += size + separation;
+        exact_offset += size + separation;
     }
 }
 
@@ -230,11 +272,7 @@ fn resolve_grid_layout(
     parent_rect: Rect2d,
     children: &[Entity],
 ) {
-    let valid_children: Vec<(Entity, Control)> = children
-        .iter()
-        .filter_map(|&e| world.get::<Control>(e).cloned().map(|c| (e, c)))
-        .filter(|(_, c)| c.visible)
-        .collect();
+    let valid_children = collect_visible_children(world, children);
 
     let count = valid_children.len();
     if count == 0 {
@@ -244,10 +282,12 @@ fn resolve_grid_layout(
     let cols = grid.columns.max(1);
     let rows = count.div_ceil(cols);
 
-    let mut col_min_w = vec![0.0f32; cols];
-    let mut row_min_h = vec![0.0f32; rows];
-    let mut col_expand = vec![false; cols];
-    let mut row_expand = vec![false; rows];
+    let mut col_min_w: korppi_core::SmallVec<[f32; 16]> = korppi_core::smallvec![0.0f32; cols];
+    let mut row_min_h: korppi_core::SmallVec<[f32; 16]> = korppi_core::smallvec![0.0f32; rows];
+    let mut col_expand: korppi_core::SmallVec<[bool; 16]> = korppi_core::smallvec![false; cols];
+    let mut row_expand: korppi_core::SmallVec<[bool; 16]> = korppi_core::smallvec![false; rows];
+    let mut col_stretch: korppi_core::SmallVec<[f32; 16]> = korppi_core::smallvec![0.0f32; cols];
+    let mut row_stretch: korppi_core::SmallVec<[f32; 16]> = korppi_core::smallvec![0.0f32; rows];
 
     for (idx, (_, c)) in valid_children.iter().enumerate() {
         let c_idx = idx % cols;
@@ -258,56 +298,82 @@ fn resolve_grid_layout(
 
         if c.size_flags_horizontal.contains(SizeFlags::EXPAND) {
             col_expand[c_idx] = true;
+            col_stretch[c_idx] = col_stretch[c_idx].max(c.stretch_ratio.max(0.0));
         }
         if c.size_flags_vertical.contains(SizeFlags::EXPAND) {
             row_expand[r_idx] = true;
+            row_stretch[r_idx] = row_stretch[r_idx].max(c.stretch_ratio.max(0.0));
         }
     }
 
-    // Allocate widths
+    // Allocate widths weighted by column stretch_ratio
     let total_h_sep = grid.h_separation * (cols - 1) as f32;
     let sum_col_min: f32 = col_min_w.iter().sum();
     let extra_w = (parent_rect.width - sum_col_min - total_h_sep).max(0.0);
     let num_col_expand = col_expand.iter().filter(|&&e| e).count();
+    let total_col_stretch: f32 = (0..cols)
+        .filter(|&c| col_expand[c])
+        .map(|c| col_stretch[c])
+        .sum();
 
     let mut col_widths = col_min_w.clone();
     if num_col_expand > 0 && extra_w > 0.0 {
-        let add_w = extra_w / num_col_expand as f32;
         for c in 0..cols {
             if col_expand[c] {
-                col_widths[c] += add_w;
+                let weight = if total_col_stretch > 0.0 {
+                    col_stretch[c] / total_col_stretch
+                } else {
+                    1.0 / num_col_expand as f32
+                };
+                col_widths[c] += extra_w * weight;
             }
         }
     }
 
-    // Allocate heights
+    // Allocate heights weighted by row stretch_ratio
     let total_v_sep = grid.v_separation * (rows - 1) as f32;
     let sum_row_min: f32 = row_min_h.iter().sum();
     let extra_h = (parent_rect.height - sum_row_min - total_v_sep).max(0.0);
     let num_row_expand = row_expand.iter().filter(|&&e| e).count();
+    let total_row_stretch: f32 = (0..rows)
+        .filter(|&r| row_expand[r])
+        .map(|r| row_stretch[r])
+        .sum();
 
     let mut row_heights = row_min_h.clone();
     if num_row_expand > 0 && extra_h > 0.0 {
-        let add_h = extra_h / num_row_expand as f32;
         for r in 0..rows {
             if row_expand[r] {
-                row_heights[r] += add_h;
+                let weight = if total_row_stretch > 0.0 {
+                    row_stretch[r] / total_row_stretch
+                } else {
+                    1.0 / num_row_expand as f32
+                };
+                row_heights[r] += extra_h * weight;
             }
         }
     }
 
-    // Compute column X offsets and row Y offsets
-    let mut col_x = vec![0.0f32; cols];
+    // Compute integer-snapped column X offsets/widths and row Y offsets/heights
+    let mut col_x: korppi_core::SmallVec<[f32; 16]> = korppi_core::smallvec![0.0f32; cols];
+    let mut col_w_snapped: korppi_core::SmallVec<[f32; 16]> = korppi_core::smallvec![0.0f32; cols];
     let mut cur_x = parent_rect.x;
     for c in 0..cols {
-        col_x[c] = cur_x;
+        let x0 = cur_x.round();
+        let x1 = (cur_x + col_widths[c]).round();
+        col_x[c] = x0;
+        col_w_snapped[c] = (x1 - x0).max(0.0);
         cur_x += col_widths[c] + grid.h_separation;
     }
 
-    let mut row_y = vec![0.0f32; rows];
+    let mut row_y: korppi_core::SmallVec<[f32; 16]> = korppi_core::smallvec![0.0f32; rows];
+    let mut row_h_snapped: korppi_core::SmallVec<[f32; 16]> = korppi_core::smallvec![0.0f32; rows];
     let mut cur_y = parent_rect.y;
     for r in 0..rows {
-        row_y[r] = cur_y;
+        let y0 = cur_y.round();
+        let y1 = (cur_y + row_heights[r]).round();
+        row_y[r] = y0;
+        row_h_snapped[r] = (y1 - y0).max(0.0);
         cur_y += row_heights[r] + grid.v_separation;
     }
 
@@ -319,8 +385,8 @@ fn resolve_grid_layout(
         let cell = Rect2d {
             x: col_x[c],
             y: row_y[r],
-            width: col_widths[c],
-            height: row_heights[r],
+            width: col_w_snapped[c],
+            height: row_h_snapped[r],
         };
 
         let fitted = fit_child_in_rect(control, cell);
@@ -341,11 +407,7 @@ fn resolve_margin_layout(
         height: (parent_rect.height - margin.margin_top - margin.margin_bottom).max(0.0),
     };
 
-    let valid_children: Vec<(Entity, Control)> = children
-        .iter()
-        .filter_map(|&e| world.get::<Control>(e).cloned().map(|c| (e, c)))
-        .filter(|(_, c)| c.visible)
-        .collect();
+    let valid_children = collect_visible_children(world, children);
 
     for (entity, control) in valid_children {
         let fitted = fit_child_in_rect(&control, inner_rect);
@@ -355,22 +417,22 @@ fn resolve_margin_layout(
 
 fn resolve_panel_layout(
     world: &mut World,
+    container_entity: Entity,
     panel: PanelContainer,
     parent_rect: Rect2d,
     children: &[Entity],
 ) {
+    let [pad_left, pad_top, pad_right, pad_bottom] =
+        panel_effective_padding(world, container_entity, panel);
+
     let inner_rect = Rect2d {
-        x: parent_rect.x + panel.padding_left,
-        y: parent_rect.y + panel.padding_top,
-        width: (parent_rect.width - panel.padding_left - panel.padding_right).max(0.0),
-        height: (parent_rect.height - panel.padding_top - panel.padding_bottom).max(0.0),
+        x: parent_rect.x + pad_left,
+        y: parent_rect.y + pad_top,
+        width: (parent_rect.width - pad_left - pad_right).max(0.0),
+        height: (parent_rect.height - pad_top - pad_bottom).max(0.0),
     };
 
-    let valid_children: Vec<(Entity, Control)> = children
-        .iter()
-        .filter_map(|&e| world.get::<Control>(e).cloned().map(|c| (e, c)))
-        .filter(|(_, c)| c.visible)
-        .collect();
+    let valid_children = collect_visible_children(world, children);
 
     for (entity, control) in valid_children {
         let fitted = fit_child_in_rect(&control, inner_rect);
@@ -390,19 +452,35 @@ fn resolve_scroll_layout(
         ctl.clip_contents = true;
     }
 
-    let valid_children: Vec<(Entity, Control)> = children
-        .iter()
-        .filter_map(|&e| world.get::<Control>(e).cloned().map(|c| (e, c)))
-        .filter(|(_, c)| c.visible)
-        .collect();
+    let valid_children = collect_visible_children(world, children);
 
     for (entity, control) in valid_children {
         let child_w = control.custom_minimum_size.x.max(parent_rect.width);
         let child_h = control.custom_minimum_size.y.max(parent_rect.height);
 
+        let scroll_x = if scroll.horizontal_scroll_mode == ScrollMode::Disabled
+            || !scroll.scroll_horizontal.is_finite()
+        {
+            0.0
+        } else {
+            scroll
+                .scroll_horizontal
+                .clamp(0.0, (child_w - parent_rect.width).max(0.0))
+        };
+
+        let scroll_y = if scroll.vertical_scroll_mode == ScrollMode::Disabled
+            || !scroll.scroll_vertical.is_finite()
+        {
+            0.0
+        } else {
+            scroll
+                .scroll_vertical
+                .clamp(0.0, (child_h - parent_rect.height).max(0.0))
+        };
+
         let global = Rect2d {
-            x: parent_rect.x - scroll.scroll_horizontal,
-            y: parent_rect.y - scroll.scroll_vertical,
+            x: parent_rect.x - scroll_x,
+            y: parent_rect.y - scroll_y,
             width: child_w,
             height: child_h,
         };
@@ -417,11 +495,7 @@ fn resolve_center_layout(
     parent_rect: Rect2d,
     children: &[Entity],
 ) {
-    let valid_children: Vec<(Entity, Control)> = children
-        .iter()
-        .filter_map(|&e| world.get::<Control>(e).cloned().map(|c| (e, c)))
-        .filter(|(_, c)| c.visible)
-        .collect();
+    let valid_children = collect_visible_children(world, children);
 
     for (entity, control) in valid_children {
         let min_s = control.custom_minimum_size;
@@ -454,13 +528,13 @@ fn resolve_aspect_ratio_layout(
     parent_rect: Rect2d,
     children: &[Entity],
 ) {
-    let valid_children: Vec<(Entity, Control)> = children
-        .iter()
-        .filter_map(|&e| world.get::<Control>(e).cloned().map(|c| (e, c)))
-        .filter(|(_, c)| c.visible)
-        .collect();
+    let valid_children = collect_visible_children(world, children);
 
-    let ratio = if arc.ratio <= 0.0 { 1.0 } else { arc.ratio };
+    let ratio = if !arc.ratio.is_finite() || arc.ratio <= 0.0 {
+        1.0
+    } else {
+        arc.ratio
+    };
     let scale_factor = match arc.stretch_mode {
         AspectStretchMode::WidthControlsHeight => parent_rect.width / ratio,
         AspectStretchMode::HeightControlsWidth => parent_rect.height,
@@ -504,11 +578,7 @@ fn resolve_split_layout(
     parent_rect: Rect2d,
     children: &[Entity],
 ) {
-    let valid_children: Vec<(Entity, Control)> = children
-        .iter()
-        .filter_map(|&e| world.get::<Control>(e).cloned().map(|c| (e, c)))
-        .filter(|(_, c)| c.visible)
-        .collect();
+    let valid_children = collect_visible_children(world, children);
 
     if valid_children.is_empty() {
         return;
@@ -555,7 +625,11 @@ fn resolve_split_layout(
     } else {
         parent_rect.height
     };
-    let dragger = split.dragger_thickness;
+    let dragger = if split.dragger_visibility == DraggerVisibility::Hidden {
+        0.0
+    } else {
+        split.dragger_thickness
+    };
     let available = (total_space - dragger).max(0.0);
 
     let min0 = if is_horizontal {
@@ -570,7 +644,7 @@ fn resolve_split_layout(
     };
 
     let base_split = available * 0.5 + split.split_offset;
-    let clamped_split = base_split.clamp(min0, (available - min1).max(min0));
+    let clamped_split = base_split.clamp(min0, (available - min1).max(min0)).round();
 
     if is_horizontal {
         let cell0 = Rect2d {

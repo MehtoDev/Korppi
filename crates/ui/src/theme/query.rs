@@ -1,6 +1,6 @@
 //! Hierarchical theme resolution cascade across the ECS scene graph.
 
-use crate::theme::definition::{Theme, ThemeOverride};
+use crate::theme::definition::{default_dark_theme, Theme, ThemeOverride};
 use crate::theme::stylebox::StyleBox;
 use korppi_ecs::{Entity, World};
 
@@ -30,8 +30,8 @@ pub fn get_theme_color(
         current = world.parent_of(cur_entity);
     }
 
-    // 3. Fallback to default engine dark theme
-    Theme::dark().get_color(theme_type, item)
+    // 3. Fallback to cached default engine dark theme
+    default_dark_theme().get_color(theme_type, item)
 }
 
 /// Resolves a numeric constant for an entity through the theme hierarchy.
@@ -58,7 +58,7 @@ pub fn get_theme_constant(
         current = world.parent_of(cur_entity);
     }
 
-    Theme::dark().get_constant(theme_type, item)
+    default_dark_theme().get_constant(theme_type, item)
 }
 
 /// Resolves a font size for an entity through the theme hierarchy.
@@ -85,7 +85,7 @@ pub fn get_theme_font_size(
         current = world.parent_of(cur_entity);
     }
 
-    Theme::dark().get_font_size(theme_type, item)
+    default_dark_theme().get_font_size(theme_type, item)
 }
 
 /// Resolves a StyleBox for an entity and state through the theme hierarchy.
@@ -112,5 +112,5 @@ pub fn get_theme_stylebox(
         current = world.parent_of(cur_entity);
     }
 
-    Theme::dark().get_stylebox(theme_type, item).cloned()
+    default_dark_theme().get_stylebox(theme_type, item).cloned()
 }

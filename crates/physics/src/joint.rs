@@ -2624,6 +2624,68 @@ impl Joint {
         }
     }
 
+    /// Clears the accumulated impulses, so the next step starts cold (Box3D's prepare with
+    /// warm starting off).
+    pub fn reset_impulses(&mut self) {
+        match self {
+            Self::Spherical(j) => {
+                j.linear_impulse = Vec3::ZERO;
+                j.spring_impulse = Vec3::ZERO;
+                j.motor_impulse = Vec3::ZERO;
+                j.lower_twist_impulse = 0.0;
+                j.upper_twist_impulse = 0.0;
+                j.swing_impulse = 0.0;
+            }
+            Self::Revolute(j) => {
+                j.linear_impulse = Vec3::ZERO;
+                j.perp_impulse = Vec2::ZERO;
+                j.spring_impulse = 0.0;
+                j.motor_impulse = 0.0;
+                j.lower_impulse = 0.0;
+                j.upper_impulse = 0.0;
+            }
+            Self::Prismatic(j) => {
+                j.perp_impulse = Vec2::ZERO;
+                j.angular_impulse = Vec3::ZERO;
+                j.spring_impulse = 0.0;
+                j.motor_impulse = 0.0;
+                j.lower_impulse = 0.0;
+                j.upper_impulse = 0.0;
+            }
+            Self::Distance(j) => {
+                j.impulse = 0.0;
+                j.lower_impulse = 0.0;
+                j.upper_impulse = 0.0;
+                j.motor_impulse = 0.0;
+            }
+            Self::Weld(j) => {
+                j.linear_impulse = Vec3::ZERO;
+                j.angular_impulse = Vec3::ZERO;
+            }
+            Self::Wheel(j) => {
+                j.linear_impulse = Vec2::ZERO;
+                j.angular_impulse = Vec2::ZERO;
+                j.spin_impulse = 0.0;
+                j.suspension_spring_impulse = 0.0;
+                j.lower_suspension_impulse = 0.0;
+                j.upper_suspension_impulse = 0.0;
+                j.steering_spring_impulse = 0.0;
+                j.lower_steering_impulse = 0.0;
+                j.upper_steering_impulse = 0.0;
+            }
+            Self::Motor(j) => {
+                j.linear_velocity_impulse = Vec3::ZERO;
+                j.angular_velocity_impulse = Vec3::ZERO;
+                j.linear_spring_impulse = Vec3::ZERO;
+                j.angular_spring_impulse = Vec3::ZERO;
+            }
+            Self::Parallel(j) => {
+                j.perp_impulse = Vec2::ZERO;
+            }
+            Self::Filter(_) => {}
+        }
+    }
+
     /// Sets the torque threshold in N·m for joint events.
     #[must_use]
     pub fn with_torque_threshold(mut self, threshold: f32) -> Self {

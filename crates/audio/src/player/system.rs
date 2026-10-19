@@ -589,8 +589,9 @@ impl AudioPlayer {
                 self.paused = true;
             }
             Request::Resume => {
-                for voice in &self.voices {
+                for voice in &mut self.voices {
                     sent(cx.voices.resume(voice.handle));
+                    voice.pitch_changed = true;
                 }
                 self.paused = false;
             }

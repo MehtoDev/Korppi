@@ -293,8 +293,17 @@ impl RigidBody2d {
     /// world, which moves it from the centre of mass it keeps.
     pub(crate) fn apply_mass_data(&mut self, mass_data: MassData2d) {
         if self.body_type == BodyType::Dynamic {
-            self.mass = mass_data.mass.max(0.0);
-            self.rotational_inertia = mass_data.rotational_inertia.max(0.0);
+            self.mass = if mass_data.mass > 0.0 && mass_data.mass.is_finite() {
+                mass_data.mass
+            } else {
+                0.0
+            };
+            self.rotational_inertia =
+                if mass_data.rotational_inertia > 0.0 && mass_data.rotational_inertia.is_finite() {
+                    mass_data.rotational_inertia
+                } else {
+                    0.0
+                };
             self.local_center = mass_data.center;
         } else {
             self.mass = 0.0;

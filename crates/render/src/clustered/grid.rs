@@ -38,8 +38,10 @@ impl ClusterGridConfig {
         assert!(z_near > 0.0, "z_near must be positive and non-zero");
         assert!(z_far > z_near, "z_far must be strictly greater than z_near");
 
-        let dim_x = screen_width.div_ceil(tile_size);
-        let dim_y = screen_height.div_ceil(tile_size);
+        let screen_width = screen_width.max(1);
+        let screen_height = screen_height.max(1);
+        let dim_x = screen_width.div_ceil(tile_size).max(1);
+        let dim_y = screen_height.div_ceil(tile_size).max(1);
 
         // Exponential depth slicing constants:
         // slice = floor(log2(depth / z_near) / log2(z_far / z_near) * dim_z)

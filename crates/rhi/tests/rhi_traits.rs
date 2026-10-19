@@ -608,8 +608,9 @@ impl GraphicsDevice for MockDevice {
 
     fn create_compute_pipeline(
         &self,
-        _desc: &ComputePipelineDescriptor,
+        desc: &ComputePipelineDescriptor,
     ) -> Result<PipelineHandle, RhiError> {
+        desc.validate()?;
         let id = self.counter.fetch_add(1, Ordering::SeqCst);
         Ok(PipelineHandle::new(id, 1))
     }

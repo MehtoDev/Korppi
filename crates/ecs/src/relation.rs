@@ -119,6 +119,7 @@ impl Default for OutgoingEdge {
 /// Storing up to 2 edges inline eliminates heap allocation and hash map lookups.
 #[derive(Debug, Clone, Default)]
 pub struct EntityRelations {
+    owner: Option<Entity>,
     inline: [OutgoingEdge; 2],
     len: u8,
     extra: Option<Vec<OutgoingEdge>>,
@@ -281,6 +282,7 @@ impl EntityRelations {
     /// Clears all outgoing relationship edges.
     #[inline]
     pub fn clear(&mut self) {
+        self.owner = None;
         self.len = 0;
         if let Some(extra) = &mut self.extra {
             extra.clear();
@@ -302,6 +304,7 @@ pub struct IncomingRelation {
 /// Incoming relationships pointing to a target entity.
 #[derive(Debug, Clone, Default)]
 pub struct IncomingTarget {
+    owner: Option<Entity>,
     /// List of incoming relations and their source entities.
     pub relations: Vec<IncomingRelation>,
     active_count: usize,
@@ -377,6 +380,7 @@ impl IncomingTarget {
     /// Clears all incoming relationships, retaining allocated vectors for recycled entities.
     #[inline]
     pub fn clear(&mut self) {
+        self.owner = None;
         for i in 0..self.active_count {
             self.relations[i].sources.clear();
         }
@@ -414,7 +418,12 @@ impl RelationshipIndex {
         if idx >= self.outgoing.len() {
             self.outgoing.resize_with(idx + 1, EntityRelations::default);
         }
-        &mut self.outgoing[idx]
+        let out = &mut self.outgoing[idx];
+        if out.owner != Some(entity) {
+            out.clear();
+            out.owner = Some(entity);
+        }
+        out
     }
 
     fn ensure_incoming(&mut self, entity: Entity) -> &mut IncomingTarget {
@@ -422,7 +431,12 @@ impl RelationshipIndex {
         if idx >= self.incoming.len() {
             self.incoming.resize_with(idx + 1, IncomingTarget::default);
         }
-        &mut self.incoming[idx]
+        let inc = &mut self.incoming[idx];
+        if inc.owner != Some(entity) {
+            inc.clear();
+            inc.owner = Some(entity);
+        }
+        inc
     }
 
     /// Records a relationship pair between `source` and `target`.
@@ -446,7 +460,11 @@ impl RelationshipIndex {
                 }
                 replaced_target = Some(old_target);
                 let old_idx = old_target.index() as usize;
-                if let Some(in_target) = self.incoming.get_mut(old_idx) {
+                if let Some(in_target) = self
+                    .incoming
+                    .get_mut(old_idx)
+                    .filter(|i| i.owner == Some(old_target))
+                {
                     in_target.remove_source(relation, source);
                 }
             }
@@ -467,7 +485,11 @@ impl RelationshipIndex {
     /// Removes a relationship pair between `source` and `target`.
     pub fn remove(&mut self, source: Entity, relation: ComponentId, target: Entity) -> bool {
         let s_idx = source.index() as usize;
-        let removed = if let Some(out) = self.outgoing.get_mut(s_idx) {
+        let removed = if let Some(out) = self
+            .outgoing
+            .get_mut(s_idx)
+            .filter(|o| o.owner == Some(source))
+        {
             out.remove(relation, target)
         } else {
             false
@@ -475,7 +497,11 @@ impl RelationshipIndex {
 
         if removed {
             let t_idx = target.index() as usize;
-            if let Some(in_target) = self.incoming.get_mut(t_idx) {
+            if let Some(in_target) = self
+                .incoming
+                .get_mut(t_idx)
+                .filter(|i| i.owner == Some(target))
+            {
                 in_target.remove_source(relation, source);
             }
         }
@@ -488,6 +514,7 @@ impl RelationshipIndex {
     pub fn target_of(&self, source: Entity, relation: ComponentId) -> Option<Entity> {
         self.outgoing
             .get(source.index() as usize)
+            .filter(|out| out.owner == Some(source))
             .and_then(|out| out.target_of(relation))
     }
 
@@ -499,6 +526,7 @@ impl RelationshipIndex {
     ) -> impl Iterator<Item = Entity> + '_ {
         self.outgoing
             .get(source.index() as usize)
+            .filter(move |out| out.owner == Some(source))
             .into_iter()
             .flat_map(move |out| out.targets(relation))
     }
@@ -508,6 +536,7 @@ impl RelationshipIndex {
     pub fn sources(&self, target: Entity, relation: ComponentId) -> &[Entity] {
         self.incoming
             .get(target.index() as usize)
+            .filter(|in_target| in_target.owner == Some(target))
             .map_or(&[], |in_target| in_target.sources(relation))
     }
 
@@ -516,7 +545,7 @@ impl RelationshipIndex {
     pub fn has_pair(&self, source: Entity, relation: ComponentId, target: Entity) -> bool {
         self.outgoing
             .get(source.index() as usize)
-            .is_some_and(|out| out.has_pair(relation, target))
+            .is_some_and(|out| out.owner == Some(source) && out.has_pair(relation, target))
     }
 
     /// Returns `true` if `source` possesses any pair with `relation`.
@@ -524,7 +553,7 @@ impl RelationshipIndex {
     pub fn has_relation(&self, source: Entity, relation: ComponentId) -> bool {
         self.outgoing
             .get(source.index() as usize)
-            .is_some_and(|out| out.has_relation(relation))
+            .is_some_and(|out| out.owner == Some(source) && out.has_relation(relation))
     }
 
     /// Returns the cleanup policy for `relation`.
@@ -542,15 +571,21 @@ impl RelationshipIndex {
     pub fn incoming_target(&self, target: Entity) -> Option<&IncomingTarget> {
         self.incoming
             .get(target.index() as usize)
-            .filter(|in_target| !in_target.is_empty())
+            .filter(|in_target| in_target.owner == Some(target) && !in_target.is_empty())
     }
 
     /// Returns `true` if `entity` has any incoming or outgoing relationships.
     #[must_use]
     pub fn has_any_relationships(&self, entity: Entity) -> bool {
         let idx = entity.index() as usize;
-        let has_out = self.outgoing.get(idx).is_some_and(|r| !r.is_empty());
-        let has_in = self.incoming.get(idx).is_some_and(|r| !r.is_empty());
+        let has_out = self
+            .outgoing
+            .get(idx)
+            .is_some_and(|r| r.owner == Some(entity) && !r.is_empty());
+        let has_in = self
+            .incoming
+            .get(idx)
+            .is_some_and(|r| r.owner == Some(entity) && !r.is_empty());
         has_out || has_in
     }
 
@@ -560,7 +595,7 @@ impl RelationshipIndex {
     pub fn has_incoming(&self, target: Entity) -> bool {
         self.incoming
             .get(target.index() as usize)
-            .is_some_and(|in_target| !in_target.is_empty())
+            .is_some_and(|in_target| in_target.owner == Some(target) && !in_target.is_empty())
     }
 
     /// Clears the outgoing edges of `entity`, removing it as a source from every target for which
@@ -568,28 +603,37 @@ impl RelationshipIndex {
     #[inline]
     pub fn clear_outgoing(&mut self, entity: Entity, target_dies: impl Fn(Entity) -> bool) {
         let e_idx = entity.index() as usize;
-        if let Some(out) = self.outgoing.get_mut(e_idx) {
+        if let Some(out) = self
+            .outgoing
+            .get_mut(e_idx)
+            .filter(|o| o.owner == Some(entity))
+        {
             if !out.is_empty() {
                 for edge in out.iter() {
                     if !target_dies(edge.target) {
-                        if let Some(in_target) = self.incoming.get_mut(edge.target.index() as usize)
+                        if let Some(in_target) = self
+                            .incoming
+                            .get_mut(edge.target.index() as usize)
+                            .filter(|i| i.owner == Some(edge.target))
                         {
                             in_target.remove_source(edge.relation, entity);
                         }
                     }
                 }
-                out.clear();
             }
+            out.clear();
         }
     }
 
     /// Clears all incoming edges for `entity`.
     #[inline]
     pub fn clear_incoming(&mut self, entity: Entity) {
-        if let Some(in_target) = self.incoming.get_mut(entity.index() as usize) {
-            if !in_target.is_empty() {
-                in_target.clear();
-            }
+        if let Some(in_target) = self
+            .incoming
+            .get_mut(entity.index() as usize)
+            .filter(|i| i.owner == Some(entity))
+        {
+            in_target.clear();
         }
     }
 
@@ -608,7 +652,7 @@ impl RelationshipIndex {
         if self
             .outgoing
             .get(target.index() as usize)
-            .is_none_or(|out| !out.has_relation(relation))
+            .is_none_or(|out| out.owner != Some(target) || !out.has_relation(relation))
         {
             return false;
         }
@@ -635,7 +679,11 @@ impl RelationshipIndex {
                 continue;
             }
             self.cycle_seen[index] = stamp;
-            if let Some(out) = self.outgoing.get(index) {
+            if let Some(out) = self
+                .outgoing
+                .get(index)
+                .filter(|o| o.owner == Some(current))
+            {
                 stack.extend(
                     out.iter()
                         .filter(|edge| edge.relation == relation)

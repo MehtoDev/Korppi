@@ -207,6 +207,26 @@ impl Mat4 {
         )
     }
 
+    /// Extracts `(scale, rotation, translation)` from a 4x4 affine transformation matrix with non-zero scale.
+    #[inline]
+    #[must_use]
+    pub fn to_scale_rotation_translation(&self) -> (Vec3, Quat, Vec3) {
+        let det = self.determinant();
+        let scale = Vec3::new(
+            self.x_axis.truncate().length() * det.signum(),
+            self.y_axis.truncate().length(),
+            self.z_axis.truncate().length(),
+        );
+        let inv_scale = Vec3::new(1.0 / scale.x, 1.0 / scale.y, 1.0 / scale.z);
+        let rotation = Quat::from_rotation_axes(
+            self.x_axis.truncate() * inv_scale.x,
+            self.y_axis.truncate() * inv_scale.y,
+            self.z_axis.truncate() * inv_scale.z,
+        );
+        let translation = self.w_axis.truncate();
+        (scale, rotation, translation)
+    }
+
     /// Creates a right-handed view matrix from camera `eye` position, forward `dir`, and `up` vector.
     #[inline]
     #[must_use]

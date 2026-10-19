@@ -1,6 +1,6 @@
-//! 3D camera with orbital rotation, panning, zoom, and perspective projection.
+//! 3D camera with orbital rotation, panning, zoom, free-flight mode, and perspective projection.
 
-use korppi_math::{Mat4, Vec3, Vec4};
+use korppi_math::{Mat4, Ray, Vec3, Vec4};
 
 /// Camera movement mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +62,16 @@ impl Camera3d {
         }
     }
 
+    /// Returns the unit forward look direction implied by `yaw` and `pitch`.
+    #[must_use]
+    pub fn forward_vector(&self) -> Vec3 {
+        let cos_p = self.pitch.cos();
+        let sin_p = self.pitch.sin();
+        let sin_y = self.yaw.sin();
+        let cos_y = self.yaw.cos();
+        Vec3::new(-cos_p * sin_y, -sin_p, -cos_p * cos_y).normalize_or_zero()
+    }
+
     /// Computes the camera eye position based on orbit angles and distance.
     pub fn update_orbit_eye(&mut self) {
         if self.mode == CameraMode::Orbit {
@@ -77,6 +87,28 @@ impl Camera3d {
             );
             self.eye = self.target + offset;
         }
+    }
+
+    /// Toggles between [`CameraMode::Orbit`] and [`CameraMode::Fly`].
+    pub fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            CameraMode::Orbit => CameraMode::Fly,
+            CameraMode::Fly => {
+                self.update_orbit_eye();
+                CameraMode::Orbit
+            }
+        };
+    }
+
+    /// Translates the camera along its local forward, right, and world-up axes in [`CameraMode::Fly`].
+    pub fn fly_move(&mut self, forward_input: f32, right_input: f32, up_input: f32, dt: f32) {
+        let forward = (self.target - self.eye).normalize_or_zero();
+        let (right, _) = self.right_and_up_vectors();
+        let velocity = (forward * forward_input + right * right_input + Vec3::Y * up_input)
+            * self.move_speed
+            * dt;
+        self.eye += velocity;
+        self.target += velocity;
     }
 
     /// Computes the right and up unit vectors perpendicular to the camera look direction.
@@ -123,12 +155,118 @@ impl Camera3d {
         Some((screen_x, screen_y))
     }
 
-    /// Orbits camera view angles in response to mouse drag delta.
+    /// Clips a 3D world-space line segment `[p1, p2]` against the camera near and far planes
+    /// before projecting both endpoints to 2D screen coordinates.
+    ///
+    /// Returns `None` only when the entire segment lies behind the near plane or beyond the far plane.
+    #[must_use]
+    pub fn clip_and_project_line(
+        &self,
+        p1: Vec3,
+        p2: Vec3,
+        screen_size: (f32, f32),
+    ) -> Option<((f32, f32), (f32, f32))> {
+        let view = self.view_matrix();
+        let v1_4 = view * Vec4::new(p1.x, p1.y, p1.z, 1.0);
+        let v2_4 = view * Vec4::new(p2.x, p2.y, p2.z, 1.0);
+        let mut c1 = Vec3::new(v1_4.x, v1_4.y, v1_4.z);
+        let mut c2 = Vec3::new(v2_4.x, v2_4.y, v2_4.z);
+
+        // Right-handed view space: visible points satisfy -far <= z <= -near.
+        let near_z = -self.near.max(0.05);
+        let far_z = -self.far;
+
+        if c1.z > near_z && c2.z > near_z {
+            return None;
+        }
+        if c1.z < far_z && c2.z < far_z {
+            return None;
+        }
+
+        if c1.z > near_z {
+            let dz = c2.z - c1.z;
+            if dz.abs() < 1e-6 {
+                return None;
+            }
+            let t = (near_z - c1.z) / dz;
+            c1 += (c2 - c1) * t;
+        } else if c2.z > near_z {
+            let dz = c2.z - c1.z;
+            if dz.abs() < 1e-6 {
+                return None;
+            }
+            let t = (near_z - c1.z) / dz;
+            c2 = c1 + (c2 - c1) * t;
+        }
+
+        if c1.z < far_z && c2.z < far_z {
+            return None;
+        }
+        if c1.z < far_z {
+            let dz = c2.z - c1.z;
+            if dz.abs() < 1e-6 {
+                return None;
+            }
+            let t = (far_z - c1.z) / dz;
+            c1 += (c2 - c1) * t;
+        } else if c2.z < far_z {
+            let dz = c2.z - c1.z;
+            if dz.abs() < 1e-6 {
+                return None;
+            }
+            let t = (far_z - c1.z) / dz;
+            c2 = c1 + (c2 - c1) * t;
+        }
+
+        let proj = self.projection_matrix();
+        let clip1 = proj * Vec4::new(c1.x, c1.y, c1.z, 1.0);
+        let clip2 = proj * Vec4::new(c2.x, c2.y, c2.z, 1.0);
+        if clip1.w <= 1e-5 || clip2.w <= 1e-5 {
+            return None;
+        }
+
+        let s1 = (
+            ((clip1.x / clip1.w) + 1.0) * 0.5 * screen_size.0,
+            (1.0 - (clip1.y / clip1.w)) * 0.5 * screen_size.1,
+        );
+        let s2 = (
+            ((clip2.x / clip2.w) + 1.0) * 0.5 * screen_size.0,
+            (1.0 - (clip2.y / clip2.w)) * 0.5 * screen_size.1,
+        );
+        if !s1.0.is_finite() || !s1.1.is_finite() || !s2.0.is_finite() || !s2.1.is_finite() {
+            return None;
+        }
+        Some((s1, s2))
+    }
+
+    /// Unprojects a 2D screen coordinate (pixels, top-left origin) into a world-space [`Ray`].
+    #[must_use]
+    pub fn screen_to_ray(&self, screen_pos: (f32, f32), screen_size: (f32, f32)) -> Ray {
+        let w = screen_size.0.max(1.0);
+        let h = screen_size.1.max(1.0);
+        let ndc_x = (screen_pos.0 / w) * 2.0 - 1.0;
+        let ndc_y = 1.0 - (screen_pos.1 / h) * 2.0;
+
+        let tan_half_fov = (self.fov_y * 0.5).tan();
+        let forward = (self.target - self.eye).normalize_or_zero();
+        let (right, up) = self.right_and_up_vectors();
+        let dir =
+            (forward + right * (ndc_x * self.aspect * tan_half_fov) + up * (ndc_y * tan_half_fov))
+                .normalize_or_zero();
+        Ray::new(self.eye, dir)
+    }
+
+    /// Orbits or rotates camera view angles in response to mouse drag delta.
     pub fn orbit_drag(&mut self, delta_x: f32, delta_y: f32) {
         let sensitivity = 0.005;
         self.yaw -= delta_x * sensitivity;
         self.pitch = (self.pitch + delta_y * sensitivity).clamp(-1.45, 1.45);
-        self.update_orbit_eye();
+        match self.mode {
+            CameraMode::Orbit => self.update_orbit_eye(),
+            CameraMode::Fly => {
+                self.target = self.eye + self.forward_vector() * self.distance;
+            }
+        }
     }
 
     /// Pans camera focal target along view right and up vectors.
@@ -143,6 +281,8 @@ impl Camera3d {
     /// Zooms camera in or out by scaling distance.
     pub fn zoom(&mut self, factor: f32) {
         self.distance = (self.distance * factor).clamp(2.0, 150.0);
-        self.update_orbit_eye();
+        if self.mode == CameraMode::Orbit {
+            self.update_orbit_eye();
+        }
     }
 }

@@ -36,12 +36,18 @@ impl DiagnosticMetrics {
 
     /// Records a completed frame with elapsed duration.
     pub fn record_frame(&mut self, elapsed: Duration) {
-        let ms = elapsed.as_secs_f32() * 1000.0;
+        let secs = elapsed.as_secs_f32();
+        let ms = if secs.is_finite() && secs >= 0.0 {
+            secs * 1000.0
+        } else {
+            0.0
+        };
         self.frame_time_ms = ms;
-        if elapsed.as_secs_f32() > 0.0 {
-            let instant_fps = 1.0 / elapsed.as_secs_f32();
+        if secs.is_finite() && secs > 0.0 {
+            let clamped_secs = secs.max(1e-3);
+            let instant_fps = 1.0 / clamped_secs;
             // Smooth rolling average FPS (alpha = 0.1)
-            if self.fps == 0.0 {
+            if self.fps == 0.0 || !self.fps.is_finite() {
                 self.fps = instant_fps;
             } else {
                 self.fps = self.fps * 0.9 + instant_fps * 0.1;

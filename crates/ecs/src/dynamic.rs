@@ -81,17 +81,24 @@ impl World {
         unsafe { self.insert_bytes_raw(entity, id, bytes) };
     }
 
-    /// The bytes of the runtime component `id` on `entity`, or `None` if the entity lacks it or
-    /// `id` is not a runtime-defined component.
+    /// The bytes of the runtime component `id` on `entity` (or inherited from a prefab), or `None`
+    /// if the entity lacks it or `id` is not a runtime-defined component.
     #[must_use]
     pub fn get_bytes(&self, entity: Entity, id: ComponentId) -> Option<&[u8]> {
         if !self.components().is_dynamic(id) {
             return None;
         }
         let location = self.entity_location(entity)?;
-        let column = self.archetypes()[location.archetype_id].column(id)?;
-        // SAFETY: a runtime component's values are written only as bytes, so all are initialized.
-        Some(unsafe { column.row_bytes(location.row) })
+        let arch = &self.archetypes()[location.archetype_id];
+        if let Some(column) = arch.column(id) {
+            // SAFETY: a runtime component's values are written only as bytes, so all are initialized.
+            return Some(unsafe { column.row_bytes(location.row) });
+        }
+        let owner = arch.inherits(id)?;
+        let owner_loc = self.entity_location(owner)?;
+        let column = self.archetypes()[owner_loc.archetype_id].column(id)?;
+        // SAFETY: as above, for the prefab owner's row.
+        Some(unsafe { column.row_bytes(owner_loc.row) })
     }
 
     /// The bytes of the runtime component `id` on `entity`, mutably; `None` if the entity lacks
@@ -124,11 +131,11 @@ impl World {
         removed
     }
 
-    /// The live entities that have component `id`.
+    /// The live entities that own or inherit component `id`.
     pub fn entities_with(&self, id: ComponentId) -> impl Iterator<Item = Entity> + '_ {
         self.archetypes()
             .iter()
-            .filter(move |archetype| archetype.has_component(id))
+            .filter(move |archetype| archetype.has_or_inherits(id))
             .flat_map(|archetype| archetype.entities().iter().copied())
     }
 
@@ -164,6 +171,8 @@ impl World {
         if let Some(column) = self.archetypes_mut()[location.archetype_id].column_mut(id) {
             // SAFETY: the caller guarantees a valid value; the entity's row holds the old one.
             unsafe { column.replace_bytes(location.row, bytes, tick) };
+            self.observers_mut().record(EventKind::Set, id, entity);
+            self.flush_observers();
             return;
         }
         let dst = self.archetype_with_added(location, id);
@@ -173,5 +182,8 @@ impl World {
                 column.push_bytes(bytes, tick);
             });
         }
+        self.observers_mut().record(EventKind::Add, id, entity);
+        self.observers_mut().record(EventKind::Set, id, entity);
+        self.flush_observers();
     }
 }

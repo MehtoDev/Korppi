@@ -54,9 +54,14 @@ fn keyboard_modifier_helpers() {
 fn mouse_state_tracks_position_delta_and_buttons() {
     let mut mouse = MouseState::new();
 
+    // Initial cursor observation establishes position without a spike from (0, 0) (INP-03)
     mouse.on_moved(Vec2::new(100.0, 200.0));
     assert_eq!(mouse.position(), Vec2::new(100.0, 200.0));
-    assert_eq!(mouse.delta(), Vec2::new(100.0, 200.0));
+    assert_eq!(mouse.delta(), Vec2::ZERO);
+
+    mouse.on_moved(Vec2::new(115.0, 190.0));
+    assert_eq!(mouse.position(), Vec2::new(115.0, 190.0));
+    assert_eq!(mouse.delta(), Vec2::new(15.0, -10.0));
     mouse.tick();
 
     // Raw delta accumulation (e.g. for FPS camera)

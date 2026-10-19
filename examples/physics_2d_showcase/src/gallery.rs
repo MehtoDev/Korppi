@@ -211,6 +211,16 @@ impl Gallery2d for JointsGallery {
         let dj_end = DistanceJoint2d::new(prev_anchor, Vec2::ZERO, 0.1, 30.0, 0.7);
         world.create_joint(prev_body, tower_right, Joint2d::Distance(dj_end));
 
+        // Dynamic payload dropped onto the suspension bridge so it sags and oscillates under load
+        let bridge_load = world
+            .create_body(RigidBody2d::new(BodyType::Dynamic).with_position(Vec2::new(-6.0, 5.5)));
+        world.create_collider(
+            bridge_load,
+            Collider2d::new(Shape2d::Circle(Circle2d::new(Vec2::ZERO, 0.35)))
+                .with_density(4.0)
+                .with_friction(0.6),
+        );
+
         // 2. Motorized rotating 4-spoke wheel at x = 3.0, y = 6.0
         let hub_base = world
             .create_body(RigidBody2d::new(BodyType::Static).with_position(Vec2::new(3.0, 6.0)));
@@ -262,19 +272,18 @@ impl Gallery2d for JointsGallery {
         let rev2 = RevoluteJoint2d::new(Vec2::new(0.7, 0.0), Vec2::new(-0.7, 0.0), 0.0, 0.0);
         world.create_joint(pend_arm1, pend_arm2, Joint2d::Revolute(rev2));
 
-        // 4. Prismatic Piston Slider at x = -6.0, y = 2.0
+        // 4. Motorized Prismatic Piston Elevator at x = -6.0, y = 2.0
         let slider_base = world
             .create_body(RigidBody2d::new(BodyType::Static).with_position(Vec2::new(-6.0, 2.0)));
         let slider_piston = world
-            .create_body(RigidBody2d::new(BodyType::Dynamic).with_position(Vec2::new(-6.0, 3.0)));
+            .create_body(RigidBody2d::new(BodyType::Dynamic).with_position(Vec2::new(-6.0, 2.6)));
         world.create_collider(
             slider_piston,
             Collider2d::new(Shape2d::Polygon(Polygon2d::from_box(0.4, 0.4))),
         );
-        let mut prism = PrismaticJoint2d::new(Vec2::ZERO, Vec2::ZERO, Vec2::Y, 0.0, 0.0);
-        prism.enable_limit = true;
-        prism.lower_translation = 0.0;
-        prism.upper_translation = 2.0;
+        let prism = PrismaticJoint2d::new(Vec2::ZERO, Vec2::ZERO, Vec2::Y, 0.0, 0.0)
+            .with_limits(0.0, 2.0)
+            .with_motor(2.5, 500.0);
         world.create_joint(slider_base, slider_piston, Joint2d::Prismatic(prism));
 
         // 5. Wheel suspension rover on ground at x = 7.0
@@ -303,7 +312,7 @@ impl Gallery2d for JointsGallery {
         let wheel_j2 = WheelJoint2d::new(Vec2::new(1.0, -0.3), Vec2::ZERO, Vec2::Y, 15.0, 0.7);
         world.create_joint(chassis, wheel_right, Joint2d::Wheel(wheel_j2));
 
-        // 6. Weld Cantilever Beam at x = -1.0, y = 2.0
+        // 6. Breakable Weld Cantilever Beam at x = -1.0, y = 2.0
         let beam_root = world
             .create_body(RigidBody2d::new(BodyType::Static).with_position(Vec2::new(-1.0, 2.0)));
         let beam_mid = world
@@ -322,7 +331,18 @@ impl Gallery2d for JointsGallery {
             Collider2d::new(Shape2d::Polygon(Polygon2d::from_box(0.75, 0.1))),
         );
         let weld2 = WeldJoint2d::new(Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0), 0.0, 0.0);
-        world.create_joint(beam_mid, beam_tip, Joint2d::Weld(weld2));
+        world.add_joint(
+            korppi_physics2d::JointInstance2d::new(beam_mid, beam_tip, Joint2d::Weld(weld2))
+                .with_event_thresholds(40.0, 15.0),
+        );
+
+        // Heavy dynamic block dropped onto the outer cantilever tip to trigger fracture
+        let anvil = world
+            .create_body(RigidBody2d::new(BodyType::Dynamic).with_position(Vec2::new(1.5, 3.8)));
+        world.create_collider(
+            anvil,
+            Collider2d::new(Shape2d::Polygon(Polygon2d::from_box(0.3, 0.3))).with_density(20.0),
+        );
     }
 }
 

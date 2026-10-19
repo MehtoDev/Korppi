@@ -82,8 +82,15 @@ impl<A: KorppiApp> ApplicationHandler for AppRunner<A> {
 
         match self.config.mode {
             crate::config::WindowMode::Fullscreen => {
-                attributes =
-                    attributes.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                let fullscreen = event_loop
+                    .primary_monitor()
+                    .or_else(|| event_loop.available_monitors().next())
+                    .and_then(|monitor| monitor.video_modes().next())
+                    .map_or(
+                        winit::window::Fullscreen::Borderless(None),
+                        winit::window::Fullscreen::Exclusive,
+                    );
+                attributes = attributes.with_fullscreen(Some(fullscreen));
             }
             crate::config::WindowMode::BorderlessFullscreen => {
                 attributes =
@@ -129,24 +136,30 @@ impl<A: KorppiApp> ApplicationHandler for AppRunner<A> {
                 event_loop.exit();
             }
             WinitWindowEvent::Resized(phys_size) => {
-                let scale = window.scale_factor();
-                let log_w = (phys_size.width as f64 / scale).round() as u32;
-                let log_h = (phys_size.height as f64 / scale).round() as u32;
-                window.on_resized(log_w, log_h);
+                window.set_physical_size(phys_size.width, phys_size.height);
                 let ev = WindowEvent::Resized {
-                    width: log_w,
-                    height: log_h,
+                    width: window.width(),
+                    height: window.height(),
                 };
                 self.app.on_event(window, &ev);
             }
             WinitWindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                window.on_scale_factor_changed(scale_factor);
-                let ev = WindowEvent::ScaleFactorChanged { scale_factor };
+                window.set_scale_factor(scale_factor);
+                if let Some(phys) = window.winit_window().map(winit::window::Window::inner_size) {
+                    window.set_physical_size(phys.width, phys.height);
+                }
+                let ev = WindowEvent::ScaleFactorChanged {
+                    scale_factor: window.scale_factor(),
+                };
                 self.app.on_event(window, &ev);
             }
             WinitWindowEvent::Focused(focused) => {
+                window.set_focused(focused);
                 let ev = WindowEvent::Focused(focused);
-                window.push_event(ev.clone());
+                self.app.on_event(window, &ev);
+            }
+            WinitWindowEvent::Moved(pos) => {
+                let ev = WindowEvent::Moved { x: pos.x, y: pos.y };
                 self.app.on_event(window, &ev);
             }
             WinitWindowEvent::CursorMoved { position, .. } => {
@@ -155,8 +168,13 @@ impl<A: KorppiApp> ApplicationHandler for AppRunner<A> {
                     x: position.x / scale,
                     y: position.y / scale,
                 };
-                window.push_event(ev.clone());
                 self.app.on_event(window, &ev);
+            }
+            WinitWindowEvent::CursorEntered { .. } => {
+                self.app.on_event(window, &WindowEvent::CursorEntered);
+            }
+            WinitWindowEvent::CursorLeft { .. } => {
+                self.app.on_event(window, &WindowEvent::CursorLeft);
             }
             WinitWindowEvent::MouseInput { state, button, .. } => {
                 let btn = match button {
@@ -165,27 +183,30 @@ impl<A: KorppiApp> ApplicationHandler for AppRunner<A> {
                     winit::event::MouseButton::Middle => 2,
                     winit::event::MouseButton::Back => 3,
                     winit::event::MouseButton::Forward => 4,
-                    winit::event::MouseButton::Other(o) => 5 + o as u32,
+                    winit::event::MouseButton::Other(o) => u32::from(o).max(5),
                 };
                 let ev = WindowEvent::MouseInput {
                     button: btn,
                     pressed: state.is_pressed(),
                 };
-                window.push_event(ev.clone());
                 self.app.on_event(window, &ev);
             }
             WinitWindowEvent::MouseWheel { delta, .. } => {
                 let (delta_x, delta_y) = match delta {
                     winit::event::MouseScrollDelta::LineDelta(x, y) => (x, y),
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        Window::normalize_pixel_scroll(pos.x, pos.y, window.scale_factor())
+                    }
                 };
                 let ev = WindowEvent::MouseWheel { delta_x, delta_y };
-                window.push_event(ev.clone());
                 self.app.on_event(window, &ev);
             }
             WinitWindowEvent::KeyboardInput {
                 event: key_event, ..
             } => {
+                if key_event.repeat && key_event.state.is_pressed() {
+                    return;
+                }
                 let key_code = match key_event.physical_key {
                     winit::keyboard::PhysicalKey::Code(code) => Some(code as u32),
                     winit::keyboard::PhysicalKey::Unidentified(_) => None,
@@ -194,7 +215,6 @@ impl<A: KorppiApp> ApplicationHandler for AppRunner<A> {
                     key_code,
                     pressed: key_event.state.is_pressed(),
                 };
-                window.push_event(ev.clone());
                 self.app.on_event(window, &ev);
             }
             WinitWindowEvent::RedrawRequested => {

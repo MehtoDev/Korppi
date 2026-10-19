@@ -1,6 +1,6 @@
 //! Virtual File System (VFS) with mount routing, physical sandboxing, and packed archives.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -147,18 +147,28 @@ impl FileSystem for MemoryFileSystem {
             format!("{clean}/")
         };
 
-        let mut results = Vec::new();
+        let mut seen = BTreeSet::new();
         for k in files.keys() {
-            if k.starts_with(&prefix) {
-                results.push(k.clone());
+            if let Some(rest) = k.strip_prefix(&prefix) {
+                if !rest.is_empty() {
+                    let child_name = rest.split('/').next().unwrap_or("");
+                    if !child_name.is_empty() {
+                        let entry_path = if clean.is_empty() {
+                            child_name.to_string()
+                        } else {
+                            format!("{clean}/{child_name}")
+                        };
+                        seen.insert(entry_path);
+                    }
+                }
             }
         }
 
-        if results.is_empty() && !clean.is_empty() && !self.is_dir(path) {
+        if seen.is_empty() && !clean.is_empty() {
             return Err(VfsError::NotFound(path.to_string()));
         }
 
-        Ok(results)
+        Ok(seen.into_iter().collect())
     }
 }
 
@@ -177,33 +187,41 @@ impl PhysicalFileSystem {
 
     fn resolve(&self, path: &str) -> Result<PathBuf, VfsError> {
         let clean = normalize_virtual_path(path)?;
-        let target = self.root.join(clean);
+        if clean.is_empty() {
+            return Ok(self.root.clone());
+        }
 
-        // Verify that path does not escape root
-        let canonical = match fs::canonicalize(&target) {
-            Ok(c) => c,
-            Err(_) => {
-                // If it doesn't exist yet, check normal parent
-                let mut current = target.clone();
-                while !current.exists() {
-                    if let Some(parent) = current.parent() {
-                        current = parent.to_path_buf();
-                    } else {
-                        break;
+        let mut current = self.root.clone();
+        for segment in clean.split('/') {
+            current.push(segment);
+            match fs::symlink_metadata(&current) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        let canon = fs::canonicalize(&current)
+                            .map_err(|_| VfsError::SecurityViolation(path.to_string()))?;
+                        if !canon.starts_with(&self.root) {
+                            return Err(VfsError::SecurityViolation(path.to_string()));
+                        }
+                        current = canon;
                     }
                 }
-                match fs::canonicalize(&current) {
-                    Ok(c) => c,
-                    Err(e) => return Err(VfsError::Io(e.to_string())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(VfsError::NotFound(path.to_string()));
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return Err(VfsError::SecurityViolation(path.to_string()));
+                }
+                Err(e) => return Err(VfsError::Io(e.to_string())),
             }
-        };
+        }
 
+        let canonical = fs::canonicalize(&current)
+            .map_err(|_| VfsError::SecurityViolation(path.to_string()))?;
         if !canonical.starts_with(&self.root) {
             return Err(VfsError::SecurityViolation(path.to_string()));
         }
 
-        Ok(target)
+        Ok(canonical)
     }
 }
 
@@ -230,6 +248,7 @@ impl FileSystem for PhysicalFileSystem {
     }
 
     fn list_dir(&self, path: &str) -> Result<Vec<String>, VfsError> {
+        let clean = normalize_virtual_path(path)?;
         let resolved = self.resolve(path)?;
         let entries = fs::read_dir(&resolved).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => VfsError::NotFound(path.to_string()),
@@ -239,12 +258,12 @@ impl FileSystem for PhysicalFileSystem {
         let mut results = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| VfsError::Io(e.to_string()))?;
-            let rel = entry
-                .path()
-                .strip_prefix(&self.root)
-                .map_err(|e| VfsError::Io(e.to_string()))?
-                .to_string_lossy()
-                .replace('\\', "/");
+            let name = entry.file_name().to_string_lossy().replace('\\', "/");
+            let rel = if clean.is_empty() {
+                name
+            } else {
+                format!("{clean}/{name}")
+            };
             results.push(rel);
         }
 
@@ -287,7 +306,14 @@ impl ArchiveFileSystem {
         let count = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
         cursor += 4;
 
-        let mut entries = HashMap::new();
+        // Each entry header is at least 18 bytes (2B path_len + 8B offset + 8B len).
+        if count > (bytes.len() - cursor) / 18 {
+            return Err(VfsError::CorruptArchive(
+                "Archive entry count exceeds remaining buffer size".into(),
+            ));
+        }
+
+        let mut entries = HashMap::with_capacity(count);
         for _ in 0..count {
             if cursor + 2 > bytes.len() {
                 return Err(VfsError::CorruptArchive("Truncated path length".into()));
@@ -300,19 +326,24 @@ impl ArchiveFileSystem {
                 return Err(VfsError::CorruptArchive("Truncated path string".into()));
             }
             let path_str = std::str::from_utf8(&bytes[cursor..cursor + path_len])
-                .map_err(|e| VfsError::CorruptArchive(e.to_string()))?
-                .to_string();
+                .map_err(|e| VfsError::CorruptArchive(e.to_string()))?;
+            let clean_path = normalize_virtual_path(path_str)?;
             cursor += path_len;
 
             if cursor + 16 > bytes.len() {
                 return Err(VfsError::CorruptArchive("Truncated offset/len".into()));
             }
-            let offset = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap()) as usize;
+            let offset_u64 = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
             cursor += 8;
-            let len = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap()) as usize;
+            let len_u64 = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
             cursor += 8;
 
-            entries.insert(path_str, (offset, len));
+            let offset = usize::try_from(offset_u64)
+                .map_err(|_| VfsError::CorruptArchive("Entry offset overflows usize".into()))?;
+            let len = usize::try_from(len_u64)
+                .map_err(|_| VfsError::CorruptArchive("Entry length overflows usize".into()))?;
+
+            entries.insert(clean_path, (offset, len));
         }
 
         let data = bytes.to_vec();
@@ -328,13 +359,16 @@ impl FileSystem for ArchiveFileSystem {
             .get(&clean)
             .ok_or_else(|| VfsError::NotFound(path.to_string()))?;
 
-        if offset + len > self.data.len() {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| VfsError::CorruptArchive("Slice offset + length overflow".into()))?;
+        if end > self.data.len() {
             return Err(VfsError::CorruptArchive(
                 "Slice extends past archive end".into(),
             ));
         }
 
-        Ok(self.data[offset..offset + len].to_vec())
+        Ok(self.data[offset..end].to_vec())
     }
 
     fn exists(&self, path: &str) -> bool {
@@ -370,18 +404,28 @@ impl FileSystem for ArchiveFileSystem {
             format!("{clean}/")
         };
 
-        let mut results = Vec::new();
+        let mut seen = BTreeSet::new();
         for k in self.entries.keys() {
-            if k.starts_with(&prefix) {
-                results.push(k.clone());
+            if let Some(rest) = k.strip_prefix(&prefix) {
+                if !rest.is_empty() {
+                    let child_name = rest.split('/').next().unwrap_or("");
+                    if !child_name.is_empty() {
+                        let entry_path = if clean.is_empty() {
+                            child_name.to_string()
+                        } else {
+                            format!("{clean}/{child_name}")
+                        };
+                        seen.insert(entry_path);
+                    }
+                }
             }
         }
 
-        if results.is_empty() && !clean.is_empty() && !self.is_dir(path) {
+        if seen.is_empty() && !clean.is_empty() {
             return Err(VfsError::NotFound(path.to_string()));
         }
 
-        Ok(results)
+        Ok(seen.into_iter().collect())
     }
 }
 
@@ -491,18 +535,21 @@ impl Vfs {
     pub fn read(&self, path: &str) -> Result<Vec<u8>, VfsError> {
         let clean = normalize_virtual_path(path)?;
         for mount in &self.mounts {
-            if mount.prefix.is_empty() {
-                if let Ok(bytes) = mount.fs.read(&clean) {
-                    return Ok(bytes);
-                }
-            } else if clean == mount.prefix || clean.starts_with(&format!("{}/", mount.prefix)) {
-                let sub_path = if clean == mount.prefix {
-                    ""
-                } else {
-                    &clean[mount.prefix.len() + 1..]
-                };
-                if let Ok(bytes) = mount.fs.read(sub_path) {
-                    return Ok(bytes);
+            let sub_path = if mount.prefix.is_empty() {
+                Some(clean.as_str())
+            } else if clean == mount.prefix {
+                Some("")
+            } else {
+                clean
+                    .strip_prefix(&mount.prefix)
+                    .and_then(|rest| rest.strip_prefix('/'))
+            };
+
+            if let Some(sub) = sub_path {
+                match mount.fs.read(sub) {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(VfsError::NotFound(_)) => continue,
+                    Err(err) => return Err(err),
                 }
             }
         }

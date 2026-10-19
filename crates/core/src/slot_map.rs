@@ -51,7 +51,8 @@ impl<T> From<u32> for Handle<T> {
 
 impl<T> From<i32> for Handle<T> {
     fn from(index: i32) -> Self {
-        Self::new(index as u32, NonZeroU32::MIN)
+        let index = u32::try_from(index).expect("Handle index cannot be negative");
+        Self::new(index, NonZeroU32::MIN)
     }
 }
 
@@ -69,13 +70,13 @@ impl<T> PartialEq for Handle<T> {
 
 impl<T> PartialEq<u32> for Handle<T> {
     fn eq(&self, other: &u32) -> bool {
-        self.index == *other
+        self.index == *other && self.generation == NonZeroU32::MIN
     }
 }
 
 impl<T> PartialEq<Handle<T>> for u32 {
     fn eq(&self, other: &Handle<T>) -> bool {
-        *self == other.index
+        *self == other.index && other.generation == NonZeroU32::MIN
     }
 }
 
@@ -167,6 +168,18 @@ impl<T> SlotMap<T> {
         self.len == 0
     }
 
+    /// Returns the allocated slot capacity of the slot map.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.slots.capacity()
+    }
+
+    /// Returns `true` if `handle` refers to a currently live element in this slot map.
+    #[must_use]
+    pub fn contains(&self, handle: Handle<T>) -> bool {
+        self.get(handle).is_some()
+    }
+
     /// Inserts a new value into the slot map, returning a typed [`Handle`].
     pub fn insert(&mut self, value: T) -> Handle<T> {
         self.len += 1;
@@ -221,7 +234,7 @@ impl<T> SlotMap<T> {
         let slot_idx = handle.index as usize;
         let slot = self.slots.get_mut(slot_idx)?;
 
-        if slot.generation != handle.generation {
+        if slot.generation != handle.generation || matches!(slot.state, SlotState::Free { .. }) {
             return None;
         }
 
@@ -231,7 +244,7 @@ impl<T> SlotMap<T> {
             .get()
             .checked_add(1)
             .and_then(NonZeroU32::new)
-            .unwrap_or_else(|| NonZeroU32::new(1).unwrap());
+            .unwrap_or(NonZeroU32::MIN);
         slot.generation = next_generation;
 
         let prev_state = std::mem::replace(
@@ -245,8 +258,44 @@ impl<T> SlotMap<T> {
 
         match prev_state {
             SlotState::Occupied(val) => Some(val),
-            SlotState::Free { .. } => None,
+            SlotState::Free { .. } => unreachable!("checked Occupied above"),
         }
+    }
+
+    /// Returns an iterator over `(Handle<T>, &T)` pairs for all live elements in slot order.
+    pub fn iter(&self) -> impl Iterator<Item = (Handle<T>, &T)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| match slot.state {
+                SlotState::Occupied(ref val) => {
+                    Some((Handle::new(idx as u32, slot.generation), val))
+                }
+                SlotState::Free { .. } => None,
+            })
+    }
+
+    /// Returns a mutable iterator over `(Handle<T>, &mut T)` pairs for all live elements in slot order.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Handle<T>, &mut T)> {
+        self.slots
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(idx, slot)| match slot.state {
+                SlotState::Occupied(ref mut val) => {
+                    Some((Handle::new(idx as u32, slot.generation), val))
+                }
+                SlotState::Free { .. } => None,
+            })
+    }
+
+    /// Returns an iterator over shared references `&T` to all live elements in slot order.
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.iter().map(|(_, val)| val)
+    }
+
+    /// Returns an iterator over mutable references `&mut T` to all live elements in slot order.
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.iter_mut().map(|(_, val)| val)
     }
 
     /// Clears all entries from the slot map while retaining memory.
@@ -258,7 +307,7 @@ impl<T> SlotMap<T> {
                     .get()
                     .checked_add(1)
                     .and_then(NonZeroU32::new)
-                    .unwrap_or_else(|| NonZeroU32::new(1).unwrap());
+                    .unwrap_or(NonZeroU32::MIN);
                 slot.state = SlotState::Free {
                     next_free: self.free_head,
                 };

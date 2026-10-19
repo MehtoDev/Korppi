@@ -115,7 +115,7 @@ impl World {
     }
 
     /// The inherited value of `T` for an entity in archetype `archetype`, if it inherits one.
-    pub(crate) fn inherited_component<T: Component>(
+    pub(crate) fn inherited_component<T: 'static>(
         &self,
         archetype: usize,
         id: ComponentId,

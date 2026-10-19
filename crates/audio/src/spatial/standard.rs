@@ -7,6 +7,7 @@ use crate::spatial::{
     AcousticRaycaster, EmitterState, ListenerState, ReverbEnvironmentParams, SpatialAudioModel,
     VoiceSpatialParams,
 };
+use korppi_math::Vec3;
 
 /// Default spatializer implementing analytical distance attenuation,
 /// equal-power stereo panning, Woodworth binaural ITD delays, emitter directivity,
@@ -77,10 +78,14 @@ impl SpatialAudioModel for StandardSpatializer {
         }
 
         // 2. Local Azimuth Computation
-        let forward = listener.forward.normalize();
-        let up = listener.up.normalize();
+        let forward = listener.forward.normalize_or(-Vec3::Z);
+        let up = listener.up.normalize_or(Vec3::Y);
         // The coordinate contract's right: forward × up (−Z forward, +Y up, +X right; AUD-04).
-        let right = forward.cross(up).normalize();
+        let right = forward.cross(up).normalize_or(if forward.y.abs() < 0.99 {
+            forward.cross(Vec3::Y).normalize_or(Vec3::X)
+        } else {
+            forward.cross(Vec3::Z).normalize_or(Vec3::X)
+        });
 
         let x_local = direction.dot(right);
         let z_local = direction.dot(forward);
@@ -97,12 +102,14 @@ impl SpatialAudioModel for StandardSpatializer {
 
         // 6. Emitter Directional Cone
         if let Some(cone) = &emitter.cone {
-            let emitter_fwd = emitter.forward.normalize();
-            let cos_angle = emitter_fwd.dot(-direction).clamp(-1.0, 1.0);
-            let off_axis_angle = cos_angle.acos();
-            let (cone_gain, cone_lpf) = cone.calculate_attenuation(off_axis_angle);
-            dist_gain *= cone_gain;
-            lpf_cutoff = lpf_cutoff.min(cone_lpf);
+            let emitter_fwd = emitter.forward.normalize_or_zero();
+            if emitter_fwd.length_squared() > 0.5 {
+                let cos_angle = emitter_fwd.dot(-direction).clamp(-1.0, 1.0);
+                let off_axis_angle = cos_angle.acos();
+                let (cone_gain, cone_lpf) = cone.calculate_attenuation(off_axis_angle);
+                dist_gain *= cone_gain;
+                lpf_cutoff = lpf_cutoff.min(cone_lpf);
+            }
         }
 
         // 7. Classical Doppler Pitch Shift

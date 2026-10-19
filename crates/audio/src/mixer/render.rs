@@ -310,6 +310,19 @@ impl Voice {
                 continue;
             }
             if self.is_held() {
+                if let Some((at, _)) = self.stop_at.as_mut() {
+                    if *at <= block_start {
+                        ended = Some(offset);
+                        break;
+                    }
+                    // Shift future scheduled stop by the remaining held frames in this block.
+                    let held_frames = (block - offset) as u64;
+                    if reflections.as_deref().is_none_or(ReflectionSlot::is_quiet) {
+                        *at = at.saturating_add(held_frames);
+                        break;
+                    }
+                    *at = at.saturating_add(1);
+                }
                 // Held, the voice is silent; its reflections still sound out.
                 match reflections.as_deref_mut() {
                     Some(slot) if !slot.is_quiet() => slot.sound_out(out),

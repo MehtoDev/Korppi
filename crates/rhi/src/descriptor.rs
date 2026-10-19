@@ -567,14 +567,49 @@ impl VertexLayoutDescriptor {
         self
     }
 
-    /// Validates attribute offsets and binding references.
+    /// Validates attribute offsets, non-zero binding strides, duplicate bindings/locations, and
+    /// binding references.
     pub fn validate(&self) -> Result<(), RhiError> {
-        for attr in &self.attributes {
-            let binding_exists = self.bindings.iter().any(|b| b.binding == attr.binding);
-            if !binding_exists {
+        for (i, b) in self.bindings.iter().enumerate() {
+            if self.bindings[..i]
+                .iter()
+                .any(|prev| prev.binding == b.binding)
+            {
+                return Err(RhiError::ValidationError(format!(
+                    "Duplicate vertex binding {}",
+                    b.binding
+                )));
+            }
+        }
+        for (i, attr) in self.attributes.iter().enumerate() {
+            if self.attributes[..i]
+                .iter()
+                .any(|prev| prev.location == attr.location)
+            {
+                return Err(RhiError::ValidationError(format!(
+                    "Duplicate vertex attribute location {}",
+                    attr.location
+                )));
+            }
+            let Some(binding) = self.bindings.iter().find(|b| b.binding == attr.binding) else {
                 return Err(RhiError::ValidationError(format!(
                     "Vertex attribute at location {} references non-existent binding {}",
                     attr.location, attr.binding
+                )));
+            };
+            if binding.stride > 0
+                && attr
+                    .offset
+                    .checked_add(attr.format.size())
+                    .is_none_or(|end| end > binding.stride)
+            {
+                return Err(RhiError::ValidationError(format!(
+                    "Vertex attribute at location {} (offset {} + size {}) exceeds binding {} stride {}",
+                    attr.location,
+                    attr.offset,
+                    attr.format.size(),
+                    attr.binding,
+                    binding.stride
                 )));
             }
         }
@@ -868,6 +903,40 @@ pub struct PushConstantRange {
     pub size: u32,
 }
 
+impl PushConstantRange {
+    /// Validates that the push-constant range has non-empty stages, non-zero size, 4-byte
+    /// alignment, and fits within [`MAX_PUSH_CONSTANTS_SIZE`] without integer overflow.
+    pub fn validate(&self) -> Result<(), RhiError> {
+        if self.stages.is_empty() {
+            return Err(RhiError::ValidationError(
+                "Push constant range stages must not be empty".into(),
+            ));
+        }
+        if self.size == 0 {
+            return Err(RhiError::ValidationError(
+                "Push constant range size must be greater than 0".into(),
+            ));
+        }
+        if !self.offset.is_multiple_of(4) || !self.size.is_multiple_of(4) {
+            return Err(RhiError::ValidationError(format!(
+                "Push constant range offset {} and size {} must be multiples of 4 bytes",
+                self.offset, self.size
+            )));
+        }
+        if self
+            .offset
+            .checked_add(self.size)
+            .is_none_or(|end| end as usize > MAX_PUSH_CONSTANTS_SIZE)
+        {
+            return Err(RhiError::ValidationError(format!(
+                "Push constant range offset {} + size {} exceeds maximum hardware limit of 128 bytes",
+                self.offset, self.size
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Multisampling state of a graphics pipeline; `count` must equal the sample count of the
 /// pass's attachments.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -907,7 +976,7 @@ pub struct GraphicsPipelineDescriptor {
 }
 
 impl GraphicsPipelineDescriptor {
-    /// Validates that total push constants do not exceed hardware limits.
+    /// Validates vertex layout, depth/stencil state, rasterizer state, and push constant ranges.
     pub fn validate(&self) -> Result<(), RhiError> {
         self.vertex_layout.validate()?;
         if let Some(ds) = &self.depth_stencil {
@@ -924,12 +993,7 @@ impl GraphicsPipelineDescriptor {
             ));
         }
         for range in &self.push_constant_ranges {
-            if (range.offset + range.size) as usize > MAX_PUSH_CONSTANTS_SIZE {
-                return Err(RhiError::ValidationError(format!(
-                    "Push constant range offset {} + size {} exceeds maximum hardware limit of 128 bytes",
-                    range.offset, range.size
-                )));
-            }
+            range.validate()?;
         }
         Ok(())
     }
@@ -946,6 +1010,16 @@ pub struct ComputePipelineDescriptor {
     pub push_constant_ranges: Vec<PushConstantRange>,
     /// Optional debug label.
     pub label: Option<&'static str>,
+}
+
+impl ComputePipelineDescriptor {
+    /// Validates that push constant ranges conform to hardware limits and alignment rules.
+    pub fn validate(&self) -> Result<(), RhiError> {
+        for range in &self.push_constant_ranges {
+            range.validate()?;
+        }
+        Ok(())
+    }
 }
 
 /// Color attachment target for dynamic rendering.

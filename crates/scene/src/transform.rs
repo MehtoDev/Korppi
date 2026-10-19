@@ -133,17 +133,19 @@ impl GlobalTransform {
         Vec3::new(col3.x, col3.y, col3.z)
     }
 
-    /// Extracts world non-uniform scale by computing matrix column lengths.
+    /// Extracts world non-uniform scale by computing matrix column lengths,
+    /// preserving negative scale on odd-axis reflections via the 3x3 determinant sign.
     #[must_use]
     pub fn scale(&self) -> Vec3 {
         let col0 = self.matrix.col(0);
         let col1 = self.matrix.col(1);
         let col2 = self.matrix.col(2);
-        Vec3::new(
-            Vec3::new(col0.x, col0.y, col0.z).length(),
-            Vec3::new(col1.x, col1.y, col1.z).length(),
-            Vec3::new(col2.x, col2.y, col2.z).length(),
-        )
+        let v0 = Vec3::new(col0.x, col0.y, col0.z);
+        let v1 = Vec3::new(col1.x, col1.y, col1.z);
+        let v2 = Vec3::new(col2.x, col2.y, col2.z);
+        let det = v0.cross(v1).dot(v2);
+        let sign = if det < 0.0 { -1.0 } else { 1.0 };
+        Vec3::new(v0.length() * sign, v1.length(), v2.length())
     }
 
     /// Extracts world rotation quaternion.
@@ -225,27 +227,50 @@ pub fn propagate_transforms_with_context(world: &mut World, ctx: &mut TransformP
         }
     }
 
-    // 2. Identify roots: entities without a `ChildOf` parent
+    // 2. Identify hierarchy roots, including roots that do not own a `LocalTransform`
+    //    but have descendants with `LocalTransform`.
     for &(entity, local_mat) in &ctx.roots {
         if world.parent_of(entity).is_none() {
             ctx.queue.push_back((entity, local_mat));
+        } else {
+            let mut top = entity;
+            while let Some(parent) = world.parent_of(top) {
+                top = parent;
+            }
+            if !world.has::<LocalTransform>(top) && !ctx.queue.iter().any(|&(e, _)| e == top) {
+                let top_mat = world
+                    .get::<GlobalTransform>(top)
+                    .map_or(Mat4::IDENTITY, |g| g.matrix);
+                ctx.queue.push_back((top, top_mat));
+            }
         }
     }
 
     // 3. Breadth-first traversal down children hierarchies (`ChildOf` forms no cycles)
     while let Some((entity, world_matrix)) = ctx.queue.pop_front() {
-        if let Some(global) = world.get_mut::<GlobalTransform>(entity) {
-            global.matrix = world_matrix;
-        } else {
-            world.add_component(entity, GlobalTransform::from_matrix(world_matrix));
+        let existing_mat = world.get_owned::<GlobalTransform>(entity).map(|g| g.matrix);
+        match existing_mat {
+            Some(mat) => {
+                if mat != world_matrix {
+                    if let Some(global) = world.get_mut::<GlobalTransform>(entity) {
+                        global.matrix = world_matrix;
+                    }
+                }
+            }
+            None => {
+                if world.has::<LocalTransform>(entity) {
+                    world.add_component(entity, GlobalTransform::from_matrix(world_matrix));
+                }
+            }
         }
 
-        // Traverse children without cloning the entities collection
+        // Traverse children even if an intermediate grouping node has no `LocalTransform`
         for &child in world.children(entity) {
-            if let Some(child_local) = world.get::<LocalTransform>(child) {
-                let child_world_mat = world_matrix * child_local.compute_matrix();
-                ctx.queue.push_back((child, child_world_mat));
-            }
+            let child_world_mat = match world.get::<LocalTransform>(child) {
+                Some(child_local) => world_matrix * child_local.compute_matrix(),
+                None => world_matrix,
+            };
+            ctx.queue.push_back((child, child_world_mat));
         }
     }
 }

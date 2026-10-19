@@ -832,7 +832,7 @@ impl PhysicsWorld2d {
         } else {
             AWAKE_SET
         };
-        let links = BodyLinks2d::new(self.config.sleep_threshold());
+        let links = BodyLinks2d::new(self.config.sleep_threshold(), body.body_type);
         if slot as usize == self.bodies.len() {
             self.bodies.push(body);
             self.body_first_collider.push(None);
@@ -862,6 +862,7 @@ impl PhysicsWorld2d {
         if !self.body_ids.contains(id) {
             return false;
         }
+        self.flush_touched_bodies();
         let slot = id.index();
         let attached: Vec<JointId2d> = self
             .joints()
@@ -890,6 +891,8 @@ impl PhysicsWorld2d {
         self.remove_body_from_island(slot);
         self.remove_body_from_set(slot);
         self.bodies[slot as usize] = RigidBody2d::new(BodyType::Static);
+        self.body_links[slot as usize].body_type = BodyType::Static;
+        self.body_links[slot as usize].touched = false;
         self.body_ids.free(id);
         true
     }
@@ -934,6 +937,14 @@ impl PhysicsWorld2d {
         if !self.body_ids.contains(id) {
             return false;
         }
+        self.flush_touched_bodies();
+        self.set_awake_internal(id, awake)
+    }
+
+    fn set_awake_internal(&mut self, id: BodyId2d, awake: bool) -> bool {
+        if !self.body_ids.contains(id) {
+            return false;
+        }
         let slot = id.index();
         let BodyLinks2d { set, island, .. } = self.body_links[slot as usize];
         if awake {
@@ -954,6 +965,7 @@ impl PhysicsWorld2d {
         if !self.body_ids.contains(id) {
             return false;
         }
+        self.flush_touched_bodies();
         let mut key = self.contact_manager.body_head(id.index());
         while key != NULL {
             let contact = self.contact_manager.at(key >> 1);
@@ -994,11 +1006,21 @@ impl PhysicsWorld2d {
         if !self.body_ids.contains(id) {
             return false;
         }
+        self.flush_touched_bodies();
+        self.set_body_type_internal(id, body_type)
+    }
+
+    fn set_body_type_internal(&mut self, id: BodyId2d, body_type: BodyType) -> bool {
+        if !self.body_ids.contains(id) {
+            return false;
+        }
         let slot = id.index();
-        let old_type = self.bodies[slot as usize].body_type;
+        let old_type = self.body_links[slot as usize].body_type;
         if old_type == body_type {
+            self.bodies[slot as usize].body_type = body_type;
             return true;
         }
+        self.body_links[slot as usize].body_type = body_type;
         if self.body_links[slot as usize].set == DISABLED_SET {
             self.bodies[slot as usize].body_type = body_type;
             self.update_mass(slot);
@@ -1073,6 +1095,7 @@ impl PhysicsWorld2d {
         if !self.body_ids.contains(id) {
             return false;
         }
+        self.flush_touched_bodies();
         let slot = id.index();
         if self.body_links[slot as usize].set == DISABLED_SET {
             return true;
@@ -1103,6 +1126,7 @@ impl PhysicsWorld2d {
         if !self.body_ids.contains(id) {
             return false;
         }
+        self.flush_touched_bodies();
         let slot = id.index();
         if self.body_links[slot as usize].set != DISABLED_SET {
             return true;
@@ -1164,6 +1188,7 @@ impl PhysicsWorld2d {
         if !self.body_ids.contains(id) {
             return false;
         }
+        self.flush_touched_bodies();
         let slot = id.index() as usize;
         let body = &mut self.bodies[slot];
         body.position = position;
@@ -1182,18 +1207,67 @@ impl PhysicsWorld2d {
         links.pose = body.transform();
     }
 
-    /// A body handed out by `body_mut` since the last step: a new pose is a teleport (Box2D
-    /// `b2Body_SetTransform`), whose proxies move before the step looks for pairs, and a new
-    /// centre of mass invalidates the contacts' anchors.
-    fn body_touched(&mut self, slot: u32) {
-        let body = &self.bodies[slot as usize];
-        let pose = self.body_links[slot as usize].pose;
-        if body.position != pose.translation || body.rotation != pose.rotation {
-            self.sync_pose(slot);
-            self.refresh_body_proxies(slot, ProxyUpdate::Reinsert);
+    /// Reconciles any bodies (and their colliders) handed out by [`Self::body_mut`] or
+    /// [`Self::collider_mut`] since the last flush.
+    fn flush_touched_bodies(&mut self) {
+        if self.touched_bodies.is_empty() {
+            return;
         }
+        let mut touched = std::mem::take(&mut self.touched_bodies);
+        for &slot in &touched {
+            if self.body_ids.handle_at(slot).is_some() {
+                self.body_touched(slot);
+                if self.body_links[slot as usize].set != AWAKE_SET {
+                    self.bodies[slot as usize].clear_forces();
+                }
+            }
+        }
+        touched.clear();
+        self.touched_bodies = touched;
+    }
+
+    /// A body handed out by `body_mut` or `collider_mut` since the last flush: reconciles direct
+    /// field mutations (`body_type`, `mass`, `rotational_inertia`, `motion_locks`, `is_sleeping`),
+    /// updates its pose and broadphase proxies if moved, and invalidates contact anchors if its
+    /// centre of mass moved.
+    fn body_touched(&mut self, slot: u32) {
+        self.body_links[slot as usize].touched = false;
+        let new_type = self.bodies[slot as usize].body_type;
+        let old_type = self.body_links[slot as usize].body_type;
+        if new_type != old_type {
+            let user_mass = self.bodies[slot as usize].mass_data();
+            self.bodies[slot as usize].body_type = old_type;
+            if let Some(id) = self.body_ids.handle_at(slot) {
+                self.set_body_type_internal(id, new_type);
+                if new_type == BodyType::Dynamic
+                    && self.body_first_collider[slot as usize].is_none()
+                {
+                    self.bodies[slot as usize].apply_mass_data(user_mass);
+                }
+            }
+        }
+        {
+            let body = &mut self.bodies[slot as usize];
+            let mass_data = body.mass_data();
+            body.apply_mass_data(mass_data);
+            let locks = body.motion_locks;
+            body.set_motion_locks(locks);
+        }
+        self.sync_pose(slot);
+        self.refresh_body_proxies(slot, ProxyUpdate::Reinsert);
         self.mass_moved(slot);
         self.refresh_body_extents(slot);
+        if self.bodies[slot as usize].is_sleeping
+            && self.body_links[slot as usize].set == AWAKE_SET
+            && self.config.enable_sleep
+            && self.bodies[slot as usize].enable_sleep
+        {
+            if let Some(id) = self.body_ids.handle_at(slot) {
+                self.set_awake_internal(id, false);
+            }
+        }
+        self.bodies[slot as usize].is_sleeping =
+            self.body_links[slot as usize].set >= FIRST_SLEEPING_SET;
     }
 
     /// Sets a body's velocities so that it reaches `target` after `time_step` (Box2D
@@ -1208,10 +1282,14 @@ impl PhysicsWorld2d {
         time_step: f32,
         wake: bool,
     ) -> bool {
+        if !(time_step > 0.0 && time_step.is_finite()) {
+            return false;
+        }
+        self.flush_touched_bodies();
         let Some(body) = self.body(id) else {
             return false;
         };
-        if !body.enabled || body.body_type == BodyType::Static || time_step <= 0.0 {
+        if !body.enabled || body.body_type == BodyType::Static {
             return false;
         }
         if body.is_sleeping && !wake {
@@ -1249,6 +1327,7 @@ impl PhysicsWorld2d {
             self.body_ids.contains(body_id),
             "stale body handle {body_id:?}"
         );
+        self.flush_touched_bodies();
         let id = self.insert_collider(body_id.index(), collider, None);
         self.update_mass(body_id.index());
         id
@@ -1319,6 +1398,7 @@ impl PhysicsWorld2d {
             def.materials.len() == 1 || def.materials.len() == count,
             "a chain needs one material or one per segment"
         );
+        self.flush_touched_bodies();
         let id = self.chain_ids.alloc();
         let mut segments = Vec::with_capacity(count);
         for (i, segment) in def.segments().enumerate() {
@@ -1349,6 +1429,7 @@ impl PhysicsWorld2d {
         if !self.chain_ids.contains(id) {
             return false;
         }
+        self.flush_touched_bodies();
         let Some(chain) = self.chains[id.index() as usize].take() else {
             return false;
         };
@@ -1393,6 +1474,7 @@ impl PhysicsWorld2d {
         if self.collider_chains[id.index() as usize].is_some() {
             return false;
         }
+        self.flush_touched_bodies();
         self.destroy_collider_contacts(id);
         self.wake_body(body_slot);
         self.remove_collider(id);
@@ -1466,7 +1548,7 @@ impl PhysicsWorld2d {
     ///
     /// # Panics
     ///
-    /// Panics if either body handle is stale.
+    /// Panics if either body handle is stale or if `body_a == body_b`.
     pub fn create_joint(
         &mut self,
         body_a: BodyId2d,
@@ -1481,7 +1563,7 @@ impl PhysicsWorld2d {
     ///
     /// # Panics
     ///
-    /// Panics if either body handle is stale.
+    /// Panics if either body handle is stale or if `instance.body_a == instance.body_b`.
     pub fn add_joint(&mut self, instance: JointInstance2d) -> JointId2d {
         assert!(
             self.body_ids.contains(instance.body_a) && self.body_ids.contains(instance.body_b),
@@ -1489,6 +1571,12 @@ impl PhysicsWorld2d {
             instance.body_a,
             instance.body_b
         );
+        assert_ne!(
+            instance.body_a, instance.body_b,
+            "cannot create a joint between a body and itself: {:?}",
+            instance.body_a
+        );
+        self.flush_touched_bodies();
         let mut instance = instance;
         instance.joint = instance.joint.sanitized(
             self.config.linear_slop(),
@@ -1555,6 +1643,7 @@ impl PhysicsWorld2d {
     /// Destroys a joint and wakes its bodies (Box2D `b2DestroyJoint`), returning it. Other
     /// joints keep their handles. Returns `None` if `id` is stale.
     pub fn destroy_joint(&mut self, id: JointId2d) -> Option<JointInstance2d> {
+        self.flush_touched_bodies();
         if !self.joint_ids.free(id) {
             return None;
         }
@@ -1690,6 +1779,207 @@ impl PhysicsWorld2d {
         &self.contact_manager
     }
 
+    /// Queries all broadphase trees for collider slots whose fat box overlaps `aabb`, evaluating
+    /// un-flushed [`Self::touched_bodies`] at their current pose rather than their stale tree
+    /// leaf.
+    fn query_trees<F>(&self, aabb: &Aabb2d, mut callback: F)
+    where
+        F: FnMut(u32) -> bool,
+    {
+        let has_touched = !self.touched_bodies.is_empty();
+        for (tree_idx, tree) in self.trees.iter().enumerate() {
+            let mut go_on = true;
+            tree.query(aabb, |_, slot| {
+                if has_touched {
+                    let body_slot = self.collider_bodies[slot as usize];
+                    if self.body_links[body_slot as usize].touched {
+                        return true;
+                    }
+                }
+                go_on = callback(slot);
+                go_on
+            });
+            if !go_on {
+                return;
+            }
+            if has_touched {
+                for &body_slot in &self.touched_bodies {
+                    if self.body_ids.handle_at(body_slot).is_none() {
+                        continue;
+                    }
+                    let body = &self.bodies[body_slot as usize];
+                    if !body.enabled || tree_of(body.body_type) != tree_idx {
+                        continue;
+                    }
+                    let xf = body.transform();
+                    for c in
+                        collider_slots(&self.body_first_collider, &self.collider_next, body_slot)
+                    {
+                        let Some(collider) = self.colliders[c as usize].as_ref() else {
+                            continue;
+                        };
+                        let fat = collider.shape.compute_aabb(&xf).fatten(
+                            self.config.speculative_distance()
+                                + self.proxy_margin(collider, body.body_type),
+                        );
+                        if fat.intersects(aabb) && !callback(c) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ray-casts all broadphase trees, evaluating un-flushed [`Self::touched_bodies`] at their
+    /// current pose rather than their stale tree leaf.
+    fn ray_cast_trees<F>(&self, ray: &Ray2d, mut callback: F)
+    where
+        F: FnMut(u32, f32) -> f32,
+    {
+        let has_touched = !self.touched_bodies.is_empty();
+        let mut fraction = 1.0f32;
+        let p1 = ray.origin;
+        let d = ray.direction;
+        let r = d.normalize_or_zero();
+        let v = Vec2::new(-r.y, r.x);
+        let abs_v = v.abs();
+        for (tree_idx, tree) in self.trees.iter().enumerate() {
+            tree.ray_cast(ray, fraction, |_, slot, max_fraction| {
+                if has_touched {
+                    let body_slot = self.collider_bodies[slot as usize];
+                    if self.body_links[body_slot as usize].touched {
+                        return max_fraction;
+                    }
+                }
+                let value = callback(slot, max_fraction);
+                if (0.0..=1.0).contains(&value) {
+                    fraction = value;
+                }
+                value
+            });
+            if fraction == 0.0 {
+                break;
+            }
+            if has_touched {
+                for &body_slot in &self.touched_bodies {
+                    if self.body_ids.handle_at(body_slot).is_none() {
+                        continue;
+                    }
+                    let body = &self.bodies[body_slot as usize];
+                    if !body.enabled || tree_of(body.body_type) != tree_idx {
+                        continue;
+                    }
+                    let xf = body.transform();
+                    for c in
+                        collider_slots(&self.body_first_collider, &self.collider_next, body_slot)
+                    {
+                        let Some(collider) = self.colliders[c as usize].as_ref() else {
+                            continue;
+                        };
+                        let fat = collider.shape.compute_aabb(&xf).fatten(
+                            self.config.speculative_distance()
+                                + self.proxy_margin(collider, body.body_type),
+                        );
+                        let p2 = p1 + d * fraction;
+                        let segment = Aabb2d::new(p1.min(p2), p1.max(p2));
+                        if !segment.intersects(&fat) {
+                            continue;
+                        }
+                        let center = fat.center();
+                        let half = fat.half_extents();
+                        if abs_v.dot(half) < v.dot(p1 - center).abs() {
+                            continue;
+                        }
+                        let value = callback(c, fraction);
+                        if value == 0.0 {
+                            return;
+                        }
+                        if (0.0..=1.0).contains(&value) && value <= fraction {
+                            fraction = value;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Box-casts all broadphase trees, evaluating un-flushed [`Self::touched_bodies`] at their
+    /// current pose rather than their stale tree leaf.
+    fn box_cast_trees<F>(&self, bounds: &Aabb2d, translation: Vec2, mut callback: F) -> f32
+    where
+        F: FnMut(u32, f32) -> f32,
+    {
+        let has_touched = !self.touched_bodies.is_empty();
+        let mut fraction = 1.0f32;
+        let p1 = bounds.center();
+        let extension = bounds.half_extents();
+        let v = Vec2::new(-translation.y, translation.x);
+        let abs_v = v.abs();
+        for (tree_idx, tree) in self.trees.iter().enumerate() {
+            tree.box_cast(bounds, translation, fraction, |_, slot, max_fraction| {
+                if has_touched {
+                    let body_slot = self.collider_bodies[slot as usize];
+                    if self.body_links[body_slot as usize].touched {
+                        return max_fraction;
+                    }
+                }
+                let value = callback(slot, max_fraction);
+                if (0.0..=1.0).contains(&value) {
+                    fraction = value;
+                }
+                value
+            });
+            if fraction == 0.0 {
+                break;
+            }
+            if has_touched {
+                for &body_slot in &self.touched_bodies {
+                    if self.body_ids.handle_at(body_slot).is_none() {
+                        continue;
+                    }
+                    let body = &self.bodies[body_slot as usize];
+                    if !body.enabled || tree_of(body.body_type) != tree_idx {
+                        continue;
+                    }
+                    let xf = body.transform();
+                    for c in
+                        collider_slots(&self.body_first_collider, &self.collider_next, body_slot)
+                    {
+                        let Some(collider) = self.colliders[c as usize].as_ref() else {
+                            continue;
+                        };
+                        let fat = collider.shape.compute_aabb(&xf).fatten(
+                            self.config.speculative_distance()
+                                + self.proxy_margin(collider, body.body_type),
+                        );
+                        let t = translation * fraction;
+                        let swept = Aabb2d::new(
+                            bounds.min.min(bounds.min + t),
+                            bounds.max.max(bounds.max + t),
+                        );
+                        if !swept.intersects(&fat) {
+                            continue;
+                        }
+                        let center = fat.center();
+                        let half = fat.half_extents() + extension;
+                        if abs_v.dot(half) < v.dot(p1 - center).abs() {
+                            continue;
+                        }
+                        let value = callback(c, fraction);
+                        if value == 0.0 {
+                            return 0.0;
+                        }
+                        if (0.0..=1.0).contains(&value) && value < fraction {
+                            fraction = value;
+                        }
+                    }
+                }
+            }
+        }
+        fraction
+    }
+
     /// Casts a ray from `origin` along `translation` against every collider that `filter`
     /// accepts (Box2D `b2World_CastRay`), static colliders first, then kinematic and dynamic.
     /// `callback` receives each hit and returns -1 to skip it, 0 to stop, the hit's fraction
@@ -1708,32 +1998,22 @@ impl PhysicsWorld2d {
             origin,
             direction: translation,
         };
-        let mut fraction = 1.0f32;
-        for tree in &self.trees {
-            tree.ray_cast(&ray, fraction, |_, slot, max_fraction| {
-                let Some((collider_id, collider, body)) = self.query_collider(slot, filter) else {
-                    return max_fraction;
-                };
-                let xf = body.transform();
-                let output = collider.shape.ray_cast(&RayCastInput2d {
-                    origin: xf.inv_transform_point(origin),
-                    translation: xf.rotation.inv_rotate(translation),
-                    max_fraction,
-                });
-                if !output.hit {
-                    return max_fraction;
-                }
-                let hit = self.world_hit(collider_id, slot, &xf, &output);
-                let value = callback(&hit);
-                if (0.0..=1.0).contains(&value) {
-                    fraction = value;
-                }
-                value
+        self.ray_cast_trees(&ray, |slot, max_fraction| {
+            let Some((collider_id, collider, body)) = self.query_collider(slot, filter) else {
+                return max_fraction;
+            };
+            let xf = body.transform();
+            let output = collider.shape.ray_cast(&RayCastInput2d {
+                origin: xf.inv_transform_point(origin),
+                translation: xf.rotation.inv_rotate(translation),
+                max_fraction,
             });
-            if fraction == 0.0 {
-                break;
+            if !output.hit {
+                return max_fraction;
             }
-        }
+            let hit = self.world_hit(collider_id, slot, &xf, &output);
+            callback(&hit)
+        });
     }
 
     /// The closest hit of a ray from `origin` along `translation`, ignoring shapes the ray
@@ -1774,31 +2054,21 @@ impl PhysicsWorld2d {
             max_fraction: 1.0,
             can_encroach: false,
         };
-        let mut fraction = 1.0f32;
         let bounds = proxy_bounds(proxy);
-        for tree in &self.trees {
-            tree.box_cast(&bounds, translation, fraction, |_, slot, max_fraction| {
-                let Some((collider_id, collider, body)) = self.query_collider(slot, filter) else {
-                    return max_fraction;
-                };
-                let xf = body.transform();
-                let output = collider
-                    .shape
-                    .shape_cast(&local_cast(&input, &xf, max_fraction));
-                if !output.hit {
-                    return max_fraction;
-                }
-                let hit = self.world_hit(collider_id, slot, &xf, &output);
-                let value = callback(&hit);
-                if (0.0..=1.0).contains(&value) {
-                    fraction = value;
-                }
-                value
-            });
-            if fraction == 0.0 {
-                break;
+        self.box_cast_trees(&bounds, translation, |slot, max_fraction| {
+            let Some((collider_id, collider, body)) = self.query_collider(slot, filter) else {
+                return max_fraction;
+            };
+            let xf = body.transform();
+            let output = collider
+                .shape
+                .shape_cast(&local_cast(&input, &xf, max_fraction));
+            if !output.hit {
+                return max_fraction;
             }
-        }
+            let hit = self.world_hit(collider_id, slot, &xf, &output);
+            callback(&hit)
+        });
     }
 
     /// Calls `callback` with every collider that `filter` accepts whose fat box overlaps `aabb`
@@ -1808,18 +2078,13 @@ impl PhysicsWorld2d {
     where
         F: FnMut(ColliderId2d) -> bool,
     {
-        for tree in &self.trees {
-            let mut go_on = true;
-            tree.query(aabb, |_, slot| {
-                if let Some((id, _, _)) = self.query_collider(slot, filter) {
-                    go_on = callback(id);
-                }
-                go_on
-            });
-            if !go_on {
-                return;
+        self.query_trees(aabb, |slot| {
+            if let Some((id, _, _)) = self.query_collider(slot, filter) {
+                callback(id)
+            } else {
+                true
             }
-        }
+        });
     }
 
     /// Calls `callback` with every collider that `filter` accepts whose shape overlaps the
@@ -1830,28 +2095,23 @@ impl PhysicsWorld2d {
     {
         let bounds = proxy_bounds(proxy);
         let tolerance = 0.1 * self.config.linear_slop();
-        for tree in &self.trees {
-            let mut go_on = true;
-            tree.query(&bounds, |_, slot| {
-                let Some((id, collider, body)) = self.query_collider(slot, filter) else {
-                    return true;
-                };
-                let output = shape_distance(
-                    proxy,
-                    &ShapeProxy2d::of_shape(&collider.shape),
-                    &body.transform(),
-                    &mut SimplexCache2d::default(),
-                    true,
-                );
-                if output.distance <= tolerance {
-                    go_on = callback(id);
-                }
-                go_on
-            });
-            if !go_on {
-                return;
+        self.query_trees(&bounds, |slot| {
+            let Some((id, collider, body)) = self.query_collider(slot, filter) else {
+                return true;
+            };
+            let output = shape_distance(
+                proxy,
+                &ShapeProxy2d::of_shape(&collider.shape),
+                &body.transform(),
+                &mut SimplexCache2d::default(),
+                true,
+            );
+            if output.distance <= tolerance {
+                callback(id)
+            } else {
+                true
             }
-        }
+        });
     }
 
     /// The fraction of `translation` a capsule `mover` (in world space) can move before it
@@ -1865,29 +2125,21 @@ impl PhysicsWorld2d {
             max_fraction: 1.0,
             can_encroach: true,
         };
-        let mut fraction = 1.0f32;
         let bounds = proxy_bounds(&input.proxy);
-        for tree in &self.trees {
-            tree.box_cast(&bounds, translation, fraction, |_, slot, max_fraction| {
-                let Some((_, collider, body)) = self.query_collider(slot, filter) else {
-                    return fraction;
-                };
-                let output =
-                    collider
-                        .shape
-                        .shape_cast(&local_cast(&input, &body.transform(), max_fraction));
-                if output.fraction == 0.0 {
-                    // Missed, or already touching.
-                    return fraction;
-                }
-                fraction = output.fraction;
-                fraction
-            });
-            if fraction == 0.0 {
-                break;
+        self.box_cast_trees(&bounds, translation, |slot, max_fraction| {
+            let Some((_, collider, body)) = self.query_collider(slot, filter) else {
+                return max_fraction;
+            };
+            let output =
+                collider
+                    .shape
+                    .shape_cast(&local_cast(&input, &body.transform(), max_fraction));
+            if output.fraction == 0.0 {
+                // Missed, or already touching.
+                return max_fraction;
             }
-        }
-        fraction
+            output.fraction
+        })
     }
 
     /// Calls `callback` with the collision plane of every collider that `filter` accepts and
@@ -1902,32 +2154,26 @@ impl PhysicsWorld2d {
             mover.point1.min(mover.point2) - r,
             mover.point1.max(mover.point2) + r,
         );
-        for tree in &self.trees {
-            let mut go_on = true;
-            tree.query(&bounds, |_, slot| {
-                let Some((id, collider, body)) = self.query_collider(slot, filter) else {
-                    return true;
-                };
-                let xf = body.transform();
-                let local = Capsule2d::new(
-                    xf.inv_transform_point(mover.point1),
-                    xf.inv_transform_point(mover.point2),
-                    mover.radius,
-                );
-                if let Some(mut result) = collider.shape.collide_mover(&local) {
-                    result.plane.normal = xf.rotation.rotate(result.plane.normal);
-                    let n = result.plane.normal;
-                    // Deep overlaps give no plane.
-                    if (1.0 - n.dot(n)).abs() < 100.0 * f32::EPSILON {
-                        go_on = callback(id, &result);
-                    }
+        self.query_trees(&bounds, |slot| {
+            let Some((id, collider, body)) = self.query_collider(slot, filter) else {
+                return true;
+            };
+            let xf = body.transform();
+            let local = Capsule2d::new(
+                xf.inv_transform_point(mover.point1),
+                xf.inv_transform_point(mover.point2),
+                mover.radius,
+            );
+            if let Some(mut result) = collider.shape.collide_mover(&local) {
+                result.plane.normal = xf.rotation.rotate(result.plane.normal);
+                let n = result.plane.normal;
+                // Deep overlaps give no plane.
+                if (1.0 - n.dot(n)).abs() < 100.0 * f32::EPSILON {
+                    return callback(id, &result);
                 }
-                go_on
-            });
-            if !go_on {
-                return;
             }
-        }
+            true
+        });
     }
 
     /// Pushes the dynamic bodies around an explosion (Box2D `b2World_Explode`): each collider
@@ -1935,6 +2181,7 @@ impl PhysicsWorld2d {
     /// `impulse_per_length` times its perimeter facing the explosion, away from it at its
     /// closest point, fading over the falloff. Bodies it reaches wake.
     pub fn explode(&mut self, explosion: &ExplosionDef2d) {
+        self.flush_touched_bodies();
         let extent = explosion.radius + explosion.falloff;
         let bounds = Aabb2d::new(
             explosion.position - Vec2::splat(extent),
@@ -2012,6 +2259,7 @@ impl PhysicsWorld2d {
         lift: f32,
         wake: bool,
     ) -> bool {
+        self.flush_touched_bodies();
         let Some(body_slot) = self.collider_body_slot(id) else {
             return false;
         };
@@ -2140,27 +2388,25 @@ impl PhysicsWorld2d {
     #[must_use]
     pub fn query_aabb(&self, aabb: &Aabb2d, filter: QueryFilter2d) -> Vec<BodyId2d> {
         let mut hits = Vec::new();
-        for tree in &self.trees {
-            tree.query(aabb, |_node_id, collider_slot| {
-                let slot = self.collider_bodies[collider_slot as usize];
-                if let Some((_, collider)) = self
-                    .collider_at(collider_slot)
-                    .filter(|(_, col)| filter.accepts(&col.filter))
-                {
-                    let tight_aabb = collider
-                        .shape
-                        .compute_aabb(&self.bodies[slot as usize].transform());
-                    if tight_aabb.intersects(aabb) {
-                        if let Some(id) = self.body_ids.handle_at(slot) {
-                            if !hits.contains(&id) {
-                                hits.push(id);
-                            }
+        self.query_trees(aabb, |collider_slot| {
+            let slot = self.collider_bodies[collider_slot as usize];
+            if let Some((_, collider)) = self
+                .collider_at(collider_slot)
+                .filter(|(_, col)| filter.accepts(&col.filter))
+            {
+                let tight_aabb = collider
+                    .shape
+                    .compute_aabb(&self.bodies[slot as usize].transform());
+                if tight_aabb.intersects(aabb) {
+                    if let Some(id) = self.body_ids.handle_at(slot) {
+                        if !hits.contains(&id) {
+                            hits.push(id);
                         }
                     }
                 }
-                true
-            });
-        }
+            }
+            true
+        });
         hits
     }
 
@@ -2170,23 +2416,21 @@ impl PhysicsWorld2d {
         let point_aabb = Aabb2d::new(point - Vec2::splat(1e-4), point + Vec2::splat(1e-4));
         let mut hit_body = None;
 
-        for tree in &self.trees {
-            tree.query(&point_aabb, |_node_id, collider_slot| {
-                let slot = self.collider_bodies[collider_slot as usize];
-                let body = &self.bodies[slot as usize];
-                if let Some((_, collider)) = self
-                    .collider_at(collider_slot)
-                    .filter(|(_, col)| filter.accepts(&col.filter))
-                {
-                    let local_point = body.rotation.inverse().rotate(point - body.position);
-                    if collider.shape.test_point(local_point) {
-                        hit_body = self.body_ids.handle_at(slot);
-                        return false;
-                    }
+        self.query_trees(&point_aabb, |collider_slot| {
+            let slot = self.collider_bodies[collider_slot as usize];
+            let body = &self.bodies[slot as usize];
+            if let Some((_, collider)) = self
+                .collider_at(collider_slot)
+                .filter(|(_, col)| filter.accepts(&col.filter))
+            {
+                let local_point = body.rotation.inverse().rotate(point - body.position);
+                if collider.shape.test_point(local_point) {
+                    hit_body = self.body_ids.handle_at(slot);
+                    return false;
                 }
-                true
-            });
-        }
+            }
+            true
+        });
 
         hit_body
     }
@@ -2705,7 +2949,7 @@ impl PhysicsWorld2d {
             .start_step(&mut self.pending_sensor_end_events);
         self.body_events.clear();
         self.joint_events.clear();
-        if dt <= 0.0 {
+        if !(dt > 0.0 && dt.is_finite()) {
             return;
         }
         // Box2D's substep rate: the substep count over the step, not one over the substep.
@@ -2721,17 +2965,8 @@ impl PhysicsWorld2d {
         let mut profile = Profile2d::default();
         let mut mark = step_start;
 
-        // A body handed out by `body_mut` may have a new centre of mass.
-        for i in 0..self.touched_bodies.len() {
-            let slot = self.touched_bodies[i];
-            if self.body_ids.handle_at(slot).is_some() {
-                self.body_touched(slot);
-                if self.body_links[slot as usize].set != AWAKE_SET {
-                    self.bodies[slot as usize].clear_forces();
-                }
-            }
-        }
-        self.touched_bodies.clear();
+        // Reconcile any bodies handed out by `body_mut` or `collider_mut`.
+        self.flush_touched_bodies();
 
         // Body pairs whose joints disable their collision (Box2D `b2ShouldBodiesCollide`).
         self.joint_filter_pairs.clear();
@@ -3134,6 +3369,7 @@ impl PhysicsWorld2d {
             friction_mixer: Default::default(),
             restitution_mixer: Default::default(),
         };
+        cloned.flush_touched_bodies();
         cloned.rebuild_sensor_slots();
         cloned
     }

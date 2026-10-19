@@ -1,9 +1,10 @@
 //! 3D bounding sphere volume.
 
 use crate::{Aabb, Vec3};
+use serde::{Deserialize, Serialize};
 
 /// A 3D bounding sphere defined by a center position and radius.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Sphere {
     /// Center of the sphere.
     pub center: Vec3,
@@ -32,6 +33,9 @@ impl Sphere {
     /// Returns `true` if this sphere intersects an AABB.
     #[must_use]
     pub fn intersects_aabb(&self, aabb: &Aabb) -> bool {
+        if aabb.is_empty() {
+            return false;
+        }
         let closest_point = self.center.clamp(aabb.min, aabb.max);
         let distance_squared = (self.center - closest_point).length_squared();
         distance_squared <= self.radius * self.radius

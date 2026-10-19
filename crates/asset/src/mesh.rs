@@ -104,14 +104,38 @@ impl MeshLoader {
                     let mut face_indices = Vec::new();
                     for token in face_tokens {
                         let parts: Vec<&str> = token.split('/').collect();
-                        let p_idx: i32 = parts[0].parse().unwrap_or(0);
+                        let p_idx: i32 = parts[0].parse().map_err(|_| {
+                            AssetError::Decode(format!("Invalid OBJ position index '{}'", parts[0]))
+                        })?;
+                        if p_idx == 0 {
+                            return Err(AssetError::Decode(
+                                "OBJ position index cannot be 0".into(),
+                            ));
+                        }
                         let t_idx: i32 = if parts.len() > 1 && !parts[1].is_empty() {
-                            parts[1].parse().unwrap_or(0)
+                            let val: i32 = parts[1].parse().map_err(|_| {
+                                AssetError::Decode(format!("Invalid OBJ UV index '{}'", parts[1]))
+                            })?;
+                            if val == 0 {
+                                return Err(AssetError::Decode("OBJ UV index cannot be 0".into()));
+                            }
+                            val
                         } else {
                             0
                         };
                         let n_idx: i32 = if parts.len() > 2 && !parts[2].is_empty() {
-                            parts[2].parse().unwrap_or(0)
+                            let val: i32 = parts[2].parse().map_err(|_| {
+                                AssetError::Decode(format!(
+                                    "Invalid OBJ normal index '{}'",
+                                    parts[2]
+                                ))
+                            })?;
+                            if val == 0 {
+                                return Err(AssetError::Decode(
+                                    "OBJ normal index cannot be 0".into(),
+                                ));
+                            }
+                            val
                         } else {
                             0
                         };
@@ -122,43 +146,20 @@ impl MeshLoader {
                         } else {
                             let idx = positions.len() as u32;
 
-                            // Resolve position (1-based, supports negative)
-                            let p = if p_idx > 0 {
-                                raw_positions.get((p_idx - 1) as usize).copied()
-                            } else if p_idx < 0 {
-                                raw_positions
-                                    .get((raw_positions.len() as i32 + p_idx) as usize)
-                                    .copied()
+                            let p = resolve_obj_index(&raw_positions, p_idx)?;
+                            let uv = if t_idx != 0 {
+                                resolve_obj_index(&raw_uvs, t_idx)?
                             } else {
-                                None
-                            }
-                            .unwrap_or(Vec3::ZERO);
+                                Vec2::ZERO
+                            };
+                            let n = if n_idx != 0 {
+                                resolve_obj_index(&raw_normals, n_idx)?
+                            } else {
+                                Vec3::ZERO
+                            };
+
                             positions.push(p);
-
-                            // Resolve UV
-                            let uv = if t_idx > 0 {
-                                raw_uvs.get((t_idx - 1) as usize).copied()
-                            } else if t_idx < 0 {
-                                raw_uvs
-                                    .get((raw_uvs.len() as i32 + t_idx) as usize)
-                                    .copied()
-                            } else {
-                                None
-                            }
-                            .unwrap_or(Vec2::ZERO);
                             uvs.push(uv);
-
-                            // Resolve Normal
-                            let n = if n_idx > 0 {
-                                raw_normals.get((n_idx - 1) as usize).copied()
-                            } else if n_idx < 0 {
-                                raw_normals
-                                    .get((raw_normals.len() as i32 + n_idx) as usize)
-                                    .copied()
-                            } else {
-                                None
-                            }
-                            .unwrap_or(Vec3::ZERO);
                             normals.push(n);
 
                             vertex_lut.insert(key, idx);
@@ -236,7 +237,7 @@ impl MeshLoader {
             )));
         }
 
-        let mut cursor = 12;
+        let mut cursor: usize = 12;
         let mut json_chunk = None;
         let mut bin_chunk = None;
 
@@ -246,12 +247,15 @@ impl MeshLoader {
             let chunk_type = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap());
             cursor += 8;
 
-            if cursor + chunk_len > bytes.len() {
+            let end = cursor
+                .checked_add(chunk_len)
+                .ok_or_else(|| AssetError::Decode("GLB chunk length overflow".into()))?;
+            if end > bytes.len() {
                 return Err(AssetError::Decode("Truncated GLB chunk".into()));
             }
 
-            let chunk_data = &bytes[cursor..cursor + chunk_len];
-            cursor += chunk_len;
+            let chunk_data = &bytes[cursor..end];
+            cursor = end;
 
             if chunk_type == 0x4E4F534A {
                 // "JSON"
@@ -296,21 +300,45 @@ impl MeshLoader {
             as usize;
 
         let positions = self.read_vec3_accessor(json, bin_data, pos_acc_idx)?;
+        if positions.is_empty() {
+            return Err(AssetError::Decode(
+                "glTF primitive has 0 vertex positions".into(),
+            ));
+        }
 
         let normals = if let Some(n_acc_idx) = prim["attributes"]["NORMAL"].as_u64() {
-            self.read_vec3_accessor(json, bin_data, n_acc_idx as usize)?
+            let n = self.read_vec3_accessor(json, bin_data, n_acc_idx as usize)?;
+            if n.len() != positions.len() {
+                return Err(AssetError::Decode(
+                    "glTF NORMAL count does not match POSITION count".into(),
+                ));
+            }
+            n
         } else {
             vec![Vec3::Y; positions.len()]
         };
 
         let uvs = if let Some(uv_acc_idx) = prim["attributes"]["TEXCOORD_0"].as_u64() {
-            self.read_vec2_accessor(json, bin_data, uv_acc_idx as usize)?
+            let u = self.read_vec2_accessor(json, bin_data, uv_acc_idx as usize)?;
+            if u.len() != positions.len() {
+                return Err(AssetError::Decode(
+                    "glTF TEXCOORD_0 count does not match POSITION count".into(),
+                ));
+            }
+            u
         } else {
             vec![Vec2::ZERO; positions.len()]
         };
 
         let indices = if let Some(idx_acc_idx) = prim["indices"].as_u64() {
-            self.read_scalar_indices(json, bin_data, idx_acc_idx as usize)?
+            let indices = self.read_scalar_indices(json, bin_data, idx_acc_idx as usize)?;
+            let vertex_count = positions.len();
+            if let Some(&bad_idx) = indices.iter().find(|&&idx| (idx as usize) >= vertex_count) {
+                return Err(AssetError::Decode(format!(
+                    "glTF index {bad_idx} out of bounds for {vertex_count} vertices"
+                )));
+            }
+            indices
         } else {
             (0..positions.len() as u32).collect()
         };
@@ -334,28 +362,82 @@ impl MeshLoader {
         })
     }
 
+    fn validate_accessor_slice(
+        json: &Value,
+        bin_data: &[u8],
+        accessor_idx: usize,
+        elem_size: usize,
+    ) -> Result<(usize, usize, u32), AssetError> {
+        let accessors = json["accessors"]
+            .as_array()
+            .ok_or_else(|| AssetError::Decode("Missing accessors array in glTF".into()))?;
+        let accessor = accessors
+            .get(accessor_idx)
+            .ok_or_else(|| AssetError::Decode(format!("Accessor {accessor_idx} out of bounds")))?;
+
+        let count_u64 = accessor["count"].as_u64().unwrap_or(0);
+        let count = usize::try_from(count_u64)
+            .map_err(|_| AssetError::Decode("Accessor count overflows usize".into()))?;
+        let comp_type = accessor["componentType"].as_u64().unwrap_or(5123) as u32;
+        let buffer_view_idx = accessor["bufferView"]
+            .as_u64()
+            .ok_or_else(|| AssetError::Decode("Accessor missing bufferView".into()))?
+            as usize;
+        let acc_offset = usize::try_from(accessor["byteOffset"].as_u64().unwrap_or(0))
+            .map_err(|_| AssetError::Decode("Accessor byteOffset overflow".into()))?;
+
+        let buffer_views = json["bufferViews"]
+            .as_array()
+            .ok_or_else(|| AssetError::Decode("Missing bufferViews array in glTF".into()))?;
+        let buffer_view = buffer_views.get(buffer_view_idx).ok_or_else(|| {
+            AssetError::Decode(format!("bufferView {buffer_view_idx} out of bounds"))
+        })?;
+        let view_offset = usize::try_from(buffer_view["byteOffset"].as_u64().unwrap_or(0))
+            .map_err(|_| AssetError::Decode("bufferView byteOffset overflow".into()))?;
+
+        let start = view_offset
+            .checked_add(acc_offset)
+            .ok_or_else(|| AssetError::Decode("glTF accessor start offset overflow".into()))?;
+        let byte_len = count
+            .checked_mul(elem_size)
+            .ok_or_else(|| AssetError::Decode("glTF accessor byte length overflow".into()))?;
+        let end = start
+            .checked_add(byte_len)
+            .ok_or_else(|| AssetError::Decode("glTF accessor end offset overflow".into()))?;
+
+        if end > bin_data.len() {
+            return Err(AssetError::Decode(
+                "glTF accessor range extends past binary buffer".into(),
+            ));
+        }
+
+        if let Some(view_len_u64) = buffer_view["byteLength"].as_u64() {
+            let view_len = usize::try_from(view_len_u64)
+                .map_err(|_| AssetError::Decode("bufferView byteLength overflow".into()))?;
+            let view_end = view_offset
+                .checked_add(view_len)
+                .ok_or_else(|| AssetError::Decode("bufferView end offset overflow".into()))?;
+            if end > view_end {
+                return Err(AssetError::Decode(
+                    "glTF accessor extends past bufferView byteLength".into(),
+                ));
+            }
+        }
+
+        Ok((start, count, comp_type))
+    }
+
     fn read_vec3_accessor(
         &self,
         json: &Value,
         bin_data: &[u8],
         accessor_idx: usize,
     ) -> Result<Vec<Vec3>, AssetError> {
-        let accessor = &json["accessors"][accessor_idx];
-        let count = accessor["count"].as_u64().unwrap_or(0) as usize;
-        let buffer_view_idx = accessor["bufferView"].as_u64().unwrap_or(0) as usize;
-        let acc_offset = accessor["byteOffset"].as_u64().unwrap_or(0) as usize;
-
-        let buffer_view = &json["bufferViews"][buffer_view_idx];
-        let view_offset = buffer_view["byteOffset"].as_u64().unwrap_or(0) as usize;
-
-        let start = view_offset + acc_offset;
+        let (start, count, _) = Self::validate_accessor_slice(json, bin_data, accessor_idx, 12)?;
         let mut results = Vec::with_capacity(count);
 
         for i in 0..count {
             let offset = start + i * 12;
-            if offset + 12 > bin_data.len() {
-                break;
-            }
             let x = f32::from_le_bytes(bin_data[offset..offset + 4].try_into().unwrap());
             let y = f32::from_le_bytes(bin_data[offset + 4..offset + 8].try_into().unwrap());
             let z = f32::from_le_bytes(bin_data[offset + 8..offset + 12].try_into().unwrap());
@@ -371,22 +453,11 @@ impl MeshLoader {
         bin_data: &[u8],
         accessor_idx: usize,
     ) -> Result<Vec<Vec2>, AssetError> {
-        let accessor = &json["accessors"][accessor_idx];
-        let count = accessor["count"].as_u64().unwrap_or(0) as usize;
-        let buffer_view_idx = accessor["bufferView"].as_u64().unwrap_or(0) as usize;
-        let acc_offset = accessor["byteOffset"].as_u64().unwrap_or(0) as usize;
-
-        let buffer_view = &json["bufferViews"][buffer_view_idx];
-        let view_offset = buffer_view["byteOffset"].as_u64().unwrap_or(0) as usize;
-
-        let start = view_offset + acc_offset;
+        let (start, count, _) = Self::validate_accessor_slice(json, bin_data, accessor_idx, 8)?;
         let mut results = Vec::with_capacity(count);
 
         for i in 0..count {
             let offset = start + i * 8;
-            if offset + 8 > bin_data.len() {
-                break;
-            }
             let u = f32::from_le_bytes(bin_data[offset..offset + 4].try_into().unwrap());
             let v = f32::from_le_bytes(bin_data[offset + 4..offset + 8].try_into().unwrap());
             results.push(Vec2::new(u, v));
@@ -401,58 +472,69 @@ impl MeshLoader {
         bin_data: &[u8],
         accessor_idx: usize,
     ) -> Result<Vec<u32>, AssetError> {
-        let accessor = &json["accessors"][accessor_idx];
-        let count = accessor["count"].as_u64().unwrap_or(0) as usize;
-        let comp_type = accessor["componentType"].as_u64().unwrap_or(5123) as u32;
-        let buffer_view_idx = accessor["bufferView"].as_u64().unwrap_or(0) as usize;
-        let acc_offset = accessor["byteOffset"].as_u64().unwrap_or(0) as usize;
-
-        let buffer_view = &json["bufferViews"][buffer_view_idx];
-        let view_offset = buffer_view["byteOffset"].as_u64().unwrap_or(0) as usize;
-
-        let start = view_offset + acc_offset;
-        let mut indices = Vec::with_capacity(count);
-
-        match comp_type {
-            5121 => {
-                // UNSIGNED_BYTE
-                for i in 0..count {
-                    if start + i < bin_data.len() {
-                        indices.push(bin_data[start + i] as u32);
-                    }
-                }
-            }
-            5123 => {
-                // UNSIGNED_SHORT
-                for i in 0..count {
-                    let offset = start + i * 2;
-                    if offset + 2 <= bin_data.len() {
-                        let val =
-                            u16::from_le_bytes(bin_data[offset..offset + 2].try_into().unwrap());
-                        indices.push(val as u32);
-                    }
-                }
-            }
-            5125 => {
-                // UNSIGNED_INT
-                for i in 0..count {
-                    let offset = start + i * 4;
-                    if offset + 4 <= bin_data.len() {
-                        let val =
-                            u32::from_le_bytes(bin_data[offset..offset + 4].try_into().unwrap());
-                        indices.push(val);
-                    }
-                }
-            }
+        let comp_type = json["accessors"][accessor_idx]["componentType"]
+            .as_u64()
+            .unwrap_or(5123) as u32;
+        let elem_size = match comp_type {
+            5121 => 1,
+            5123 => 2,
+            5125 => 4,
             _ => {
                 return Err(AssetError::Decode(format!(
                     "Unsupported index component type {comp_type}"
                 )))
             }
+        };
+
+        let (start, count, _) =
+            Self::validate_accessor_slice(json, bin_data, accessor_idx, elem_size)?;
+        let mut indices = Vec::with_capacity(count);
+
+        match comp_type {
+            5121 => {
+                for i in 0..count {
+                    indices.push(bin_data[start + i] as u32);
+                }
+            }
+            5123 => {
+                for i in 0..count {
+                    let offset = start + i * 2;
+                    let val = u16::from_le_bytes(bin_data[offset..offset + 2].try_into().unwrap());
+                    indices.push(val as u32);
+                }
+            }
+            5125 => {
+                for i in 0..count {
+                    let offset = start + i * 4;
+                    let val = u32::from_le_bytes(bin_data[offset..offset + 4].try_into().unwrap());
+                    indices.push(val);
+                }
+            }
+            _ => unreachable!(),
         }
 
         Ok(indices)
     }
+}
+
+fn resolve_obj_index<T: Copy>(slice: &[T], idx: i32) -> Result<T, AssetError> {
+    let resolved = if idx > 0 {
+        usize::try_from(idx - 1).ok()
+    } else if idx < 0 {
+        isize::try_from(slice.len())
+            .ok()
+            .and_then(|len| len.checked_add(idx as isize))
+            .and_then(|pos| usize::try_from(pos).ok())
+    } else {
+        None
+    };
+
+    resolved.and_then(|i| slice.get(i).copied()).ok_or_else(|| {
+        AssetError::Decode(format!(
+            "OBJ index {idx} out of bounds for attribute list of length {}",
+            slice.len()
+        ))
+    })
 }
 
 fn calculate_bounds(positions: &[Vec3]) -> Aabb {
@@ -476,18 +558,24 @@ impl AssetLoader for MeshLoader {
     }
 
     fn load(&self, bytes: &[u8], path: &str) -> Result<Self::Asset, AssetError> {
-        let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
+        let ext = path
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
 
-        if ext == "glb" {
-            self.load_glb(bytes)
-        } else if ext == "gltf" {
-            let json: Value = serde_json::from_slice(bytes)
-                .map_err(|e| AssetError::Decode(format!("glTF JSON parse error: {e}")))?;
-            self.parse_gltf_json(&json, &[])
-        } else {
-            let text = std::str::from_utf8(bytes)
-                .map_err(|e| AssetError::Decode(format!("Invalid UTF-8 in OBJ: {e}")))?;
-            self.load_obj(text)
+        match ext.as_str() {
+            "glb" => self.load_glb(bytes),
+            "gltf" => {
+                let json: Value = serde_json::from_slice(bytes)
+                    .map_err(|e| AssetError::Decode(format!("glTF JSON parse error: {e}")))?;
+                self.parse_gltf_json(&json, &[])
+            }
+            "obj" => {
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|e| AssetError::Decode(format!("Invalid UTF-8 in OBJ: {e}")))?;
+                self.load_obj(text)
+            }
+            _ => Err(AssetError::UnsupportedFormat(ext)),
         }
     }
 }

@@ -279,12 +279,22 @@ impl WavFormat {
                     (f64::from(value) / 2_147_483_648.0) as f32
                 }
                 Encoding::Float32 => {
-                    f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]])
+                    let s = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+                    if s.is_finite() {
+                        s
+                    } else {
+                        0.0
+                    }
                 }
                 Encoding::Float64 => {
                     let mut bytes = [0; 8];
                     bytes.copy_from_slice(sample);
-                    f64::from_le_bytes(bytes) as f32
+                    let s = f64::from_le_bytes(bytes) as f32;
+                    if s.is_finite() {
+                        s
+                    } else {
+                        0.0
+                    }
                 }
             })
             .collect();

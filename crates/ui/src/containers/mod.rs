@@ -16,6 +16,7 @@ pub use box_container::{BoxAlignment, BoxContainer, HBoxContainer, Orientation, 
 pub use center_container::CenterContainer;
 pub use fitting::fit_child_in_rect;
 pub use grid_container::GridContainer;
+pub(crate) use layout::panel_effective_padding;
 pub use layout::resolve_container_layout;
 pub use margin_container::MarginContainer;
 pub use panel_container::PanelContainer;

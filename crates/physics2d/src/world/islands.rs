@@ -57,6 +57,10 @@ impl SolverSet2d {
     }
 }
 
+const fn default_body_type() -> BodyType {
+    BodyType::Static
+}
+
 /// Where a body is: its solver set and island, with its sleep threshold.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub(super) struct BodyLinks2d {
@@ -64,6 +68,9 @@ pub(super) struct BodyLinks2d {
     pub(super) local: u32,
     pub(super) island: u32,
     pub(super) island_index: u32,
+    /// Authoritative body type matching the solver set and broadphase tree.
+    #[serde(default = "default_body_type")]
+    pub(super) body_type: BodyType,
     /// Speed of the body's fastest point under which it counts as resting, in length units per
     /// second (Box2D `sleepThreshold`).
     pub(super) sleep_threshold: f32,
@@ -90,12 +97,13 @@ pub(super) struct BodyLinks2d {
 }
 
 impl BodyLinks2d {
-    pub(super) const fn new(sleep_threshold: f32) -> Self {
+    pub(super) const fn new(sleep_threshold: f32, body_type: BodyType) -> Self {
         Self {
             set: NULL,
             local: NULL,
             island: NULL,
             island_index: NULL,
+            body_type,
             sleep_threshold,
             move_event: NULL,
             is_fast: false,

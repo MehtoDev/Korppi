@@ -174,19 +174,19 @@ pub struct GpuLightCuller {
     decals_buf: [Option<BufferHandle>; FRAMES_IN_FLIGHT],
     probes_buf: [Option<BufferHandle>; FRAMES_IN_FLIGHT],
     counter_buf: [Option<BufferHandle>; FRAMES_IN_FLIGHT],
-    records_buf: Option<BufferHandle>,
-    indices_buf: Option<BufferHandle>,
-    decal_indices_buf: Option<BufferHandle>,
-    probe_indices_buf: Option<BufferHandle>,
+    records_buf: [Option<BufferHandle>; FRAMES_IN_FLIGHT],
+    indices_buf: [Option<BufferHandle>; FRAMES_IN_FLIGHT],
+    decal_indices_buf: [Option<BufferHandle>; FRAMES_IN_FLIGHT],
+    probe_indices_buf: [Option<BufferHandle>; FRAMES_IN_FLIGHT],
     allocated_froxels: [u32; FRAMES_IN_FLIGHT],
     allocated_points: [usize; FRAMES_IN_FLIGHT],
     allocated_spots: [usize; FRAMES_IN_FLIGHT],
     allocated_decals: [usize; FRAMES_IN_FLIGHT],
     allocated_probes: [usize; FRAMES_IN_FLIGHT],
-    allocated_clusters: u32,
-    max_light_indices: u32,
-    max_decal_indices: u32,
-    max_probe_indices: u32,
+    allocated_clusters: [u32; FRAMES_IN_FLIGHT],
+    max_light_indices: [u32; FRAMES_IN_FLIGHT],
+    max_decal_indices: [u32; FRAMES_IN_FLIGHT],
+    max_probe_indices: [u32; FRAMES_IN_FLIGHT],
     scratch_froxels: Vec<FroxelAabbGpu>,
     scratch_points: Vec<PointLightGpu>,
     scratch_spots: Vec<SpotLightGpu>,
@@ -216,19 +216,19 @@ impl GpuLightCuller {
             decals_buf: [None; FRAMES_IN_FLIGHT],
             probes_buf: [None; FRAMES_IN_FLIGHT],
             counter_buf: [None; FRAMES_IN_FLIGHT],
-            records_buf: None,
-            indices_buf: None,
-            decal_indices_buf: None,
-            probe_indices_buf: None,
+            records_buf: [None; FRAMES_IN_FLIGHT],
+            indices_buf: [None; FRAMES_IN_FLIGHT],
+            decal_indices_buf: [None; FRAMES_IN_FLIGHT],
+            probe_indices_buf: [None; FRAMES_IN_FLIGHT],
             allocated_froxels: [0; FRAMES_IN_FLIGHT],
             allocated_points: [0; FRAMES_IN_FLIGHT],
             allocated_spots: [0; FRAMES_IN_FLIGHT],
             allocated_decals: [0; FRAMES_IN_FLIGHT],
             allocated_probes: [0; FRAMES_IN_FLIGHT],
-            allocated_clusters: 0,
-            max_light_indices: 0,
-            max_decal_indices: 0,
-            max_probe_indices: 0,
+            allocated_clusters: [0; FRAMES_IN_FLIGHT],
+            max_light_indices: [0; FRAMES_IN_FLIGHT],
+            max_decal_indices: [0; FRAMES_IN_FLIGHT],
+            max_probe_indices: [0; FRAMES_IN_FLIGHT],
             scratch_froxels: Vec::new(),
             scratch_points: Vec::new(),
             scratch_spots: Vec::new(),
@@ -286,31 +286,31 @@ impl GpuLightCuller {
         Ok(())
     }
 
-    /// Returns the persistent GPU buffer handle holding cluster records.
+    /// Returns the persistent GPU buffer handle holding cluster records (slot 0).
     #[inline]
     pub fn records_buffer(&self) -> Option<BufferHandle> {
-        self.records_buf
+        self.records_buf[0]
     }
 
-    /// Returns the persistent GPU buffer handle holding flattened light indices.
+    /// Returns the persistent GPU buffer handle holding flattened light indices (slot 0).
     #[inline]
     pub fn light_indices_buffer(&self) -> Option<BufferHandle> {
-        self.indices_buf
+        self.indices_buf[0]
     }
 
-    /// Returns the persistent GPU buffer handle holding flattened decal indices.
+    /// Returns the persistent GPU buffer handle holding flattened decal indices (slot 0).
     #[inline]
     pub fn decal_indices_buffer(&self) -> Option<BufferHandle> {
-        self.decal_indices_buf
+        self.decal_indices_buf[0]
     }
 
-    /// Returns the persistent GPU buffer handle holding flattened probe indices.
+    /// Returns the persistent GPU buffer handle holding flattened probe indices (slot 0).
     #[inline]
     pub fn probe_indices_buffer(&self) -> Option<BufferHandle> {
-        self.probe_indices_buf
+        self.probe_indices_buf[0]
     }
 
-    /// Ensures all persistent GPU buffers for `slot` are created with sufficient capacity without per-frame churn.
+    /// Ensures all persistent GPU buffers for `slot` are created with sufficient capacity without per-frame churn (`RND-23`).
     #[allow(clippy::too_many_arguments)]
     fn ensure_buffers(
         &mut self,
@@ -322,9 +322,12 @@ impl GpuLightCuller {
         decal_count: usize,
         probe_count: usize,
     ) -> Result<(), RhiError> {
-        let max_light_indices = (total_clusters * (MAX_FEATURES_PER_FROXEL as u32)).max(1024);
-        let max_decal_indices = (total_clusters * 32).max(512);
-        let max_probe_indices = (total_clusters * 16).max(256);
+        let max_light_indices =
+            (total_clusters.saturating_mul((MAX_FEATURES_PER_FROXEL as u32) * 2)).max(1024);
+        let max_decal_indices =
+            (total_clusters.saturating_mul(MAX_FEATURES_PER_FROXEL as u32)).max(512);
+        let max_probe_indices =
+            (total_clusters.saturating_mul(MAX_FEATURES_PER_FROXEL as u32)).max(256);
 
         if self.ubo[slot].is_none() {
             let ubo = device.create_buffer(
@@ -358,7 +361,7 @@ impl GpuLightCuller {
             if let Some(old) = self.froxels_buf[slot].take() {
                 device.destroy_buffer(old)?;
             }
-            let size = total_clusters as usize * std::mem::size_of::<FroxelAabbGpu>();
+            let size = (total_clusters.max(1) as usize) * std::mem::size_of::<FroxelAabbGpu>();
             self.froxels_buf[slot] = Some(device.create_buffer(
                 &BufferDescriptor {
                     size: size as u64,
@@ -368,7 +371,7 @@ impl GpuLightCuller {
                 },
                 None,
             )?);
-            self.allocated_froxels[slot] = total_clusters;
+            self.allocated_froxels[slot] = total_clusters.max(1);
         }
 
         let pt_cap = point_count.max(16);
@@ -443,12 +446,13 @@ impl GpuLightCuller {
             self.allocated_probes[slot] = prb_cap;
         }
 
-        if self.records_buf.is_none() || self.allocated_clusters < total_clusters {
-            if let Some(old) = self.records_buf.take() {
+        let rec_clusters = total_clusters.max(1);
+        if self.records_buf[slot].is_none() || self.allocated_clusters[slot] < rec_clusters {
+            if let Some(old) = self.records_buf[slot].take() {
                 device.destroy_buffer(old)?;
             }
-            let size = total_clusters as usize * std::mem::size_of::<ClusterRecord>();
-            self.records_buf = Some(device.create_buffer(
+            let size = rec_clusters as usize * std::mem::size_of::<ClusterRecord>();
+            self.records_buf[slot] = Some(device.create_buffer(
                 &BufferDescriptor {
                     size: size as u64,
                     usage: BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST,
@@ -457,15 +461,15 @@ impl GpuLightCuller {
                 },
                 None,
             )?);
-            self.allocated_clusters = total_clusters;
+            self.allocated_clusters[slot] = rec_clusters;
         }
 
-        if self.indices_buf.is_none() || self.max_light_indices < max_light_indices {
-            if let Some(old) = self.indices_buf.take() {
+        if self.indices_buf[slot].is_none() || self.max_light_indices[slot] < max_light_indices {
+            if let Some(old) = self.indices_buf[slot].take() {
                 device.destroy_buffer(old)?;
             }
             let size = max_light_indices as usize * std::mem::size_of::<u32>();
-            self.indices_buf = Some(device.create_buffer(
+            self.indices_buf[slot] = Some(device.create_buffer(
                 &BufferDescriptor {
                     size: size as u64,
                     usage: BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST,
@@ -474,15 +478,17 @@ impl GpuLightCuller {
                 },
                 None,
             )?);
-            self.max_light_indices = max_light_indices;
+            self.max_light_indices[slot] = max_light_indices;
         }
 
-        if self.decal_indices_buf.is_none() || self.max_decal_indices < max_decal_indices {
-            if let Some(old) = self.decal_indices_buf.take() {
+        if self.decal_indices_buf[slot].is_none()
+            || self.max_decal_indices[slot] < max_decal_indices
+        {
+            if let Some(old) = self.decal_indices_buf[slot].take() {
                 device.destroy_buffer(old)?;
             }
             let size = max_decal_indices as usize * std::mem::size_of::<u32>();
-            self.decal_indices_buf = Some(device.create_buffer(
+            self.decal_indices_buf[slot] = Some(device.create_buffer(
                 &BufferDescriptor {
                     size: size as u64,
                     usage: BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST,
@@ -491,15 +497,17 @@ impl GpuLightCuller {
                 },
                 None,
             )?);
-            self.max_decal_indices = max_decal_indices;
+            self.max_decal_indices[slot] = max_decal_indices;
         }
 
-        if self.probe_indices_buf.is_none() || self.max_probe_indices < max_probe_indices {
-            if let Some(old) = self.probe_indices_buf.take() {
+        if self.probe_indices_buf[slot].is_none()
+            || self.max_probe_indices[slot] < max_probe_indices
+        {
+            if let Some(old) = self.probe_indices_buf[slot].take() {
                 device.destroy_buffer(old)?;
             }
             let size = max_probe_indices as usize * std::mem::size_of::<u32>();
-            self.probe_indices_buf = Some(device.create_buffer(
+            self.probe_indices_buf[slot] = Some(device.create_buffer(
                 &BufferDescriptor {
                     size: size as u64,
                     usage: BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST,
@@ -508,7 +516,7 @@ impl GpuLightCuller {
                 },
                 None,
             )?);
-            self.max_probe_indices = max_probe_indices;
+            self.max_probe_indices[slot] = max_probe_indices;
         }
 
         if self.counter_buf[slot].is_none() {
@@ -560,9 +568,9 @@ impl GpuLightCuller {
             probe_count,
         )?;
 
-        let max_light_indices = self.max_light_indices;
-        let max_decal_indices = self.max_decal_indices;
-        let max_probe_indices = self.max_probe_indices;
+        let max_light_indices = self.max_light_indices[slot];
+        let max_decal_indices = self.max_decal_indices[slot];
+        let max_probe_indices = self.max_probe_indices[slot];
 
         // 1. Upload parameters UBO
         let params = CullingParamsGpu {
@@ -708,11 +716,12 @@ impl GpuLightCuller {
         device.write_buffer(self.counter_buf[slot].unwrap(), 0, counter_bytes)?;
 
         // Bind and dispatch without heap allocation in steady state
+        let bind_clusters = total_clusters.max(1) as usize;
         recorder.bind_pipeline(pipeline);
         let ranges: [(Option<BufferHandle>, usize); 10] = [
             (
                 self.froxels_buf[slot],
-                total_clusters as usize * size_of::<FroxelAabbGpu>(),
+                bind_clusters * size_of::<FroxelAabbGpu>(),
             ),
             (
                 self.points_buf[slot],
@@ -723,11 +732,11 @@ impl GpuLightCuller {
                 self.allocated_spots[slot] * size_of::<SpotLightGpu>(),
             ),
             (
-                self.records_buf,
-                total_clusters as usize * size_of::<ClusterRecord>(),
+                self.records_buf[slot],
+                bind_clusters * size_of::<ClusterRecord>(),
             ),
             (
-                self.indices_buf,
+                self.indices_buf[slot],
                 max_light_indices as usize * size_of::<u32>(),
             ),
             (self.counter_buf[slot], 16),
@@ -740,11 +749,11 @@ impl GpuLightCuller {
                 self.allocated_probes[slot] * size_of::<ProbeGpu>(),
             ),
             (
-                self.decal_indices_buf,
+                self.decal_indices_buf[slot],
                 max_decal_indices as usize * size_of::<u32>(),
             ),
             (
-                self.probe_indices_buf,
+                self.probe_indices_buf[slot],
                 max_probe_indices as usize * size_of::<u32>(),
             ),
         ];
@@ -770,12 +779,12 @@ impl GpuLightCuller {
         recorder.dispatch(group_count_x, 1, 1);
 
         Ok(GpuCullingBuffers {
-            records_buffer: self.records_buf.unwrap(),
-            records_size: (total_clusters as usize * size_of::<ClusterRecord>()) as u64,
-            light_indices_buffer: self.indices_buf.unwrap(),
+            records_buffer: self.records_buf[slot].unwrap(),
+            records_size: (bind_clusters * size_of::<ClusterRecord>()) as u64,
+            light_indices_buffer: self.indices_buf[slot].unwrap(),
             light_indices_size: (max_light_indices as usize * size_of::<u32>()) as u64,
-            decal_indices_buffer: self.decal_indices_buf.unwrap(),
-            probe_indices_buffer: self.probe_indices_buf.unwrap(),
+            decal_indices_buffer: self.decal_indices_buf[slot].unwrap(),
+            probe_indices_buffer: self.probe_indices_buf[slot].unwrap(),
             points_buffer: self.points_buf[slot].unwrap(),
             points_size: (self.allocated_points[slot] * size_of::<PointLightGpu>()) as u64,
             spots_buffer: self.spots_buf[slot].unwrap(),
@@ -840,21 +849,24 @@ impl GpuLightCuller {
 
         let total_clusters = buffers.total_clusters;
         let records_size = total_clusters as usize * std::mem::size_of::<ClusterRecord>();
-        let records_bytes =
-            device.read_buffer(self.records_buf.unwrap(), 0, records_size as u64)?;
+        let records_bytes = if records_size > 0 {
+            device.read_buffer(self.records_buf[0].unwrap(), 0, records_size as u64)?
+        } else {
+            Vec::new()
+        };
         let counter_bytes = device.read_buffer(self.counter_buf[0].unwrap(), 0, 16)?;
 
-        let total_lights =
-            u32::from_ne_bytes(counter_bytes[0..4].try_into().unwrap()).min(self.max_light_indices);
-        let total_decals =
-            u32::from_ne_bytes(counter_bytes[4..8].try_into().unwrap()).min(self.max_decal_indices);
+        let total_lights = u32::from_ne_bytes(counter_bytes[0..4].try_into().unwrap())
+            .min(self.max_light_indices[0]);
+        let total_decals = u32::from_ne_bytes(counter_bytes[4..8].try_into().unwrap())
+            .min(self.max_decal_indices[0]);
         let total_probes = u32::from_ne_bytes(counter_bytes[8..12].try_into().unwrap())
-            .min(self.max_probe_indices);
+            .min(self.max_probe_indices[0]);
 
         let mut global_light_indices = Vec::with_capacity(total_lights as usize);
         if total_lights > 0 {
             let indices_bytes =
-                device.read_buffer(self.indices_buf.unwrap(), 0, (total_lights * 4) as u64)?;
+                device.read_buffer(self.indices_buf[0].unwrap(), 0, (total_lights * 4) as u64)?;
             for chunk in indices_bytes.as_chunks::<4>().0 {
                 global_light_indices.push(u32::from_ne_bytes(*chunk));
             }
@@ -863,7 +875,7 @@ impl GpuLightCuller {
         let mut global_decal_indices = Vec::with_capacity(total_decals as usize);
         if total_decals > 0 {
             let indices_bytes = device.read_buffer(
-                self.decal_indices_buf.unwrap(),
+                self.decal_indices_buf[0].unwrap(),
                 0,
                 (total_decals * 4) as u64,
             )?;
@@ -875,7 +887,7 @@ impl GpuLightCuller {
         let mut global_probe_indices = Vec::with_capacity(total_probes as usize);
         if total_probes > 0 {
             let indices_bytes = device.read_buffer(
-                self.probe_indices_buf.unwrap(),
+                self.probe_indices_buf[0].unwrap(),
                 0,
                 (total_probes * 4) as u64,
             )?;
@@ -970,31 +982,31 @@ impl GpuLightCuller {
             if let Some(buf) = self.counter_buf[slot].take() {
                 device.destroy_buffer(buf)?;
             }
+            if let Some(buf) = self.records_buf[slot].take() {
+                device.destroy_buffer(buf)?;
+            }
+            if let Some(buf) = self.indices_buf[slot].take() {
+                device.destroy_buffer(buf)?;
+            }
+            if let Some(buf) = self.decal_indices_buf[slot].take() {
+                device.destroy_buffer(buf)?;
+            }
+            if let Some(buf) = self.probe_indices_buf[slot].take() {
+                device.destroy_buffer(buf)?;
+            }
             self.allocated_froxels[slot] = 0;
             self.allocated_points[slot] = 0;
             self.allocated_spots[slot] = 0;
             self.allocated_decals[slot] = 0;
             self.allocated_probes[slot] = 0;
+            self.allocated_clusters[slot] = 0;
+            self.max_light_indices[slot] = 0;
+            self.max_decal_indices[slot] = 0;
+            self.max_probe_indices[slot] = 0;
         }
         for layout in self.layouts.take().into_iter().flatten() {
             device.destroy_bind_group_layout(layout)?;
         }
-        if let Some(buf) = self.records_buf.take() {
-            device.destroy_buffer(buf)?;
-        }
-        if let Some(buf) = self.indices_buf.take() {
-            device.destroy_buffer(buf)?;
-        }
-        if let Some(buf) = self.decal_indices_buf.take() {
-            device.destroy_buffer(buf)?;
-        }
-        if let Some(buf) = self.probe_indices_buf.take() {
-            device.destroy_buffer(buf)?;
-        }
-        self.allocated_clusters = 0;
-        self.max_light_indices = 0;
-        self.max_decal_indices = 0;
-        self.max_probe_indices = 0;
         if let Some(pipe) = self.pipeline.take() {
             device.destroy_pipeline(pipe)?;
         }

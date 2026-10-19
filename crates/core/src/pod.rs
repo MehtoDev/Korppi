@@ -147,6 +147,13 @@ pub fn cast_slice<A: Pod, B: Pod>(slice: &[A]) -> &[B] {
         return unsafe { slice::from_raw_parts(ptr, slice.len()) };
     }
 
+    if !slice.is_empty() {
+        assert!(
+            (size_of::<A>() == 0) == (size_of::<B>() == 0),
+            "cast_slice: cannot cast non-empty zero-sized slice to or from non-zero-sized type"
+        );
+    }
+
     let input_bytes = slice
         .len()
         .checked_mul(size_of::<A>())
@@ -156,10 +163,6 @@ pub fn cast_slice<A: Pod, B: Pod>(slice: &[A]) -> &[B] {
         return &[];
     }
 
-    assert!(
-        size_of::<B>() != 0,
-        "cast_slice: cannot cast non-empty byte range into zero-sized type"
-    );
     assert!(
         input_bytes.is_multiple_of(size_of::<B>()),
         "cast_slice: input byte length ({input_bytes}) is not a multiple of target element size ({})",
@@ -195,6 +198,13 @@ pub fn cast_slice_mut<A: Pod, B: Pod>(slice: &mut [A]) -> &mut [B] {
         return unsafe { slice::from_raw_parts_mut(ptr, len) };
     }
 
+    if !slice.is_empty() {
+        assert!(
+            (size_of::<A>() == 0) == (size_of::<B>() == 0),
+            "cast_slice_mut: cannot cast non-empty zero-sized slice to or from non-zero-sized type"
+        );
+    }
+
     let input_bytes = slice
         .len()
         .checked_mul(size_of::<A>())
@@ -204,10 +214,6 @@ pub fn cast_slice_mut<A: Pod, B: Pod>(slice: &mut [A]) -> &mut [B] {
         return &mut [];
     }
 
-    assert!(
-        size_of::<B>() != 0,
-        "cast_slice_mut: cannot cast non-empty byte range into zero-sized type"
-    );
     assert!(
         input_bytes.is_multiple_of(size_of::<B>()),
         "cast_slice_mut: input byte length ({input_bytes}) is not a multiple of target element size ({})",

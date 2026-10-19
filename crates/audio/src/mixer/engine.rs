@@ -178,7 +178,9 @@ impl AudioMixer {
         let mixer = AudioMixer {
             commands: command_consumer,
             events: event_producer,
-            pending_releases: Vec::with_capacity(config.max_clips + config.max_buses.max(1)),
+            pending_releases: Vec::with_capacity(
+                config.queue_capacity + config.max_clips + config.max_buses.max(1),
+            ),
             clock,
             states,
             voices: (0..slots + TAILS).map(|_| None).collect(),
@@ -335,8 +337,10 @@ impl AudioMixer {
                 let Some(found) = self.voice_mut(voice) else {
                     return;
                 };
-                if found.fresh && at <= found.start_at.max(first_frame) {
-                    // Stopped before it first sounds: it ends without sounding.
+                if (found.fresh && at <= found.start_at.max(first_frame))
+                    || (found.is_held() && at <= first_frame)
+                {
+                    // Stopped before it first sounds, or while paused and silent: it ends at once.
                     self.finish(voice.slot());
                 } else {
                     found.stop_at = Some((at, fade_out));
@@ -531,8 +535,13 @@ impl AudioMixer {
         self.release_if_unused(voice.clip);
     }
 
-    /// Hands a released clip back once no voice plays it.
+    /// Hands a released clip back once no voice plays it and the event queue has room.
     fn release_if_unused(&mut self, index: usize) {
+        let can_emit = self.events.len() < self.events.capacity()
+            || self.pending_releases.len() < self.pending_releases.capacity();
+        if !can_emit {
+            return;
+        }
         let slot = &mut self.clips[index];
         if slot.released && slot.voices == 0 {
             if let Some(data) = slot.data.take() {
@@ -564,11 +573,19 @@ impl AudioMixer {
                 return;
             }
         }
+        for index in 0..self.clips.len() {
+            if self.clips[index].released
+                && self.clips[index].voices == 0
+                && self.clips[index].data.is_some()
+            {
+                self.release_if_unused(index);
+            }
+        }
     }
 
     /// Chooses the voices mixed in the block ending before output frame `block_end`: the
-    /// `max_audible` that rank highest by priority, then by audibility (gain, fade and buses).
-    /// Voices that start later wait, virtual, and take no place.
+    /// `max_audible` that rank highest by priority, then by audibility (gain, spatial pan, fade
+    /// and buses). Voices that start later wait, virtual, and take no place.
     fn rank_voices(&mut self, block_end: u64) {
         for index in 0..self.buses.len() {
             let parent = if index == 0 {
@@ -599,7 +616,9 @@ impl AudioMixer {
             } else {
                 1.0
             };
+            let spatial = voice.pan[0].peak().max(voice.pan[1].peak());
             voice.rank_level = voice.gain.peak()
+                * spatial
                 * voice.envelope.peak()
                 * bus.map_or(self.buses[0].level, |bus| bus.level)
                 * bias;

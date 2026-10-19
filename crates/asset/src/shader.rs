@@ -50,7 +50,14 @@ impl AssetLoader for ShaderLoader {
     }
 
     fn load(&self, bytes: &[u8], path: &str) -> Result<Self::Asset, AssetError> {
-        let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
+        let ext = path
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        if !matches!(ext.as_str(), "spv" | "vert" | "frag" | "comp") {
+            return Err(AssetError::UnsupportedFormat(ext));
+        }
 
         let stage = match ext.as_str() {
             "vert" => ShaderStage::Vertex,
@@ -69,14 +76,20 @@ impl AssetLoader for ShaderLoader {
         };
 
         if ext == "spv" {
-            if !bytes.len().is_multiple_of(4) {
+            if bytes.len() < 20 || !bytes.len().is_multiple_of(4) {
                 return Err(AssetError::Decode(
-                    "SPIR-V byte length must be a multiple of 4".into(),
+                    "SPIR-V binary must be at least 20 bytes and a multiple of 4".into(),
                 ));
             }
             let mut words = Vec::with_capacity(bytes.len() / 4);
             for chunk in bytes.as_chunks::<4>().0 {
                 words.push(u32::from_le_bytes(*chunk));
+            }
+            if words[0] != 0x0723_0203 {
+                return Err(AssetError::Decode(format!(
+                    "Invalid SPIR-V magic number {:#010x} (expected 0x07230203)",
+                    words[0]
+                )));
             }
             Ok(ShaderAsset {
                 stage,

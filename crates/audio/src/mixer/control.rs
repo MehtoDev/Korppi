@@ -214,8 +214,12 @@ struct VoiceRank {
     priority: u8,
     /// The gain last set.
     gain: f32,
+    /// The peak stereo spatial gain last set.
+    spatial: f32,
     /// When the voice started, in starts.
     started: u64,
+    /// The clip slot the voice plays.
+    clip: u32,
     /// The sample rate of the voice's clip.
     clip_rate: u32,
 }
@@ -235,6 +239,10 @@ pub struct MixerControl {
     starts: u64,
     /// Clip slots free to register into.
     free_clips: Vec<u32>,
+    /// Whether each clip slot is currently registered on the control side.
+    clip_registered: Box<[bool]>,
+    /// Number of `ClipReleased` events still in flight from the mixer for each clip slot.
+    clip_releases_in_flight: Box<[u32]>,
     /// The sample rate of each registered clip, by `ClipId`.
     clip_rates: Box<[u32]>,
     /// Bus names, indexed by `BusId`.
@@ -269,6 +277,8 @@ impl MixerControl {
             states,
             starts: 0,
             free_clips: (0..max_clips as u32).rev().collect(),
+            clip_registered: vec![false; max_clips].into_boxed_slice(),
+            clip_releases_in_flight: vec![0; max_clips].into_boxed_slice(),
             clip_rates: vec![0; max_clips].into_boxed_slice(),
             buses: vec!["Master".to_string()],
             max_buses: config.max_buses.max(1),
@@ -422,6 +432,7 @@ impl MixerControl {
             self.free_clips.push(slot);
             return Err(AudioError::QueueFull);
         }
+        self.clip_registered[slot as usize] = true;
         Ok(clip)
     }
 
@@ -431,9 +442,42 @@ impl MixerControl {
     /// # Errors
     /// [`AudioError::QueueFull`] if the command queue is full.
     pub fn release_clip(&mut self, clip: ClipId) -> AudioResult<()> {
+        let index = clip.0 as usize;
+        if index >= self.clip_registered.len() || !self.clip_registered[index] {
+            return Ok(());
+        }
         self.commands
             .push(MixerCommand::ReleaseClip { clip })
-            .map_err(|_| AudioError::QueueFull)
+            .map_err(|_| AudioError::QueueFull)?;
+        self.clip_registered[index] = false;
+        self.clip_releases_in_flight[index] += 1;
+        Ok(())
+    }
+
+    /// Number of free clip slots currently available for registration.
+    #[must_use]
+    pub(crate) fn free_clip_slots(&self) -> usize {
+        self.free_clips.len()
+    }
+
+    /// Whether any currently playing voice uses `clip`.
+    #[must_use]
+    pub(crate) fn is_clip_in_use(&self, clip: ClipId) -> bool {
+        self.voices.iter().any(|handle| {
+            let voice = VoiceHandle(handle);
+            !self.states.has_ended(voice) && self.ranks[voice.slot()].clip == clip.0
+        })
+    }
+
+    /// Reclaims an unused registered clip slot so a new [`Self::register_clip`] call can
+    /// immediately overwrite it on the mixer without waiting for a release round-trip.
+    pub(crate) fn reclaim_unused_clip(&mut self, clip: ClipId) {
+        let index = clip.0 as usize;
+        if index < self.clip_registered.len() && self.clip_registered[index] {
+            self.clip_registered[index] = false;
+            self.clip_releases_in_flight[index] += 1;
+            self.free_clips.push(clip.0);
+        }
     }
 
     /// Starts a voice playing `clip` at full gain at the start of the mixer's next block.
@@ -478,7 +522,9 @@ impl MixerControl {
         self.ranks[voice.slot()] = VoiceRank {
             priority: params.priority,
             gain: params.gain,
+            spatial: 1.0,
             started: self.starts,
+            clip: clip.0,
             clip_rate: self.clip_rates.get(clip.0 as usize).copied().unwrap_or(0),
         };
         self.starts += 1;
@@ -493,16 +539,18 @@ impl MixerControl {
         Ok(voice)
     }
 
-    /// The live voice a full pool replaces first: lowest priority, then quietest, then oldest.
+    /// The live voice a full pool replaces first: lowest priority, then quietest (gain times
+    /// spatial pan), then oldest.
     fn lowest_ranked(&self) -> Option<VoiceHandle> {
         let rank = |voice: &Handle<VoiceSlot>| self.ranks[voice.index() as usize];
         self.voices
             .iter()
             .min_by(|a, b| {
                 let (a, b) = (rank(a), rank(b));
+                let (level_a, level_b) = (a.gain * a.spatial, b.gain * b.spatial);
                 a.priority
                     .cmp(&b.priority)
-                    .then(a.gain.total_cmp(&b.gain))
+                    .then(level_a.total_cmp(&level_b))
                     .then(a.started.cmp(&b.started))
             })
             .map(VoiceHandle)
@@ -624,7 +672,12 @@ impl MixerControl {
             voice,
             spatial,
             frames,
-        })
+        })?;
+        if self.voices.contains(voice.0) {
+            self.ranks[voice.slot()].spatial =
+                spatial.gain_left.max(0.0).max(spatial.gain_right.max(0.0));
+        }
+        Ok(())
     }
 
     /// Gives `voice` early reflections, ramping each tap's delay and gains over `frames` output
@@ -677,7 +730,15 @@ impl MixerControl {
             match event {
                 MixerEvent::ClipReleased { clip, data } => {
                     drop(data);
-                    self.free_clips.push(clip.0);
+                    let index = clip.0 as usize;
+                    if index < self.clip_releases_in_flight.len() {
+                        self.clip_releases_in_flight[index] =
+                            self.clip_releases_in_flight[index].saturating_sub(1);
+                        if !self.clip_registered[index] && self.clip_releases_in_flight[index] == 0
+                        {
+                            self.free_clips.push(clip.0);
+                        }
+                    }
                 }
                 MixerEvent::EffectReleased { effect } => drop(effect),
             }

@@ -20,16 +20,15 @@ use korppi_rhi::{
     AccessFlags, BindGroupDescriptor, BindGroupEntry, BindGroupHandle, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindGroupLayoutHandle, BindingResource, BindingType, BlendComponent,
     BlendFactor, BlendOp, BlendState, BufferDescriptor, BufferHandle, BufferMemoryBarrier,
-    BufferUsage, ColorAttachments, ColorTargetState, ColorWriteMask, CommandBufferRecorder,
-    CompareFunction, CullMode, DepthAttachment, DepthStencilState, FilterMode, FrontFace,
-    GraphicsDevice, GraphicsPipelineDescriptor, ImageLayout, ImageMemoryBarrier, IndexType, LoadOp,
-    MemoryUsage, MultisampleState, PipelineBarrier, PipelineHandle, PipelineStageFlags,
-    PolygonMode, PrimitiveTopology, PushConstantRange, RasterizerState, RenderingDescriptor,
+    BufferUsage, ColorTargetState, ColorWriteMask, CommandBufferRecorder, CompareFunction,
+    CullMode, DepthStencilState, FilterMode, FrontFace, GraphicsDevice, GraphicsPipelineDescriptor,
+    ImageLayout, IndexType, LoadOp, MemoryUsage, MultisampleState, PipelineBarrier, PipelineHandle,
+    PipelineStageFlags, PolygonMode, PrimitiveTopology, PushConstantRange, RasterizerState,
     RhiError, SampleCount, SamplerAddressMode, SamplerDescriptor, SamplerHandle, ShaderDescriptor,
     ShaderHandle, ShaderSource, ShaderStage, ShaderStages, StencilFaceState, StoreOp,
     TextureBinding, TextureDescriptor, TextureDimension, TextureFormat, TextureHandle,
-    TextureSubresourceRange, TextureUsage, VertexAttribute, VertexBinding, VertexFormat,
-    VertexLayoutDescriptor, VertexStepMode, FRAMES_IN_FLIGHT,
+    TextureUsage, VertexAttribute, VertexBinding, VertexFormat, VertexLayoutDescriptor,
+    VertexStepMode, FRAMES_IN_FLIGHT,
 };
 
 const TEX_UNDEFINED: TextureAccess = TextureAccess {
@@ -63,6 +62,48 @@ const FORWARD_PBR_FRAG_SPV: &[u8] = include_bytes!("shaders/forward_pbr.frag.spv
 const CUBE_FACE_SIZE: u32 = 256;
 const CUBE_STRIP_WIDTH: u32 = CUBE_FACE_SIZE * 6;
 const CUBE_STRIP_HEIGHT: u32 = CUBE_FACE_SIZE;
+
+const MAX_BLOOM_MIPS: usize = 6;
+
+const BLOOM_MIP_TEX_NAMES: [&str; MAX_BLOOM_MIPS] = [
+    "bloom_mip_0",
+    "bloom_mip_1",
+    "bloom_mip_2",
+    "bloom_mip_3",
+    "bloom_mip_4",
+    "bloom_mip_5",
+];
+
+const BLOOM_DOWN_PASS_NAMES: [&str; MAX_BLOOM_MIPS] = [
+    "bloom_down_0",
+    "bloom_down_1",
+    "bloom_down_2",
+    "bloom_down_3",
+    "bloom_down_4",
+    "bloom_down_5",
+];
+
+const BLOOM_UP_PASS_NAMES: [&str; MAX_BLOOM_MIPS - 1] = [
+    "bloom_up_0",
+    "bloom_up_1",
+    "bloom_up_2",
+    "bloom_up_3",
+    "bloom_up_4",
+];
+
+const POINT_SHADOW_CUBE_NAMES: [&str; 4] = [
+    "point_shadow_cube_0",
+    "point_shadow_cube_1",
+    "point_shadow_cube_2",
+    "point_shadow_cube_3",
+];
+
+const POINT_SHADOW_UNWRAP_NAMES: [&str; 4] = [
+    "point_shadow_unwrap_0",
+    "point_shadow_unwrap_1",
+    "point_shadow_unwrap_2",
+    "point_shadow_unwrap_3",
+];
 
 const CUBE_FACE_DIRS: [(Vec3, Vec3); 6] = [
     // +X, -X
@@ -221,6 +262,7 @@ pub struct ForwardPipeline {
 
     // Pipelines
     pipe_depth_prepass: PipelineHandle,
+    pipe_depth_prepass_msaa: Option<PipelineHandle>,
     pipe_shadow_depth: PipelineHandle,
     pipe_oct_unwrap: PipelineHandle,
     pipe_ssao: PipelineHandle,
@@ -235,6 +277,7 @@ pub struct ForwardPipeline {
     tex_white_1x1: TextureHandle,
     tex_black_1x1: TextureHandle,
     tex_depth_prepass: TextureHandle,
+    depth_1x_written: bool,
     tex_shadow_atlas: TextureHandle,
     tex_cube_strip: TextureHandle,
     buf_dfg_lut: BufferHandle,
@@ -479,6 +522,50 @@ impl ForwardPipeline {
             label: Some("pipe_depth_prepass_reverse_z"),
         })?;
 
+        let pipe_depth_prepass_msaa = if config.msaa_samples != SampleCount::Count1 {
+            Some(
+                device.create_graphics_pipeline(&GraphicsPipelineDescriptor {
+                    vertex_shader: sh_depth_vert,
+                    fragment_shader: Some(sh_depth_frag),
+                    vertex_layout: vertex_layout_3d.clone(),
+                    topology: PrimitiveTopology::TriangleList,
+                    rasterizer: RasterizerState {
+                        cull_mode: CullMode::None,
+                        front_face: FrontFace::CounterClockwise,
+                        polygon_mode: PolygonMode::Fill,
+                        depth_bias: 0.0,
+                        slope_scaled_depth_bias: 0.0,
+                        depth_bias_clamp: 0.0,
+                        depth_clamp: false,
+                    },
+                    multisample: MultisampleState {
+                        count: config.msaa_samples,
+                        alpha_to_coverage: false,
+                    },
+                    depth_stencil: Some(DepthStencilState {
+                        format: TextureFormat::Depth32Float,
+                        depth_test_enabled: true,
+                        depth_write_enabled: true,
+                        depth_compare: CompareFunction::GreaterEqual,
+                        stencil_front: StencilFaceState::IGNORE,
+                        stencil_back: StencilFaceState::IGNORE,
+                        stencil_read_mask: 0,
+                        stencil_write_mask: 0,
+                    }),
+                    color_targets: Vec::new(),
+                    bind_group_layouts: Vec::new(),
+                    push_constant_ranges: vec![PushConstantRange {
+                        stages: ShaderStages::VERTEX,
+                        offset: 0,
+                        size: size_of::<DepthPush>() as u32,
+                    }],
+                    label: Some("pipe_depth_prepass_reverse_z_msaa"),
+                })?,
+            )
+        } else {
+            None
+        };
+
         // 2. Shadow Atlas Depth pipeline (standard [0, 1] LessEqual for CSM & spotlight shadow tiles)
         let pipe_shadow_depth = device.create_graphics_pipeline(&GraphicsPipelineDescriptor {
             vertex_shader: sh_depth_vert,
@@ -581,7 +668,7 @@ impl ForwardPipeline {
             label: Some("pipe_ssao"),
         })?;
 
-        // 5. Forward Opaque PBR pipeline (Reverse-Z GreaterEqual, MSAA configured)
+        // 5. Forward Opaque PBR pipeline (Reverse-Z GreaterEqual against prepass, MSAA configured)
         let pipe_forward = device.create_graphics_pipeline(&GraphicsPipelineDescriptor {
             vertex_shader: sh_forward_vert,
             fragment_shader: Some(sh_forward_frag),
@@ -591,8 +678,8 @@ impl ForwardPipeline {
                 cull_mode: CullMode::None,
                 front_face: FrontFace::CounterClockwise,
                 polygon_mode: PolygonMode::Fill,
-                depth_bias: 0.0,
-                slope_scaled_depth_bias: 0.0,
+                depth_bias: 4.0,
+                slope_scaled_depth_bias: 1.0,
                 depth_bias_clamp: 0.0,
                 depth_clamp: false,
             },
@@ -603,7 +690,7 @@ impl ForwardPipeline {
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
                 depth_test_enabled: true,
-                depth_write_enabled: true,
+                depth_write_enabled: false,
                 depth_compare: CompareFunction::GreaterEqual,
                 stencil_front: StencilFaceState::IGNORE,
                 stencil_back: StencilFaceState::IGNORE,
@@ -909,6 +996,7 @@ impl ForwardPipeline {
             bgl_bloom,
             bgl_tonemap,
             pipe_depth_prepass,
+            pipe_depth_prepass_msaa,
             pipe_shadow_depth,
             pipe_oct_unwrap,
             pipe_ssao,
@@ -921,6 +1009,7 @@ impl ForwardPipeline {
             tex_white_1x1,
             tex_black_1x1,
             tex_depth_prepass,
+            depth_1x_written: false,
             tex_shadow_atlas,
             tex_cube_strip,
             buf_dfg_lut,
@@ -931,7 +1020,7 @@ impl ForwardPipeline {
             bg_ssao: [None; FRAMES_IN_FLIGHT],
             bg_forward_scene: [None; FRAMES_IN_FLIGHT],
             bg_forward_lights: [None; FRAMES_IN_FLIGHT],
-            bg_bloom_sources: Vec::with_capacity(8),
+            bg_bloom_sources: Vec::with_capacity(16),
             bg_tonemap_sources: Vec::with_capacity(8),
             scratch_froxels: Vec::new(),
             scratch_point_lights: Vec::new(),
@@ -943,6 +1032,10 @@ impl ForwardPipeline {
     /// Reads back the 1× Reverse-Z depth prepass buffer as row-major `f32` depth values in `[0.0, 1.0]`.
     #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn read_depth_prepass(&self, device: &dyn GraphicsDevice) -> Result<Vec<f32>, RenderError> {
+        if !self.depth_1x_written {
+            let count = (self.config.width.max(1) as usize) * (self.config.height.max(1) as usize);
+            return Ok(vec![0.0; count]);
+        }
         let bytes = device.read_texture(self.tex_depth_prepass, 0)?;
         let mut depths = Vec::with_capacity(bytes.len() / 4);
         for chunk in bytes.chunks_exact(4) {
@@ -984,20 +1077,24 @@ impl ForwardPipeline {
         let tile_size = atlas_size / 4;
         let inv_atlas = 1.0 / (atlas_size as f32);
 
+        let safe_near = if scene.camera.z_near.is_finite() && scene.camera.z_near > 1e-4 {
+            scene.camera.z_near
+        } else {
+            0.1
+        };
+        let safe_far = if scene.camera.z_far.is_finite() && scene.camera.z_far > safe_near + 1e-3 {
+            scene.camera.z_far
+        } else {
+            safe_near + 100.0
+        };
+
         let view = scene.camera.view_matrix();
         let proj = scene.camera.projection_matrix();
         let view_proj = proj * view;
         let inv_proj = proj.inverse();
 
         // 1. Build froxels & view-space lights into reusable scratch buffers (0 steady-state allocations)
-        let cluster_cfg = ClusterGridConfig::new(
-            width,
-            height,
-            64,
-            16,
-            scene.camera.z_near,
-            scene.camera.z_far,
-        );
+        let cluster_cfg = ClusterGridConfig::new(width, height, 64, 16, safe_near, safe_far);
         cluster_cfg.build_froxel_aabbs_into(inv_proj, &mut self.scratch_froxels);
 
         self.scratch_point_lights.clear();
@@ -1023,7 +1120,9 @@ impl ForwardPipeline {
         let view_mat3 = korppi_math::Mat3::from_mat4(view);
         for sp in &scene.spot_lights {
             let pos_vs4 = view * Vec4::new(sp.position.x, sp.position.y, sp.position.z, 1.0);
-            let dir_vs = (view_mat3 * sp.direction).normalize();
+            let dir_vs = (view_mat3 * sp.direction)
+                .try_normalize()
+                .unwrap_or(Vec3::NEG_Z);
             self.scratch_spot_lights.push(SpotLight {
                 position_vs: Vec3::new(pos_vs4.x, pos_vs4.y, pos_vs4.z),
                 direction_vs: dir_vs,
@@ -1037,7 +1136,7 @@ impl ForwardPipeline {
         // 2. Compute CSM cascades and spotlight/point shadow descriptors
         let mut csm_view_proj = [Mat4::IDENTITY.to_cols_array_2d(); 4];
         let mut csm_atlas_uv = [[0.0f32; 4]; 4];
-        let mut csm_split_depths = [scene.camera.z_far; 4];
+        let mut csm_split_depths = [safe_far; 4];
 
         let has_dir_shadows = scene
             .directional_light
@@ -1048,17 +1147,12 @@ impl ForwardPipeline {
                 let csm_cfg = CascadeConfig {
                     cascade_count: 4,
                     split_lambda: 0.5,
-                    near_plane: scene.camera.z_near,
-                    far_plane: scene.camera.z_far,
+                    near_plane: safe_near,
+                    far_plane: safe_far,
                     shadow_map_resolution: tile_size,
                 };
-                compute_cascades_into(
-                    view,
-                    proj,
-                    dir_light.direction,
-                    &csm_cfg,
-                    &mut self.scratch_cascades,
-                );
+                let safe_dir = dir_light.direction.try_normalize().unwrap_or(Vec3::NEG_Y);
+                compute_cascades_into(view, proj, safe_dir, &csm_cfg, &mut self.scratch_cascades);
                 for (i, c) in self.scratch_cascades.iter().enumerate().take(4) {
                     csm_view_proj[i] = c.view_proj_matrix.to_cols_array_2d();
                     csm_split_depths[i] = c.split_depth;
@@ -1081,7 +1175,7 @@ impl ForwardPipeline {
         for (idx, sp) in scene.spot_lights.iter().enumerate() {
             if sp.casts_shadows && spot_shadow_count < 4 {
                 let s = spot_shadow_count;
-                let dir = sp.direction.normalize();
+                let dir = sp.direction.try_normalize().unwrap_or(Vec3::NEG_Y);
                 let up = if dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
                 let sp_view = Mat4::look_at_rh(sp.position, sp.position + dir, up);
                 let fov = (sp.half_angle * 2.0).clamp(0.1, 3.0);
@@ -1124,7 +1218,7 @@ impl ForwardPipeline {
         }
 
         let (dir_vec, dir_rad) = if let Some(d) = scene.directional_light {
-            let dn = d.direction.normalize();
+            let dn = d.direction.try_normalize().unwrap_or(Vec3::NEG_Y);
             let rad = d.color * d.illuminance;
             (
                 [dn.x, dn.y, dn.z, 1.0],
@@ -1134,9 +1228,7 @@ impl ForwardPipeline {
             ([0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])
         };
 
-        let log_far_over_near = (scene.camera.z_far / scene.camera.z_near.max(1e-4))
-            .ln()
-            .max(1e-5);
+        let log_far_over_near = (safe_far / safe_near.max(1e-4)).ln().max(1e-5);
         let scene_ubo = SceneUniformsGpu {
             view: view.to_cols_array_2d(),
             proj: proj.to_cols_array_2d(),
@@ -1161,12 +1253,7 @@ impl ForwardPipeline {
                 cluster_cfg.dim_z(),
                 cluster_cfg.tile_size(),
             ],
-            cluster_depth_params: [
-                scene.camera.z_near,
-                scene.camera.z_far,
-                1.0 / log_far_over_near,
-                inv_atlas,
-            ],
+            cluster_depth_params: [safe_near, safe_far, 1.0 / log_far_over_near, inv_atlas],
             viewport_and_shadow_counts: [
                 1.0 / (width as f32),
                 1.0 / (height as f32),
@@ -1255,13 +1342,31 @@ impl ForwardPipeline {
 
         let rg_shadow_atlas =
             graph.import_texture(self.tex_shadow_atlas, TEX_UNDEFINED, atlas_size, atlas_size);
-        let rg_depth_prepass = graph.import_texture_with_final_access(
-            self.tex_depth_prepass,
-            TEX_UNDEFINED,
-            TEX_SHADER_READ_DEPTH,
-            width,
-            height,
-        );
+        let rg_cube_strip = if point_shadow_count > 0 {
+            Some(graph.import_texture(
+                self.tex_cube_strip,
+                TEX_UNDEFINED,
+                CUBE_STRIP_WIDTH,
+                CUBE_STRIP_HEIGHT,
+            ))
+        } else {
+            None
+        };
+
+        let need_1x_depth =
+            self.config.msaa_samples == SampleCount::Count1 || self.config.ssao.is_some();
+        self.depth_1x_written = need_1x_depth;
+        let rg_depth_prepass = if need_1x_depth {
+            Some(graph.import_texture_with_final_access(
+                self.tex_depth_prepass,
+                TEX_UNDEFINED,
+                TEX_SHADER_READ_DEPTH,
+                width,
+                height,
+            ))
+        } else {
+            None
+        };
         let rg_target = graph.import_texture(target, TEX_UNDEFINED, width, height);
 
         let rg_hdr_1x = graph.create_transient_texture(TransientTextureDesc::new(
@@ -1311,48 +1416,66 @@ impl ForwardPipeline {
             None
         };
 
-        let bloom_handles: Option<(RenderGraphTextureHandle, RenderGraphTextureHandle)> =
-            if self.config.bloom.is_some() {
-                let half_w = (width / 2).max(1);
-                let half_h = (height / 2).max(1);
-                let quar_w = (width / 4).max(1);
-                let quar_h = (height / 4).max(1);
-                let b_half = graph.create_transient_texture(TransientTextureDesc::new(
-                    "bloom_half",
-                    half_w,
-                    half_h,
-                    TextureFormat::Rgba16Float,
-                    TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED,
-                ));
-                let b_quar = graph.create_transient_texture(TransientTextureDesc::new(
-                    "bloom_quar",
-                    quar_w,
-                    quar_h,
-                    TextureFormat::Rgba16Float,
-                    TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED,
-                ));
-                Some((b_half, b_quar))
-            } else {
-                None
-            };
+        let bloom_mip_count = self
+            .config
+            .bloom
+            .as_ref()
+            .map(|b| (b.mip_levels as usize).clamp(1, MAX_BLOOM_MIPS))
+            .unwrap_or(0);
+        let mut bloom_mips = [RenderGraphTextureHandle::default(); MAX_BLOOM_MIPS];
+        for (i, slot_handle) in bloom_mips.iter_mut().enumerate().take(bloom_mip_count) {
+            let mip_w = (width >> (i + 1)).max(1);
+            let mip_h = (height >> (i + 1)).max(1);
+            *slot_handle = graph.create_transient_texture(TransientTextureDesc::new(
+                BLOOM_MIP_TEX_NAMES[i],
+                mip_w,
+                mip_h,
+                TextureFormat::Rgba16Float,
+                TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED,
+            ));
+        }
 
-        // Pass 1: Shadow Atlas
+        // Pass 1: Shadow Atlas (CSM & Spotlights) + Declarative Point-Light Cube/Unwrap passes
         graph
             .add_pass("shadow_atlas", PassType::Graphics)
             .write_depth(rg_shadow_atlas, LoadOp::Clear, StoreOp::Store, 1.0)
             .mark_as_root();
 
-        // Pass 2: 1x Reverse-Z Depth Prepass
-        graph
-            .add_pass("depth_prepass", PassType::Graphics)
-            .write_depth(rg_depth_prepass, LoadOp::Clear, StoreOp::Store, 0.0)
-            .mark_as_root();
+        if let Some(cube_strip) = rg_cube_strip {
+            for p_slot in 0..point_shadow_count {
+                graph
+                    .add_pass(POINT_SHADOW_CUBE_NAMES[p_slot], PassType::Graphics)
+                    .write_depth(cube_strip, LoadOp::Clear, StoreOp::Store, 0.0);
+                graph
+                    .add_pass(POINT_SHADOW_UNWRAP_NAMES[p_slot], PassType::Graphics)
+                    .read_texture(cube_strip, TEX_SHADER_READ_DEPTH)
+                    .write_depth(rg_shadow_atlas, LoadOp::Load, StoreOp::Store, 1.0)
+                    .mark_as_root();
+            }
+        }
+
+        // Pass 2: Reverse-Z Depth Prepass matching forward pass sample count
+        if let Some((_, depth_msaa)) = msaa_pair {
+            graph
+                .add_pass("depth_prepass", PassType::Graphics)
+                .write_depth(depth_msaa, LoadOp::Clear, StoreOp::Store, 0.0);
+            if let Some(depth_1x) = rg_depth_prepass {
+                graph
+                    .add_pass("depth_prepass_1x", PassType::Graphics)
+                    .write_depth(depth_1x, LoadOp::Clear, StoreOp::Store, 0.0);
+            }
+        } else {
+            let depth_1x = rg_depth_prepass.expect("1x depth prepass");
+            graph
+                .add_pass("depth_prepass", PassType::Graphics)
+                .write_depth(depth_1x, LoadOp::Clear, StoreOp::Store, 0.0);
+        }
 
         // Pass 3: Optional SSAO
-        if let Some(ssao_tex) = rg_ssao {
+        if let (Some(ssao_tex), Some(depth_1x)) = (rg_ssao, rg_depth_prepass) {
             graph
                 .add_pass("ssao", PassType::Graphics)
-                .read_texture(rg_depth_prepass, TEX_SHADER_READ_DEPTH)
+                .read_texture(depth_1x, TEX_SHADER_READ_DEPTH)
                 .write_color(
                     ssao_tex,
                     0,
@@ -1362,7 +1485,7 @@ impl ForwardPipeline {
                 );
         }
 
-        // Pass 4: Forward Opaque PBR Pass
+        // Pass 4: Forward Opaque PBR Pass (loads prepass depth with read-only GreaterEqual)
         {
             let mut pass = graph
                 .add_pass("forward_opaque", PassType::Graphics)
@@ -1379,8 +1502,9 @@ impl ForwardPipeline {
                     StoreOp::DontCare,
                     scene.clear_color,
                 )
-                .write_depth(depth_msaa, LoadOp::Clear, StoreOp::DontCare, 0.0);
+                .write_depth(depth_msaa, LoadOp::Load, StoreOp::DontCare, 0.0);
             } else {
+                let depth_1x = rg_depth_prepass.expect("1x depth prepass");
                 pass.write_color(
                     rg_hdr_1x,
                     0,
@@ -1388,42 +1512,38 @@ impl ForwardPipeline {
                     StoreOp::Store,
                     scene.clear_color,
                 )
-                .write_depth(rg_depth_prepass, LoadOp::Clear, StoreOp::Store, 0.0);
+                .write_depth(depth_1x, LoadOp::Load, StoreOp::Store, 0.0);
             }
         }
 
-        // Pass 5: Optional Progressive Bloom Downsample & Upsample
-        if let Some((b_half, b_quar)) = bloom_handles {
+        // Pass 5: Optional Progressive Bloom Downsample & Upsample Pyramid
+        for i in 0..bloom_mip_count {
+            let src = if i == 0 { rg_hdr_1x } else { bloom_mips[i - 1] };
+            let dst = bloom_mips[i];
             graph
-                .add_pass("bloom_down_0", PassType::Graphics)
-                .read_texture(rg_hdr_1x, TEX_SHADER_READ)
-                .write_color(
-                    b_half,
-                    0,
-                    LoadOp::Clear,
-                    StoreOp::Store,
-                    [0.0, 0.0, 0.0, 1.0],
-                );
-            graph
-                .add_pass("bloom_down_1", PassType::Graphics)
-                .read_texture(b_half, TEX_SHADER_READ)
-                .write_color(
-                    b_quar,
-                    0,
-                    LoadOp::Clear,
-                    StoreOp::Store,
-                    [0.0, 0.0, 0.0, 1.0],
-                );
-            graph
-                .add_pass("bloom_up_0", PassType::Graphics)
-                .read_texture(b_quar, TEX_SHADER_READ)
-                .write_color(
-                    b_half,
-                    0,
-                    LoadOp::Load,
-                    StoreOp::Store,
-                    [0.0, 0.0, 0.0, 1.0],
-                );
+                .add_pass(BLOOM_DOWN_PASS_NAMES[i], PassType::Graphics)
+                .read_texture(src, TEX_SHADER_READ)
+                .write_color(dst, 0, LoadOp::Clear, StoreOp::Store, [0.0, 0.0, 0.0, 1.0]);
+        }
+        if bloom_mip_count > 1 {
+            for (step, &pass_name) in BLOOM_UP_PASS_NAMES
+                .iter()
+                .enumerate()
+                .take(bloom_mip_count - 1)
+            {
+                let src_mip = bloom_mip_count - 1 - step;
+                let dst_mip = src_mip - 1;
+                graph
+                    .add_pass(pass_name, PassType::Graphics)
+                    .read_texture(bloom_mips[src_mip], TEX_SHADER_READ)
+                    .write_color(
+                        bloom_mips[dst_mip],
+                        0,
+                        LoadOp::Load,
+                        StoreOp::Store,
+                        [0.0, 0.0, 0.0, 1.0],
+                    );
+            }
         }
 
         // Pass 6: Final Tonemap & Composite into `target`
@@ -1431,8 +1551,8 @@ impl ForwardPipeline {
             let mut pass = graph
                 .add_pass("tonemap", PassType::Graphics)
                 .read_texture(rg_hdr_1x, TEX_SHADER_READ);
-            if let Some((b_half, _)) = bloom_handles {
-                pass = pass.read_texture(b_half, TEX_SHADER_READ);
+            if bloom_mip_count > 0 {
+                pass = pass.read_texture(bloom_mips[0], TEX_SHADER_READ);
             }
             pass.write_color(
                 rg_target,
@@ -1460,8 +1580,11 @@ impl ForwardPipeline {
         let phys_ssao = rg_ssao
             .map(|h| compiled.resolve_texture(h))
             .unwrap_or(self.tex_white_1x1);
-        let phys_bloom_half = bloom_handles.map(|(h, _)| compiled.resolve_texture(h));
-        let phys_bloom_quar = bloom_handles.map(|(_, q)| compiled.resolve_texture(q));
+
+        let mut phys_bloom_mips = [TextureHandle::default(); MAX_BLOOM_MIPS];
+        for i in 0..bloom_mip_count {
+            phys_bloom_mips[i] = compiled.resolve_texture(bloom_mips[i]);
+        }
 
         let bg_ssao = if rg_ssao.is_some() {
             Some(self.ensure_ssao_bind_group(device, slot, self.tex_depth_prepass)?)
@@ -1472,25 +1595,31 @@ impl ForwardPipeline {
         let bg_forward_lights =
             self.ensure_forward_lights_bind_group(device, slot, &culling_buffers)?;
 
-        let bg_bloom_hdr = if phys_bloom_half.is_some() {
-            Some(self.ensure_bloom_bind_group(device, phys_hdr_1x)?)
-        } else {
-            None
-        };
-        let bg_bloom_half = if let Some(bh) = phys_bloom_half {
-            Some(self.ensure_bloom_bind_group(device, bh)?)
-        } else {
-            None
-        };
-        let bg_bloom_quar = if let Some(bq) = phys_bloom_quar {
-            Some(self.ensure_bloom_bind_group(device, bq)?)
-        } else {
-            None
-        };
+        let mut bg_bloom_down = [BindGroupHandle::default(); MAX_BLOOM_MIPS];
+        for i in 0..bloom_mip_count {
+            let src_phys = if i == 0 {
+                phys_hdr_1x
+            } else {
+                phys_bloom_mips[i - 1]
+            };
+            bg_bloom_down[i] = self.ensure_bloom_bind_group(device, src_phys)?;
+        }
+        let mut bg_bloom_up = [BindGroupHandle::default(); MAX_BLOOM_MIPS - 1];
+        if bloom_mip_count > 1 {
+            for (step, bg_slot) in bg_bloom_up.iter_mut().enumerate().take(bloom_mip_count - 1) {
+                let src_mip = bloom_mip_count - 1 - step;
+                *bg_slot = self.ensure_bloom_bind_group(device, phys_bloom_mips[src_mip])?;
+            }
+        }
+
         let bg_tonemap = self.ensure_tonemap_bind_group(
             device,
             phys_hdr_1x,
-            phys_bloom_half.unwrap_or(self.tex_black_1x1),
+            if bloom_mip_count > 0 {
+                phys_bloom_mips[0]
+            } else {
+                self.tex_black_1x1
+            },
         )?;
 
         compiled.execute_with(recorder, |pass_name, _ctx: &PassContext<'_>, rec| {
@@ -1538,167 +1667,18 @@ impl ForwardPipeline {
                             Self::record_shadow_draws(rec, &scene.draws, vp_mat)?;
                         }
                     }
-
-                    // 1c. Render omnidirectional point-light shadows via 6-face strip -> octahedral unwrap
-                    if point_shadow_count > 0 {
-                        rec.end_rendering()?;
-
-                        for (p_slot, &light_idx) in point_light_indices_for_unwrap
-                            .iter()
-                            .enumerate()
-                            .take(point_shadow_count)
-                        {
-                            let pt = &scene.point_lights[light_idx];
-                            let pt_near = 0.1f32;
-                            let pt_far = pt.radius.max(0.2);
-                            let face_proj = ReverseZ::perspective_rh(
-                                std::f32::consts::FRAC_PI_2,
-                                1.0,
-                                pt_near,
-                                pt_far,
-                            );
-
-                            rec.pipeline_barrier(&PipelineBarrier::new().with_image_barrier(
-                                ImageMemoryBarrier {
-                                    texture: self.tex_cube_strip,
-                                    range: TextureSubresourceRange::ALL,
-                                    src_stages: PipelineStageFlags::TOP_OF_PIPE
-                                        | PipelineStageFlags::FRAGMENT_SHADER,
-                                    src_access: AccessFlags::empty(),
-                                    dst_stages: PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                                        | PipelineStageFlags::LATE_FRAGMENT_TESTS,
-                                    dst_access: AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                                    old_layout: ImageLayout::Undefined,
-                                    new_layout: ImageLayout::DepthStencilAttachment,
-                                },
-                            ));
-
-                            rec.begin_rendering(&RenderingDescriptor {
-                                offset_x: 0,
-                                offset_y: 0,
-                                width: CUBE_STRIP_WIDTH,
-                                height: CUBE_STRIP_HEIGHT,
-                                color_attachments: ColorAttachments::new(),
-                                depth_attachment: Some(DepthAttachment {
-                                    texture: self.tex_cube_strip,
-                                    mip_level: 0,
-                                    layer: 0,
-                                    load_op: LoadOp::Clear,
-                                    store_op: StoreOp::Store,
-                                    clear_depth: Some(0.0),
-                                    clear_stencil: None,
-                                    stencil_load_op: LoadOp::DontCare,
-                                    stencil_store_op: StoreOp::DontCare,
-                                }),
-                            })?;
-
-                            rec.bind_pipeline(self.pipe_depth_prepass);
-                            for (face_idx, &(forward, up)) in CUBE_FACE_DIRS.iter().enumerate() {
-                                let fx = (face_idx as u32) * CUBE_FACE_SIZE;
-                                rec.set_viewport(
-                                    fx as f32,
-                                    0.0,
-                                    CUBE_FACE_SIZE as f32,
-                                    CUBE_FACE_SIZE as f32,
-                                    0.0,
-                                    1.0,
-                                );
-                                rec.set_scissor(fx as i32, 0, CUBE_FACE_SIZE, CUBE_FACE_SIZE);
-                                let face_view =
-                                    Mat4::look_at_rh(pt.position, pt.position + forward, up);
-                                let face_vp = face_proj * face_view;
-                                Self::record_shadow_draws(rec, &scene.draws, face_vp)?;
-                            }
-                            rec.end_rendering()?;
-
-                            rec.pipeline_barrier(&PipelineBarrier::new().with_image_barrier(
-                                ImageMemoryBarrier {
-                                    texture: self.tex_cube_strip,
-                                    range: TextureSubresourceRange::ALL,
-                                    src_stages: PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                                        | PipelineStageFlags::LATE_FRAGMENT_TESTS,
-                                    src_access: AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                                    dst_stages: PipelineStageFlags::FRAGMENT_SHADER,
-                                    dst_access: AccessFlags::SHADER_READ,
-                                    old_layout: ImageLayout::DepthStencilAttachment,
-                                    new_layout: ImageLayout::DepthStencilReadOnly,
-                                },
-                            ));
-
-                            // Unwrap 6-face strip into octahedral tile (row 2 of shadow atlas)
-                            rec.begin_rendering(&RenderingDescriptor {
-                                offset_x: 0,
-                                offset_y: 0,
-                                width: atlas_size,
-                                height: atlas_size,
-                                color_attachments: ColorAttachments::new(),
-                                depth_attachment: Some(DepthAttachment {
-                                    texture: self.tex_shadow_atlas,
-                                    mip_level: 0,
-                                    layer: 0,
-                                    load_op: LoadOp::Load,
-                                    store_op: StoreOp::Store,
-                                    clear_depth: None,
-                                    clear_stencil: None,
-                                    stencil_load_op: LoadOp::DontCare,
-                                    stencil_store_op: StoreOp::DontCare,
-                                }),
-                            })?;
-
-                            let tx = (p_slot as u32) * tile_size;
-                            let ty = tile_size * 2;
-                            rec.set_viewport(
-                                tx as f32,
-                                ty as f32,
-                                tile_size as f32,
-                                tile_size as f32,
-                                0.0,
-                                1.0,
-                            );
-                            rec.set_scissor(tx as i32, ty as i32, tile_size, tile_size);
-                            rec.bind_pipeline(self.pipe_oct_unwrap);
-                            rec.set_bind_group(0, self.bg_oct_unwrap, &[]);
-                            let push = OctUnwrapPush {
-                                near_far_offset: [pt_near, pt_far, tx as f32, ty as f32],
-                                inv_tile_size: [
-                                    1.0 / (tile_size as f32),
-                                    1.0 / (tile_size as f32),
-                                    0.0,
-                                    0.0,
-                                ],
-                            };
-                            rec.push_constants(0, korppi_core::pod::bytes_of(&push))?;
-                            rec.draw(3, 1, 0, 0);
-                            rec.end_rendering()?;
-                        }
-
-                        // Re-open the shadow atlas rendering pass so CompiledRenderGraph::execute_with
-                        // closes it cleanly.
-                        rec.begin_rendering(&RenderingDescriptor {
-                            offset_x: 0,
-                            offset_y: 0,
-                            width: atlas_size,
-                            height: atlas_size,
-                            color_attachments: ColorAttachments::new(),
-                            depth_attachment: Some(DepthAttachment {
-                                texture: self.tex_shadow_atlas,
-                                mip_level: 0,
-                                layer: 0,
-                                load_op: LoadOp::Load,
-                                store_op: StoreOp::Store,
-                                clear_depth: None,
-                                clear_stencil: None,
-                                stencil_load_op: LoadOp::DontCare,
-                                stencil_store_op: StoreOp::DontCare,
-                            }),
-                        })?;
-                    }
                     Ok(())
                 }
-                "depth_prepass" => {
+                "depth_prepass" | "depth_prepass_1x" => {
                     rec.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
                     rec.set_scissor(0, 0, width, height);
-                    rec.bind_pipeline(self.pipe_depth_prepass);
+                    let pipe = if pass_name == "depth_prepass" {
+                        self.pipe_depth_prepass_msaa
+                            .unwrap_or(self.pipe_depth_prepass)
+                    } else {
+                        self.pipe_depth_prepass
+                    };
+                    rec.bind_pipeline(pipe);
                     for draw in &scene.draws {
                         if draw.mesh.index_count == 0 {
                             continue;
@@ -1767,73 +1747,6 @@ impl ForwardPipeline {
                     }
                     Ok(())
                 }
-                "bloom_down_0" => {
-                    let bloom_cfg = self.config.bloom.as_ref().expect("bloom config");
-                    let dst_w = (width / 2).max(1);
-                    let dst_h = (height / 2).max(1);
-                    rec.set_viewport(0.0, 0.0, dst_w as f32, dst_h as f32, 0.0, 1.0);
-                    rec.set_scissor(0, 0, dst_w, dst_h);
-                    rec.bind_pipeline(self.pipe_bloom_down);
-                    rec.set_bind_group(0, bg_bloom_hdr.expect("bg_bloom_hdr"), &[]);
-                    let push = BloomPush {
-                        texel_radius_mode: [
-                            1.0 / (width as f32),
-                            1.0 / (height as f32),
-                            bloom_cfg.filter_radius,
-                            0.0,
-                        ],
-                        threshold_params: [bloom_cfg.threshold, bloom_cfg.soft_knee, 0.0, 0.0],
-                    };
-                    rec.push_constants(0, korppi_core::pod::bytes_of(&push))?;
-                    rec.draw(3, 1, 0, 0);
-                    Ok(())
-                }
-                "bloom_down_1" => {
-                    let bloom_cfg = self.config.bloom.as_ref().expect("bloom config");
-                    let src_w = (width / 2).max(1);
-                    let src_h = (height / 2).max(1);
-                    let dst_w = (width / 4).max(1);
-                    let dst_h = (height / 4).max(1);
-                    rec.set_viewport(0.0, 0.0, dst_w as f32, dst_h as f32, 0.0, 1.0);
-                    rec.set_scissor(0, 0, dst_w, dst_h);
-                    rec.bind_pipeline(self.pipe_bloom_down);
-                    rec.set_bind_group(0, bg_bloom_half.expect("bg_bloom_half"), &[]);
-                    let push = BloomPush {
-                        texel_radius_mode: [
-                            1.0 / (src_w as f32),
-                            1.0 / (src_h as f32),
-                            bloom_cfg.filter_radius,
-                            0.0,
-                        ],
-                        threshold_params: [0.0, 0.0, 0.0, 0.0],
-                    };
-                    rec.push_constants(0, korppi_core::pod::bytes_of(&push))?;
-                    rec.draw(3, 1, 0, 0);
-                    Ok(())
-                }
-                "bloom_up_0" => {
-                    let bloom_cfg = self.config.bloom.as_ref().expect("bloom config");
-                    let src_w = (width / 4).max(1);
-                    let src_h = (height / 4).max(1);
-                    let dst_w = (width / 2).max(1);
-                    let dst_h = (height / 2).max(1);
-                    rec.set_viewport(0.0, 0.0, dst_w as f32, dst_h as f32, 0.0, 1.0);
-                    rec.set_scissor(0, 0, dst_w, dst_h);
-                    rec.bind_pipeline(self.pipe_bloom_up);
-                    rec.set_bind_group(0, bg_bloom_quar.expect("bg_bloom_quar"), &[]);
-                    let push = BloomPush {
-                        texel_radius_mode: [
-                            1.0 / (src_w as f32),
-                            1.0 / (src_h as f32),
-                            bloom_cfg.filter_radius,
-                            1.0,
-                        ],
-                        threshold_params: [0.0, 0.0, 0.0, 0.0],
-                    };
-                    rec.push_constants(0, korppi_core::pod::bytes_of(&push))?;
-                    rec.draw(3, 1, 0, 0);
-                    Ok(())
-                }
                 "tonemap" => {
                     rec.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
                     rec.set_scissor(0, 0, width, height);
@@ -1859,18 +1772,130 @@ impl ForwardPipeline {
                             self.config.tonemap.white_point,
                             bloom_intensity,
                         ],
-                        flags: [
-                            op_code,
-                            u32::from(self.config.bloom.is_some()),
-                            srgb_target,
-                            0,
-                        ],
+                        flags: [op_code, u32::from(bloom_mip_count > 0), srgb_target, 0],
                     };
                     rec.push_constants(0, korppi_core::pod::bytes_of(&push))?;
                     rec.draw(3, 1, 0, 0);
                     Ok(())
                 }
-                _ => Ok(()),
+                other => {
+                    if let Some(p_slot) = POINT_SHADOW_CUBE_NAMES.iter().position(|&n| n == other) {
+                        let light_idx = point_light_indices_for_unwrap[p_slot];
+                        let pt = &scene.point_lights[light_idx];
+                        let pt_near = 0.1f32;
+                        let pt_far = pt.radius.max(0.2);
+                        let face_proj = ReverseZ::perspective_rh(
+                            std::f32::consts::FRAC_PI_2,
+                            1.0,
+                            pt_near,
+                            pt_far,
+                        );
+                        rec.bind_pipeline(self.pipe_depth_prepass);
+                        for (face_idx, &(forward, up)) in CUBE_FACE_DIRS.iter().enumerate() {
+                            let fx = (face_idx as u32) * CUBE_FACE_SIZE;
+                            rec.set_viewport(
+                                fx as f32,
+                                0.0,
+                                CUBE_FACE_SIZE as f32,
+                                CUBE_FACE_SIZE as f32,
+                                0.0,
+                                1.0,
+                            );
+                            rec.set_scissor(fx as i32, 0, CUBE_FACE_SIZE, CUBE_FACE_SIZE);
+                            let face_view =
+                                Mat4::look_at_rh(pt.position, pt.position + forward, up);
+                            let face_vp = face_proj * face_view;
+                            Self::record_shadow_draws(rec, &scene.draws, face_vp)?;
+                        }
+                        return Ok(());
+                    }
+                    if let Some(p_slot) = POINT_SHADOW_UNWRAP_NAMES.iter().position(|&n| n == other)
+                    {
+                        let light_idx = point_light_indices_for_unwrap[p_slot];
+                        let pt = &scene.point_lights[light_idx];
+                        let pt_near = 0.1f32;
+                        let pt_far = pt.radius.max(0.2);
+                        let tx = (p_slot as u32) * tile_size;
+                        let ty = tile_size * 2;
+                        rec.set_viewport(
+                            tx as f32,
+                            ty as f32,
+                            tile_size as f32,
+                            tile_size as f32,
+                            0.0,
+                            1.0,
+                        );
+                        rec.set_scissor(tx as i32, ty as i32, tile_size, tile_size);
+                        rec.bind_pipeline(self.pipe_oct_unwrap);
+                        rec.set_bind_group(0, self.bg_oct_unwrap, &[]);
+                        let push = OctUnwrapPush {
+                            near_far_offset: [pt_near, pt_far, tx as f32, ty as f32],
+                            inv_tile_size: [
+                                1.0 / (tile_size as f32),
+                                1.0 / (tile_size as f32),
+                                0.0,
+                                0.0,
+                            ],
+                        };
+                        rec.push_constants(0, korppi_core::pod::bytes_of(&push))?;
+                        rec.draw(3, 1, 0, 0);
+                        return Ok(());
+                    }
+                    if let Some(i) = BLOOM_DOWN_PASS_NAMES.iter().position(|&n| n == other) {
+                        let bloom_cfg = self.config.bloom.as_ref().expect("bloom config");
+                        let src_w = (width >> i).max(1);
+                        let src_h = (height >> i).max(1);
+                        let dst_w = (width >> (i + 1)).max(1);
+                        let dst_h = (height >> (i + 1)).max(1);
+                        rec.set_viewport(0.0, 0.0, dst_w as f32, dst_h as f32, 0.0, 1.0);
+                        rec.set_scissor(0, 0, dst_w, dst_h);
+                        rec.bind_pipeline(self.pipe_bloom_down);
+                        rec.set_bind_group(0, bg_bloom_down[i], &[]);
+                        let threshold = if i == 0 {
+                            [bloom_cfg.threshold, bloom_cfg.soft_knee, 1.0, 0.0]
+                        } else {
+                            [0.0, 0.0, 0.0, 0.0]
+                        };
+                        let push = BloomPush {
+                            texel_radius_mode: [
+                                1.0 / (src_w as f32),
+                                1.0 / (src_h as f32),
+                                bloom_cfg.filter_radius,
+                                0.0,
+                            ],
+                            threshold_params: threshold,
+                        };
+                        rec.push_constants(0, korppi_core::pod::bytes_of(&push))?;
+                        rec.draw(3, 1, 0, 0);
+                        return Ok(());
+                    }
+                    if let Some(step) = BLOOM_UP_PASS_NAMES.iter().position(|&n| n == other) {
+                        let bloom_cfg = self.config.bloom.as_ref().expect("bloom config");
+                        let src_mip = bloom_mip_count - 1 - step;
+                        let dst_mip = src_mip - 1;
+                        let src_w = (width >> (src_mip + 1)).max(1);
+                        let src_h = (height >> (src_mip + 1)).max(1);
+                        let dst_w = (width >> (dst_mip + 1)).max(1);
+                        let dst_h = (height >> (dst_mip + 1)).max(1);
+                        rec.set_viewport(0.0, 0.0, dst_w as f32, dst_h as f32, 0.0, 1.0);
+                        rec.set_scissor(0, 0, dst_w, dst_h);
+                        rec.bind_pipeline(self.pipe_bloom_up);
+                        rec.set_bind_group(0, bg_bloom_up[step], &[]);
+                        let push = BloomPush {
+                            texel_radius_mode: [
+                                1.0 / (src_w as f32),
+                                1.0 / (src_h as f32),
+                                bloom_cfg.filter_radius,
+                                1.0,
+                            ],
+                            threshold_params: [0.0, 0.0, 0.0, 0.0],
+                        };
+                        rec.push_constants(0, korppi_core::pod::bytes_of(&push))?;
+                        rec.draw(3, 1, 0, 0);
+                        return Ok(());
+                    }
+                    Ok(())
+                }
             }
         })?;
 
@@ -2158,6 +2183,9 @@ impl ForwardPipeline {
         device.destroy_pipeline(self.pipe_ssao)?;
         device.destroy_pipeline(self.pipe_oct_unwrap)?;
         device.destroy_pipeline(self.pipe_shadow_depth)?;
+        if let Some(p) = self.pipe_depth_prepass_msaa.take() {
+            device.destroy_pipeline(p)?;
+        }
         device.destroy_pipeline(self.pipe_depth_prepass)?;
 
         device.destroy_bind_group_layout(self.bgl_tonemap)?;

@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/*",
+    "examples/*",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["MehtoDev-AntiGravity"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MehtoDev/refactored-potato"
+
+[workspace.dependencies]
+# Category 1: Complexity outside the engine's scope (Rule 2; owner decisions 2026-10-15, 2026-10-16).
+ciborium = { version = "0.2.2", default-features = false, features = ["std"] }
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+lewton = { version = "0.10", default-features = false, features = ["ogg"] }
+naga = { version = "30.0.1", default-features = false, features = ["spv-in", "glsl-out"] }
+serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter"] }
+
+# Category 2: Low-level OS and driver interfaces (Rule 2).
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
+ash-window = { version = "0.13", default-features = false }
+cpal = { version = "0.15", default-features = false }
+glow = { version = "0.18", default-features = false }
+khronos-egl = { version = "6.0", default-features = false, features = ["dynamic", "1_5"] }
+libloading = { version = "0.8", default-features = false }
+raw-window-handle = { version = "0.6", default-features = false, features = ["std"] }
+wayland-client = { version = "0.31", default-features = false, features = ["system", "dlopen"] }
+wayland-protocols = { version = "0.32", default-features = false, features = ["client"] }
+windows-sys = { version = "0.59", default-features = false, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_OpenGL", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+x11-dl = { version = "2.21", default-features = false }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+# Unsafe operations inside an `unsafe fn` need their own block and proof (AGENTS.md).
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+# Every `unsafe` block and `unsafe impl` carries a `// SAFETY:` proof (AGENTS.md; RHI-14,
+# RVK-18, RGL-19).
+undocumented_unsafe_blocks = "deny"
+todo = "warn"
+unimplemented = "warn"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

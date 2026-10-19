@@ -37,6 +37,8 @@ pub struct Window {
     config: WindowConfig,
     width: u32,
     height: u32,
+    physical_width: u32,
+    physical_height: u32,
     scale_factor: f64,
     focused: bool,
     should_close: bool,
@@ -46,6 +48,12 @@ pub struct Window {
 }
 
 impl Window {
+    /// Maximum number of events buffered in `event_queue` when `drain_events` is not called.
+    pub const MAX_EVENT_QUEUE_CAPACITY: usize = 1024;
+
+    /// Logical pixels per scroll line used to normalize `MouseScrollDelta::PixelDelta`.
+    pub const SCROLL_LINE_PIXELS: f64 = 40.0;
+
     /// Creates a headless window instance without requiring an active OS display server.
     ///
     /// Ideal for automated integration testing, CI pipelines, and server-side rendering.
@@ -57,6 +65,8 @@ impl Window {
             config,
             width,
             height,
+            physical_width: width,
+            physical_height: height,
             scale_factor: 1.0,
             focused: true,
             should_close: false,
@@ -68,15 +78,27 @@ impl Window {
     /// Wraps a native `winit::window::Window` with engine configuration.
     #[must_use]
     pub fn from_winit(window: winit::window::Window, config: WindowConfig) -> Self {
+        window.set_cursor_visible(config.cursor_visible);
+        Self::apply_cursor_grab(&window, config.cursor_grabbed);
+
         let inner_size = window.inner_size();
-        let scale_factor = window.scale_factor();
-        let width = (inner_size.width as f64 / scale_factor) as u32;
-        let height = (inner_size.height as f64 / scale_factor) as u32;
+        let raw_scale = window.scale_factor();
+        let scale_factor = if raw_scale.is_finite() && raw_scale > 0.0 {
+            raw_scale
+        } else {
+            1.0
+        };
+        let physical_width = inner_size.width;
+        let physical_height = inner_size.height;
+        let width = (physical_width as f64 / scale_factor).round() as u32;
+        let height = (physical_height as f64 / scale_factor).round() as u32;
 
         Self {
             config,
             width,
             height,
+            physical_width,
+            physical_height,
             scale_factor,
             focused: window.has_focus(),
             should_close: false,
@@ -85,10 +107,77 @@ impl Window {
         }
     }
 
+    fn apply_cursor_grab(window: &winit::window::Window, grabbed: bool) {
+        if grabbed {
+            if window
+                .set_cursor_grab(winit::window::CursorGrabMode::Confined)
+                .is_err()
+            {
+                let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Locked);
+            }
+        } else {
+            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+        }
+    }
+
+    /// Normalizes physical pixel scroll deltas into line units using `scale_factor`.
+    #[must_use]
+    pub fn normalize_pixel_scroll(pixel_x: f64, pixel_y: f64, scale_factor: f64) -> (f32, f32) {
+        let valid_scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+            scale_factor
+        } else {
+            1.0
+        };
+        let divisor = valid_scale * Self::SCROLL_LINE_PIXELS;
+        ((pixel_x / divisor) as f32, (pixel_y / divisor) as f32)
+    }
+
     /// Returns the window configuration.
     #[must_use]
     pub fn config(&self) -> &WindowConfig {
         &self.config
+    }
+
+    /// Returns the current window title.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.config.title
+    }
+
+    /// Sets the window title and updates the underlying OS window if present.
+    pub fn set_title(&mut self, title: impl Into<String>) {
+        self.config.title = title.into();
+        if let Some(winit) = &self.winit_window {
+            winit.set_title(&self.config.title);
+        }
+    }
+
+    /// Returns whether the mouse cursor is currently configured to be visible.
+    #[must_use]
+    pub fn cursor_visible(&self) -> bool {
+        self.config.cursor_visible
+    }
+
+    /// Sets mouse cursor visibility and updates the underlying OS window if present.
+    pub fn set_cursor_visible(&mut self, visible: bool) {
+        self.config.cursor_visible = visible;
+        if let Some(winit) = &self.winit_window {
+            winit.set_cursor_visible(visible);
+        }
+    }
+
+    /// Returns whether the mouse cursor is currently grabbed/confined.
+    #[must_use]
+    pub fn cursor_grabbed(&self) -> bool {
+        self.config.cursor_grabbed
+    }
+
+    /// Sets mouse cursor grab/confinement state and updates the underlying OS window if present.
+    pub fn set_cursor_grabbed(&mut self, grabbed: bool) {
+        self.config.cursor_grabbed = grabbed;
+        if let Some(winit) = &self.winit_window {
+            Self::apply_cursor_grab(winit, grabbed);
+        }
     }
 
     /// Returns the logical width of the window client area.
@@ -103,16 +192,16 @@ impl Window {
         self.height
     }
 
-    /// Returns the physical pixel width of the window client area.
+    /// Returns the authoritative physical pixel width of the window client area.
     #[must_use]
     pub fn physical_width(&self) -> u32 {
-        (self.width as f64 * self.scale_factor).round() as u32
+        self.physical_width
     }
 
-    /// Returns the physical pixel height of the window client area.
+    /// Returns the authoritative physical pixel height of the window client area.
     #[must_use]
     pub fn physical_height(&self) -> u32 {
-        (self.height as f64 * self.scale_factor).round() as u32
+        self.physical_height
     }
 
     /// Returns the aspect ratio (width / height) of the window client area.
@@ -137,6 +226,11 @@ impl Window {
         self.focused
     }
 
+    /// Updates focus state without buffering an event.
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
     /// Returns `true` if a close request has been received.
     #[must_use]
     pub fn should_close(&self) -> bool {
@@ -148,25 +242,73 @@ impl Window {
         self.should_close = true;
     }
 
-    /// Updates window dimensions and enqueues a `Resized` event.
-    pub fn on_resized(&mut self, width: u32, height: u32) {
+    /// Updates logical window dimensions and recomputes physical dimensions without buffering an event.
+    pub fn set_logical_size(&mut self, width: u32, height: u32) {
         self.width = width;
         self.height = height;
+        self.physical_width = (width as f64 * self.scale_factor).round() as u32;
+        self.physical_height = (height as f64 * self.scale_factor).round() as u32;
+    }
+
+    /// Updates authoritative physical pixel dimensions and recomputes logical dimensions without buffering an event.
+    pub fn set_physical_size(&mut self, physical_width: u32, physical_height: u32) {
+        self.physical_width = physical_width;
+        self.physical_height = physical_height;
+        self.width = (physical_width as f64 / self.scale_factor).round() as u32;
+        self.height = (physical_height as f64 / self.scale_factor).round() as u32;
+    }
+
+    /// Updates the monitor scale factor and recomputes physical dimensions from logical size without buffering an event.
+    pub fn set_scale_factor(&mut self, scale_factor: f64) {
+        if scale_factor.is_finite() && scale_factor > 0.0 {
+            self.scale_factor = scale_factor;
+            self.physical_width = (self.width as f64 * self.scale_factor).round() as u32;
+            self.physical_height = (self.height as f64 * self.scale_factor).round() as u32;
+        }
+    }
+
+    /// Updates logical window dimensions and enqueues a `Resized` event.
+    pub fn on_resized(&mut self, width: u32, height: u32) {
+        self.set_logical_size(width, height);
         self.push_event(WindowEvent::Resized { width, height });
+    }
+
+    /// Updates authoritative physical pixel dimensions and enqueues a `Resized` event.
+    pub fn on_physical_resized(&mut self, physical_width: u32, physical_height: u32) {
+        self.set_physical_size(physical_width, physical_height);
+        self.push_event(WindowEvent::Resized {
+            width: self.width,
+            height: self.height,
+        });
     }
 
     /// Updates the monitor scale factor and enqueues a `ScaleFactorChanged` event.
     pub fn on_scale_factor_changed(&mut self, scale_factor: f64) {
-        self.scale_factor = scale_factor;
-        self.push_event(WindowEvent::ScaleFactorChanged { scale_factor });
+        self.set_scale_factor(scale_factor);
+        self.push_event(WindowEvent::ScaleFactorChanged {
+            scale_factor: self.scale_factor,
+        });
     }
 
-    /// Pushes a window event into the FIFO event queue.
+    /// Pushes a window event into the bounded FIFO event queue.
     pub fn push_event(&mut self, event: WindowEvent) {
-        if let WindowEvent::CloseRequested = event {
-            self.should_close = true;
-        } else if let WindowEvent::Focused(f) = event {
-            self.focused = f;
+        match event {
+            WindowEvent::CloseRequested => self.should_close = true,
+            WindowEvent::Focused(f) => self.focused = f,
+            WindowEvent::Resized { width, height }
+                if self.width != width || self.height != height =>
+            {
+                self.set_logical_size(width, height);
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor }
+                if (self.scale_factor - scale_factor).abs() > f64::EPSILON =>
+            {
+                self.set_scale_factor(scale_factor);
+            }
+            _ => {}
+        }
+        if self.event_queue.len() >= Self::MAX_EVENT_QUEUE_CAPACITY {
+            self.event_queue.pop_front();
         }
         self.event_queue.push_back(event);
     }

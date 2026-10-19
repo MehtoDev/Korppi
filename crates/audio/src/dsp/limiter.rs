@@ -86,7 +86,12 @@ impl PeakLimiter {
             for frame in frames.iter_mut() {
                 let peak = frame.left.abs().max(frame.right.abs());
                 if peak > self.envelope {
-                    self.envelope = peak;
+                    let base = if peak > self.threshold_linear {
+                        self.envelope.max(self.threshold_linear)
+                    } else {
+                        self.envelope
+                    };
+                    self.envelope = base + self.attack_coeff * (peak - base);
                 } else {
                     self.envelope += self.release_coeff * (peak - self.envelope);
                 }
@@ -97,11 +102,11 @@ impl PeakLimiter {
                 };
                 frame.left *= gain;
                 frame.right *= gain;
-                *frame = frame.clamp(-1.0, 1.0);
             }
             return;
         }
 
+        let bound = self.threshold_linear.max(1.0);
         for frame in frames.iter_mut() {
             // Find the steepest linear slope required to reach every peak in the lookahead
             // delay line by the frame it exits (`d = 1` for the sample exiting now, up to
@@ -125,7 +130,8 @@ impl PeakLimiter {
 
             let delayed_peak = delayed.left.abs().max(delayed.right.abs());
             if max_step > 0.0 {
-                self.envelope += max_step;
+                let attack_step = self.attack_coeff * (delayed_peak - self.envelope).max(0.0);
+                self.envelope += max_step.max(attack_step);
             } else {
                 self.envelope += self.release_coeff * (delayed_peak - self.envelope);
             }
@@ -139,8 +145,8 @@ impl PeakLimiter {
             frame.left = delayed.left * gain;
             frame.right = delayed.right * gain;
 
-            // Final safety clamp for floating-point rounding at 0 dBFS.
-            *frame = frame.clamp(-1.0, 1.0);
+            // Final safety clamp for floating-point rounding.
+            *frame = frame.clamp(-bound, bound);
         }
     }
 }

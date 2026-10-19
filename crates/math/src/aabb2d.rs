@@ -20,20 +20,29 @@ impl Default for Aabb2d {
 
 impl Aabb2d {
     /// Creates a new 2D AABB from minimum and maximum extents.
+    ///
+    /// Preserves the empty sentinel (`min = +∞, max = -∞`) rather than inverting it into `[-∞, +∞]`.
     #[must_use]
     pub fn new(min: Vec2, max: Vec2) -> Self {
+        if min.is_nan()
+            || max.is_nan()
+            || (min.x == f32::INFINITY && max.x == f32::NEG_INFINITY)
+            || (min.y == f32::INFINITY && max.y == f32::NEG_INFINITY)
+        {
+            return Self::empty();
+        }
         Self {
             min: min.min(max),
             max: min.max(max),
         }
     }
 
-    /// Creates an empty / inverted bounding box for accumulation.
+    /// Creates an empty / inverted bounding box (`min = +∞`, `max = -∞`) for accumulation.
     #[must_use]
     pub const fn empty() -> Self {
         Self {
-            min: Vec2::splat(f32::INFINITY),
-            max: Vec2::splat(f32::NEG_INFINITY),
+            min: Vec2::INFINITY,
+            max: Vec2::NEG_INFINITY,
         }
     }
 
@@ -46,36 +55,63 @@ impl Aabb2d {
         }
     }
 
-    /// Computes the center of the bounding box.
+    /// Returns `true` if this bounding box is empty (`min > max` on either axis or contains `NaN`).
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.min.x > self.max.x || self.min.y > self.max.y || self.min.is_nan() || self.max.is_nan()
+    }
+
+    /// Computes the center of the bounding box, or [`Vec2::ZERO`] if empty.
     #[must_use]
     pub fn center(&self) -> Vec2 {
-        (self.min + self.max) * 0.5
+        if self.is_empty() {
+            Vec2::ZERO
+        } else {
+            (self.min + self.max) * 0.5
+        }
     }
 
-    /// Computes half extents (half-width, half-height).
+    /// Computes half extents (half-width, half-height), or [`Vec2::ZERO`] if empty.
     #[must_use]
     pub fn half_extents(&self) -> Vec2 {
-        (self.max - self.min) * 0.5
+        if self.is_empty() {
+            Vec2::ZERO
+        } else {
+            (self.max - self.min) * 0.5
+        }
     }
 
-    /// Computes total extents (width, height).
+    /// Computes total extents (width, height), or [`Vec2::ZERO`] if empty.
     #[must_use]
     pub fn extents(&self) -> Vec2 {
-        self.max - self.min
+        if self.is_empty() {
+            Vec2::ZERO
+        } else {
+            self.max - self.min
+        }
     }
 
-    /// Computes perimeter of the bounding box: `2 * (w + h)`.
+    /// Computes perimeter of the bounding box: `2 * (w + h)`, or `0.0` if empty.
     #[must_use]
     pub fn perimeter(&self) -> f32 {
-        let d = self.max - self.min;
-        2.0 * (d.x + d.y)
+        if self.is_empty() {
+            0.0
+        } else {
+            let d = self.max - self.min;
+            2.0 * (d.x + d.y)
+        }
     }
 
-    /// Computes area of the bounding box: `w * h`.
+    /// Computes area of the bounding box: `w * h`, or `0.0` if empty.
     #[must_use]
     pub fn area(&self) -> f32 {
-        let d = self.max - self.min;
-        d.x * d.y
+        if self.is_empty() {
+            0.0
+        } else {
+            let d = self.max - self.min;
+            d.x * d.y
+        }
     }
 
     /// Checks if this AABB contains a point.
@@ -90,7 +126,9 @@ impl Aabb2d {
     /// Checks if this AABB completely contains another AABB.
     #[must_use]
     pub fn contains_aabb(&self, other: &Self) -> bool {
-        self.min.x <= other.min.x
+        !self.is_empty()
+            && !other.is_empty()
+            && self.min.x <= other.min.x
             && self.min.y <= other.min.y
             && self.max.x >= other.max.x
             && self.max.y >= other.max.y
@@ -99,7 +137,9 @@ impl Aabb2d {
     /// Checks if this AABB intersects / overlaps another AABB.
     #[must_use]
     pub fn intersects(&self, other: &Self) -> bool {
-        self.min.x <= other.max.x
+        !self.is_empty()
+            && !other.is_empty()
+            && self.min.x <= other.max.x
             && self.max.x >= other.min.x
             && self.min.y <= other.max.y
             && self.max.y >= other.min.y
@@ -129,6 +169,9 @@ impl Aabb2d {
     /// Expands the bounding box uniformly by a margin in all directions.
     #[must_use]
     pub fn fatten(&self, margin: f32) -> Self {
+        if self.is_empty() {
+            return *self;
+        }
         Self {
             min: self.min - Vec2::splat(margin),
             max: self.max + Vec2::splat(margin),
@@ -138,6 +181,9 @@ impl Aabb2d {
     /// Expands the bounding box to enclose a displaced version (velocity expansion).
     #[must_use]
     pub fn enlarge_by_displacement(&self, displacement: Vec2) -> Self {
+        if self.is_empty() {
+            return *self;
+        }
         let min = self.min.min(self.min + displacement);
         let max = self.max.max(self.max + displacement);
         Self { min, max }

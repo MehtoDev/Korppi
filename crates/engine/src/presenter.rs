@@ -434,6 +434,7 @@ impl<A: korppi_window::KorppiApp + QuadBatchSource> korppi_window::KorppiApp
 
     fn on_update(&mut self, window: &mut korppi_window::Window, delta_time: f32) {
         self.app.on_update(window, delta_time);
+        for _ in window.drain_events() {}
         let Some(presenter) = self.presenter.as_mut() else {
             return;
         };

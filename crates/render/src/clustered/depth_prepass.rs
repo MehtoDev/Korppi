@@ -5,7 +5,7 @@ use crate::graph::handle::RenderGraphTextureHandle;
 use crate::graph::pass::PassType;
 use crate::graph::render_graph::RenderGraph;
 use crate::graph::resource::TransientTextureDesc;
-use korppi_rhi::{LoadOp, SampleCount, StoreOp, TextureDimension, TextureFormat, TextureUsage};
+use korppi_rhi::{LoadOp, SampleCount, StoreOp, TextureFormat, TextureUsage};
 
 /// Configuration options for configuring a Depth Prepass.
 #[derive(Clone, Debug)]
@@ -39,15 +39,14 @@ pub fn add_depth_prepass(
     graph: &mut RenderGraph,
     config: &DepthPrepassConfig,
 ) -> RenderGraphTextureHandle {
-    let depth_desc = TransientTextureDesc {
-        name: "DepthPrepassTarget".to_string(),
-        width: config.width,
-        height: config.height,
-        format: config.format,
-        usage: TextureUsage::DEPTH_STENCIL_ATTACHMENT | TextureUsage::SAMPLED,
-        dimension: TextureDimension::D2,
-        sample_count: config.sample_count,
-    };
+    let depth_desc = TransientTextureDesc::new(
+        "DepthPrepassTarget",
+        config.width,
+        config.height,
+        config.format,
+        TextureUsage::DEPTH_STENCIL_ATTACHMENT | TextureUsage::SAMPLED,
+    )
+    .with_samples(config.sample_count);
     let depth_handle = graph.create_transient_texture(depth_desc);
 
     let (w, h) = (config.width as f32, config.height as f32);

@@ -75,6 +75,7 @@ const ISA_TARGET: u8 = 2;
 pub struct EntityManager {
     records: Vec<EntityRecord>,
     free_indices: Vec<u32>,
+    unplaced: Vec<Entity>,
     alive_count: usize,
     reserved: AtomicU32,
 }
@@ -82,7 +83,7 @@ pub struct EntityManager {
 impl EntityManager {
     /// Creates a new, empty `EntityManager`.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -102,7 +103,7 @@ impl EntityManager {
     ///
     /// The entity has no location until [`set_location`](Self::set_location) gives it one.
     /// Pending reservations are allocated first, so they keep the entities they predicted.
-    pub fn allocate(&mut self) -> Entity {
+    pub(crate) fn allocate(&mut self) -> Entity {
         self.flush_reserved();
         self.allocate_now()
     }
@@ -144,7 +145,27 @@ impl EntityManager {
     pub(crate) fn flush_reserved(&mut self) {
         let pending = std::mem::take(self.reserved.get_mut());
         for _ in 0..pending {
-            self.allocate_now();
+            let entity = self.allocate_now();
+            self.unplaced.push(entity);
+        }
+    }
+
+    /// Reclaims any reserved entities that were never placed into an archetype, incrementing
+    /// their generation and returning their indices to the free list so that handles handed out
+    /// before an aborted or panicking command pass cannot alias later entities.
+    pub(crate) fn reclaim_unplaced(&mut self) {
+        self.flush_reserved();
+        for entity in self.unplaced.drain(..) {
+            if let Some(record) = self.records.get_mut(entity.index as usize) {
+                if record.generation == entity.generation && record.archetype == NO_ARCHETYPE {
+                    record.flags = 0;
+                    if let Some(next) = record.generation.checked_add(1) {
+                        record.generation = next;
+                        self.free_indices.push(entity.index);
+                    }
+                    self.alive_count -= 1;
+                }
+            }
         }
     }
 
@@ -186,7 +207,7 @@ impl EntityManager {
     /// # Panics
     /// If the archetype index or the row does not fit in 32 bits.
     #[inline]
-    pub fn set_location(&mut self, entity: Entity, location: EntityLocation) {
+    pub(crate) fn set_location(&mut self, entity: Entity, location: EntityLocation) {
         let archetype = u32::try_from(location.archetype_id)
             .ok()
             .filter(|&a| a != NO_ARCHETYPE)
@@ -203,7 +224,7 @@ impl EntityManager {
     /// Deallocates an entity, incrementing its generation and freeing its index for reuse; an
     /// index at its last generation is retired instead.
     #[inline]
-    pub fn free(&mut self, entity: Entity) -> Option<EntityLocation> {
+    pub(crate) fn free(&mut self, entity: Entity) -> Option<EntityLocation> {
         let record = self.records.get_mut(entity.index as usize)?;
         if record.generation != entity.generation || record.archetype == NO_ARCHETYPE {
             return None;

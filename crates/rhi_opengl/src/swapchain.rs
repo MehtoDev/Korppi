@@ -18,8 +18,9 @@ use glow::HasContext;
 use korppi_rhi::lock;
 use korppi_rhi::SampleCount;
 use korppi_rhi::{
-    PresentMode, PresentTarget, RhiError, SwapchainDescriptor, SwapchainHandle, SwapchainImage,
-    SwapchainInfo, TextureDescriptor, TextureDimension, TextureFormat, TextureHandle, TextureUsage,
+    BoundResource, PresentMode, PresentTarget, RhiError, SwapchainDescriptor, SwapchainHandle,
+    SwapchainImage, SwapchainInfo, TextureDescriptor, TextureDimension, TextureFormat,
+    TextureHandle, TextureUsage,
 };
 use raw_window_handle::RawWindowHandle;
 use std::sync::atomic::Ordering;
@@ -108,13 +109,31 @@ impl GlThread {
     }
 
     fn destroy_swapchain_textures(&mut self, textures: &[TextureHandle]) {
-        for texture in textures {
-            let removed = lock(&self.resources.textures).remove(texture);
-            if let Some((entry, _)) = removed {
-                // Earlier commands that used the texture have been issued, and GL keeps it
-                // alive until they finish.
-                self.delete_texture_object(Some(texture.id()), entry.texture);
+        let mut destroyed: Vec<BoundResource> = Vec::with_capacity(textures.len());
+        let mut to_delete = Vec::with_capacity(textures.len());
+        {
+            let mut registry = lock(&self.resources.textures);
+            for &texture in textures {
+                destroyed.push(BoundResource::Texture(texture));
+                if let Some((entry, _)) = registry.remove(texture) {
+                    destroyed.extend(entry.views.iter().map(|&view| BoundResource::View(view)));
+                    to_delete.push((texture, entry));
+                }
             }
+        }
+        if !destroyed.is_empty() {
+            self.resources.invalidate_bind_groups(&destroyed);
+        }
+        for (texture, entry) in to_delete {
+            for &view_handle in &entry.views {
+                let view = lock(&self.resources.texture_views).remove(view_handle);
+                if let Some((view, _)) = view {
+                    self.delete_texture_object(None, view.texture);
+                }
+            }
+            // Earlier commands that used the texture have been issued, and GL keeps it
+            // alive until they finish.
+            self.delete_texture_object(Some(texture.id()), entry.texture);
         }
     }
 
@@ -326,16 +345,21 @@ impl OpenGlDevice {
         Ok(SwapchainHandle::from_parts(self.resources.device, id, 1))
     }
 
-    /// The id of a swapchain handle of this device; a handle of another device is rejected
-    /// (RHI-15), since swapchains are kept by id, not in a slot map.
+    /// The id of a swapchain handle of this device; a handle of another device or with a forged
+    /// generation is rejected (RHI-15, RGL-23), since swapchains are kept by id, not in a slot
+    /// map.
     fn swapchain_key(&self, handle: SwapchainHandle) -> Result<u32, RhiError> {
-        if handle.device() == self.resources.device {
-            Ok(handle.id())
-        } else {
-            Err(RhiError::InvalidHandle(format!(
+        if handle.device() != self.resources.device {
+            return Err(RhiError::InvalidHandle(format!(
                 "swapchain {handle:?} belongs to another device"
-            )))
+            )));
         }
+        if handle.generation() != 1 {
+            return Err(RhiError::InvalidHandle(format!(
+                "swapchain {handle:?} not found"
+            )));
+        }
+        Ok(handle.id())
     }
 
     pub(crate) fn destroy_swapchain_impl(&self, handle: SwapchainHandle) -> Result<(), RhiError> {

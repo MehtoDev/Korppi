@@ -4,7 +4,7 @@ use crate::registry::SceneRegistry;
 use crate::scene::{Scene, SceneError};
 use korppi_ecs::{Component, Entity, World};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 /// Property overrides targeting a specific entity in a prefab instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -104,11 +104,10 @@ impl Prefab {
 
         for over in overrides {
             if over.entity_index >= scene.entities.len() {
-                return Err(SceneError::UnregisteredComponent(format!(
-                    "Invalid entity index {} for prefab with {} entities",
-                    over.entity_index,
-                    scene.entities.len()
-                )));
+                return Err(SceneError::InvalidEntityIndex {
+                    index: over.entity_index,
+                    len: scene.entities.len(),
+                });
             }
             let entity_entry = &mut scene.entities[over.entity_index];
             for (comp_name, comp_value) in &over.component_overrides {
@@ -133,11 +132,10 @@ impl Prefab {
 
         for over in overrides {
             if over.entity_index >= scene.entities.len() {
-                return Err(SceneError::UnregisteredComponent(format!(
-                    "Invalid entity index {} for prefab with {} entities",
-                    over.entity_index,
-                    scene.entities.len()
-                )));
+                return Err(SceneError::InvalidEntityIndex {
+                    index: over.entity_index,
+                    len: scene.entities.len(),
+                });
             }
             let entity_entry = &mut scene.entities[over.entity_index];
             for (comp_name, comp_value) in &over.component_overrides {
@@ -178,7 +176,7 @@ impl Prefab {
 /// Fluent builder for configuring overrides on a prefab before spawning.
 pub struct PrefabBuilder<'a> {
     prefab: &'a Prefab,
-    overrides: HashMap<usize, BTreeMap<String, serde_json::Value>>,
+    overrides: BTreeMap<usize, BTreeMap<String, serde_json::Value>>,
 }
 
 impl<'a> PrefabBuilder<'a> {
@@ -187,7 +185,7 @@ impl<'a> PrefabBuilder<'a> {
     pub fn new(prefab: &'a Prefab) -> Self {
         Self {
             prefab,
-            overrides: HashMap::new(),
+            overrides: BTreeMap::new(),
         }
     }
 

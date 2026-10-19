@@ -247,6 +247,30 @@ impl Clone for SolverScratch3d {
 }
 
 impl SolverScratch3d {
+    /// Creates solver scratch buffers pre-allocated for `body_cap` bodies and `contact_cap` contacts.
+    #[must_use]
+    pub fn with_capacity(body_cap: usize, contact_cap: usize) -> Self {
+        let wide_cap = contact_cap.div_ceil(crate::solver_wide::WIDE).max(64);
+        Self {
+            start_positions: Vec::with_capacity(body_cap),
+            start_rotations: Vec::with_capacity(body_cap),
+            inv_inertia_world: Vec::with_capacity(body_cap),
+            motions: Vec::with_capacity(body_cap),
+            contacts: Vec::with_capacity(contact_cap),
+            contact_manifolds: Vec::with_capacity(contact_cap),
+            contact_refs: Vec::with_capacity(contact_cap),
+            scalar_contact_ranges: Vec::with_capacity(32),
+            wide_contacts: Vec::with_capacity(wide_cap),
+            wide_slots: Vec::with_capacity(wide_cap),
+            overflow_contacts: Vec::with_capacity(contact_cap),
+            overflow_refs: Vec::with_capacity(contact_cap),
+            colored_joints: Vec::with_capacity(64),
+            colors: Vec::with_capacity(32),
+            blocks: Vec::with_capacity(256),
+            stages: Vec::with_capacity(128),
+        }
+    }
+
     /// Body `index`'s centre of mass and rotation at the start of the last solved step.
     pub(crate) fn start_pose(&self, index: usize) -> (Vec3, Quat) {
         (self.start_positions[index], self.start_rotations[index])
@@ -308,7 +332,7 @@ pub fn solve_contacts_with_buffers(
     config: &SolverConfig3d,
     scratch: &mut SolverScratch3d,
 ) {
-    if bodies.is_empty() || dt <= 0.0 {
+    if bodies.is_empty() || !(dt > 0.0 && dt.is_finite()) {
         return;
     }
     let sub_steps = config.sub_steps.max(1);
@@ -357,6 +381,9 @@ pub fn solve_contacts_with_buffers(
     // Prepare joints (Box3D `b3PrepareJointsTask`)
     for joint in joints.iter_mut().flatten() {
         if is_active_joint(bodies, joint) {
+            if !config.enable_warm_starting {
+                joint.reset_impulses();
+            }
             joint.prepare(bodies, inv_inertia_world, h);
         }
     }
@@ -371,16 +398,14 @@ pub fn solve_contacts_with_buffers(
             }
         }
 
-        // Warm start
-        if config.enable_warm_starting {
-            for joint in joints.iter().flatten() {
-                if is_active_joint(bodies, joint) {
-                    joint.warm_start_step(bodies, motions);
-                }
+        // Warm start (substep 0 impulses were zeroed at prepare time if warm starting is disabled)
+        for joint in joints.iter().flatten() {
+            if is_active_joint(bodies, joint) {
+                joint.warm_start_step(bodies, motions);
             }
-            for contact in contacts.iter() {
-                contact.warm_start(bodies);
-            }
+        }
+        for contact in contacts.iter() {
+            contact.warm_start(bodies);
         }
 
         // Solve with bias
@@ -635,16 +660,16 @@ impl SolveContext3d<'_> {
         let colors = self.colors.len();
         let (mut body_sync, mut graph_sync) = (1, 1);
 
-        // 0: PrepareJoints, 1: PrepareWideContacts, 2: PrepareScalarContacts
-        self.main_stage(0, 1);
-        self.main_stage(1, 1);
-        self.main_stage(2, 1);
-
         let overflow = self.graph.color(self.graph.overflow_index());
         for &joint_idx in &overflow.joint_indices {
             // SAFETY: no block runs between stages, and overflow joints are in no block.
             unsafe { self.prepare_joint(joint_idx as u32) };
         }
+
+        // 0: PrepareJoints, 1: PrepareWideContacts, 2: PrepareScalarContacts
+        self.main_stage(0, 1);
+        self.main_stage(1, 1);
+        self.main_stage(2, 1);
 
         let mut stage = 3;
         for _ in 0..self.sub_steps {
@@ -654,25 +679,23 @@ impl SolveContext3d<'_> {
             index += 1;
             body_sync += 1;
 
-            // WarmStart
-            if self.enable_warm_starting {
-                for _ in 0..colors {
-                    self.main_stage(index, graph_sync);
-                    index += 1;
-                }
-                graph_sync += 1;
-                self.overflow(StageKind::WarmStart);
-            } else {
-                index += colors;
-            }
-
-            // Solve with bias
+            // WarmStart: overflow constraints have lower priority and run before colored constraints
+            // (Box3D `b3SolverTask`). When `enable_warm_starting == false`, impulses were zeroed at
+            // prepare time so substep 0 starts cold and substeps 1..sub_steps warm-start within the step.
+            self.overflow(StageKind::WarmStart);
             for _ in 0..colors {
                 self.main_stage(index, graph_sync);
                 index += 1;
             }
             graph_sync += 1;
+
+            // Solve with bias
             self.overflow(StageKind::Solve);
+            for _ in 0..colors {
+                self.main_stage(index, graph_sync);
+                index += 1;
+            }
+            graph_sync += 1;
 
             // IntegratePositions
             self.main_stage(index, body_sync);
@@ -680,12 +703,12 @@ impl SolveContext3d<'_> {
             body_sync += 1;
 
             // Relax without bias
+            self.overflow(StageKind::Relax);
             for _ in 0..colors {
                 self.main_stage(index, graph_sync);
                 index += 1;
             }
             graph_sync += 1;
-            self.overflow(StageKind::Relax);
         }
 
         stage += 1 + 2 * colors + 1 + colors;
@@ -696,19 +719,19 @@ impl SolveContext3d<'_> {
         // Restitution
         if self.any_restitution.load(Ordering::Relaxed) {
             for _ in 0..self.restitution_iterations {
+                self.overflow(StageKind::Restitution);
                 for color in 0..colors {
                     self.main_stage(stage + color, graph_sync);
                 }
                 graph_sync += 1;
-                self.overflow(StageKind::Restitution);
             }
         }
         stage += colors;
 
         // StoreWideImpulses (second use of wide_blocks) and StoreScalarImpulses (second use of scalar_blocks)
+        self.overflow(StageKind::StoreWideImpulses);
         self.main_stage(stage, 2);
         self.main_stage(stage + 1, 2);
-        self.overflow(StageKind::StoreWideImpulses);
     }
 
     fn execute_block(&self, stage: &Stage, block: &SyncBlock) {
@@ -856,6 +879,9 @@ impl SolveContext3d<'_> {
             let bodies_slice =
                 unsafe { std::slice::from_raw_parts(self.bodies.get(0), self.bodies.len()) };
             if is_active_joint(bodies_slice, joint) {
+                if !self.enable_warm_starting {
+                    joint.reset_impulses();
+                }
                 joint.prepare(bodies_slice, self.inv_inertia_world, self.h);
             }
         }

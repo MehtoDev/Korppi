@@ -16,7 +16,7 @@
 //! body ready to sleep is the island split via union-find (`split_island`), at most one island per
 //! step, the sleepiest candidate first.
 
-use crate::body::{BodyType, RigidBody};
+use crate::body::BodyType;
 use crate::contact::NULL;
 use crate::world::PhysicsWorld;
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,9 @@ const fn null_u32() -> u32 {
 /// Body links tracking solver set and persistent island membership (Box3D `b3Body`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BodyLinks3d {
+    /// Mobility type recorded by the world (`set_body_type` / `flush_touched_bodies`).
+    #[serde(default)]
+    pub body_type: BodyType,
     /// Solver set ID (0 = static, 1 = disabled, 2 = awake, >= 3 = sleeping).
     pub set: u32,
     /// Index in `sets[set].bodies`.
@@ -69,6 +72,7 @@ pub struct BodyLinks3d {
 impl Default for BodyLinks3d {
     fn default() -> Self {
         Self {
+            body_type: BodyType::Static,
             set: NULL,
             local: NULL,
             island: NULL,
@@ -572,7 +576,12 @@ impl PhysicsWorld {
         let id = if let Some(id) = self.free_islands.pop() {
             id
         } else {
-            self.islands.push(Island3d::default());
+            self.islands.push(Island3d {
+                bodies: Vec::with_capacity(256),
+                contacts: Vec::with_capacity(512),
+                joints: Vec::with_capacity(16),
+                ..Island3d::default()
+            });
             self.islands.len() as u32 - 1
         };
         let islands = &mut self.sets[set as usize].islands;
@@ -1034,80 +1043,5 @@ impl PhysicsWorld {
                 );
             }
         }
-    }
-}
-
-/// Legacy graph-based island manager preserved for backward compatibility.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct IslandManager3d {
-    parent: Vec<u32>,
-    sleeping: Vec<bool>,
-    /// Solver set and island tracking for each body.
-    pub body_links: Vec<BodyLinks3d>,
-}
-
-impl PartialEq for IslandManager3d {
-    fn eq(&self, other: &Self) -> bool {
-        self.parent == other.parent
-            && self.sleeping == other.sleeping
-            && self.body_links == other.body_links
-    }
-}
-
-impl Eq for IslandManager3d {}
-
-impl IslandManager3d {
-    /// Creates an empty island manager.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Registers a body into the island manager.
-    pub fn register_body(&mut self, body_id: u32, sleeping: bool) {
-        let idx = body_id as usize;
-        if self.parent.len() <= idx {
-            self.parent.resize(idx + 1, 0);
-            self.sleeping.resize(idx + 1, false);
-            self.body_links.resize(idx + 1, BodyLinks3d::default());
-        }
-        self.parent[idx] = body_id;
-        self.sleeping[idx] = sleeping;
-        self.body_links[idx] = BodyLinks3d {
-            set: if sleeping {
-                FIRST_SLEEPING_SET + body_id
-            } else {
-                AWAKE_SET
-            },
-            island: body_id,
-            ..BodyLinks3d::default()
-        };
-    }
-
-    /// Returns the solver set ID for `body_id`.
-    #[must_use]
-    pub fn body_solver_set(&self, body_id: u32) -> u32 {
-        self.body_links
-            .get(body_id as usize)
-            .map_or(AWAKE_SET, |l| l.set)
-    }
-
-    /// Sets the solver set for `body_id`.
-    pub fn set_body_set(&mut self, body_id: u32, set: u32) {
-        let idx = body_id as usize;
-        if self.body_links.len() <= idx {
-            self.body_links.resize(idx + 1, BodyLinks3d::default());
-        }
-        self.body_links[idx].set = set;
-    }
-
-    /// Updates sleeping states for a slice of bodies (legacy helper).
-    pub fn update_islands(
-        &mut self,
-        _bodies: &mut [RigidBody],
-        _contacts: impl Iterator<Item = (u32, u32)>,
-        _joints: impl Iterator<Item = (u32, u32)>,
-        _dt: f32,
-    ) {
     }
 }

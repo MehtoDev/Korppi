@@ -12,12 +12,19 @@ fn oct_sign(val: f32) -> f32 {
     }
 }
 
-/// Projects a 3D unit direction vector onto a 2D octahedral UV coordinate in $[0, 1]^2$.
+/// Projects a 3D unit direction vector onto a 2D octahedral UV coordinate in $[0, 1]^2$ (`RND-25`).
 pub fn encode_octahedral(direction: Vec3) -> Vec2 {
-    let norm = direction.normalize();
+    if !direction.is_finite() {
+        return Vec2::splat(0.5);
+    }
+    let len_sq = direction.length_squared();
+    if len_sq <= 1e-12 {
+        return Vec2::splat(0.5);
+    }
+    let norm = direction / len_sq.sqrt();
     let l1_norm = norm.x.abs() + norm.y.abs() + norm.z.abs();
 
-    if l1_norm < 1e-6 {
+    if l1_norm <= 1e-6 {
         return Vec2::splat(0.5);
     }
 
@@ -34,6 +41,9 @@ pub fn encode_octahedral(direction: Vec3) -> Vec2 {
 
 /// Unfolds a 2D octahedral UV coordinate in $[0, 1]^2$ back to a 3D unit direction vector.
 pub fn decode_octahedral(uv: Vec2) -> Vec3 {
+    if !uv.is_finite() {
+        return Vec3::Z;
+    }
     let p = uv * 2.0 - Vec2::splat(1.0);
     let mut v = Vec3::new(p.x, p.y, 1.0 - p.x.abs() - p.y.abs());
 
@@ -44,5 +54,5 @@ pub fn decode_octahedral(uv: Vec2) -> Vec3 {
         v.y = vy;
     }
 
-    v.normalize()
+    v.try_normalize().unwrap_or(Vec3::Z)
 }

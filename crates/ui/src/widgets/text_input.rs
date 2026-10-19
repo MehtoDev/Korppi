@@ -52,9 +52,15 @@ impl LineEdit {
         &self.text
     }
 
-    /// Replaces the text content and clamps caret column.
+    /// Replaces the text content, enforces `max_length`, clears selection, and clamps caret column.
     pub fn set_text(&mut self, text: impl Into<String>) {
-        self.text = text.into();
+        let raw = text.into();
+        self.text = if self.max_length > 0 {
+            raw.chars().take(self.max_length).collect()
+        } else {
+            raw
+        };
+        self.selection = None;
         let len = self.text.chars().count();
         if self.caret_column > len {
             self.caret_column = len;
@@ -73,14 +79,34 @@ impl LineEdit {
         self.caret_column = col.min(len);
     }
 
-    /// Inserts text at the current caret column and advances the caret.
+    fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection.take() else {
+            return false;
+        };
+        let mut chars: Vec<char> = self.text.chars().collect();
+        let lo = start.min(end).min(chars.len());
+        let hi = start.max(end).min(chars.len());
+        if lo < hi {
+            chars.drain(lo..hi);
+            self.text = chars.into_iter().collect();
+            self.caret_column = lo;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Inserts text at the current caret column (replacing any active selection) and advances the caret.
     pub fn insert_text(&mut self, input: &str) {
         if !self.editable {
             return;
         }
 
+        let _ = self.delete_selection();
+
         let mut chars: Vec<char> = self.text.chars().collect();
         let col = self.caret_column.min(chars.len());
+        self.caret_column = col;
 
         let input_chars: Vec<char> = input.chars().collect();
         for (i, &ch) in input_chars.iter().enumerate() {
@@ -94,9 +120,12 @@ impl LineEdit {
         self.text = chars.into_iter().collect();
     }
 
-    /// Deletes the character immediately before the caret (Backspace).
+    /// Deletes the active selection or the character immediately before the caret (Backspace).
     pub fn delete_char_before_caret(&mut self) {
-        if !self.editable || self.caret_column == 0 {
+        if !self.editable {
+            return;
+        }
+        if self.delete_selection() || self.caret_column == 0 {
             return;
         }
 
@@ -108,9 +137,12 @@ impl LineEdit {
         }
     }
 
-    /// Deletes the character immediately at the caret (Delete key).
+    /// Deletes the active selection or the character immediately at the caret (Delete key).
     pub fn delete_char_at_caret(&mut self) {
         if !self.editable {
+            return;
+        }
+        if self.delete_selection() {
             return;
         }
 
@@ -137,7 +169,12 @@ impl LineEdit {
     /// Returns the currently selected substring slice, if any.
     pub fn selected_text(&self) -> Option<&str> {
         let (start, end) = self.selection?;
-        let (lo, hi) = (start.min(end), start.max(end));
+        let char_count = self.text.chars().count();
+        let lo = start.min(end).min(char_count);
+        let hi = start.max(end).min(char_count);
+        if lo == hi {
+            return None;
+        }
 
         let mut byte_start = None;
         let mut byte_end = None;
@@ -151,10 +188,10 @@ impl LineEdit {
             }
         }
 
-        if byte_start.is_none() && lo == self.text.chars().count() {
+        if byte_start.is_none() && lo == char_count {
             byte_start = Some(self.text.len());
         }
-        if byte_end.is_none() && hi >= self.text.chars().count() {
+        if byte_end.is_none() && hi >= char_count {
             byte_end = Some(self.text.len());
         }
 
@@ -164,14 +201,22 @@ impl LineEdit {
         }
     }
 
-    /// Formats the display string, substituting secret characters if `secret` is true.
-    pub fn display_text(&self) -> String {
+    /// Writes the display string into `out` without allocating when `out` has sufficient capacity.
+    pub fn write_display_text(&self, out: &mut String) {
+        out.clear();
         if self.secret {
             let count = self.text.chars().count();
-            std::iter::repeat_n(self.secret_character, count).collect()
+            out.extend(std::iter::repeat_n(self.secret_character, count));
         } else {
-            self.text.clone()
+            out.push_str(&self.text);
         }
+    }
+
+    /// Formats the display string, substituting secret characters if `secret` is true.
+    pub fn display_text(&self) -> String {
+        let mut out = String::with_capacity(self.text.len());
+        self.write_display_text(&mut out);
+        out
     }
 }
 
@@ -301,6 +346,47 @@ impl TextEdit {
 
         self.text = self.lines.join("\n");
         self.clamp_caret();
+    }
+
+    /// Deletes the character immediately before the caret (Backspace), merging lines at column 0.
+    pub fn delete_char_before_caret(&mut self) {
+        if !self.editable {
+            return;
+        }
+        self.clamp_caret();
+        if self.caret_column > 0 {
+            let mut chars: Vec<char> = self.lines[self.caret_line].chars().collect();
+            if self.caret_column <= chars.len() {
+                chars.remove(self.caret_column - 1);
+                self.caret_column -= 1;
+                self.lines[self.caret_line] = chars.into_iter().collect();
+                self.text = self.lines.join("\n");
+            }
+        } else if self.caret_line > 0 {
+            let cur = self.lines.remove(self.caret_line);
+            self.caret_line -= 1;
+            self.caret_column = self.lines[self.caret_line].chars().count();
+            self.lines[self.caret_line].push_str(&cur);
+            self.text = self.lines.join("\n");
+        }
+    }
+
+    /// Deletes the character immediately at the caret (Delete), merging with the next line at end-of-line.
+    pub fn delete_char_at_caret(&mut self) {
+        if !self.editable {
+            return;
+        }
+        self.clamp_caret();
+        let mut chars: Vec<char> = self.lines[self.caret_line].chars().collect();
+        if self.caret_column < chars.len() {
+            chars.remove(self.caret_column);
+            self.lines[self.caret_line] = chars.into_iter().collect();
+            self.text = self.lines.join("\n");
+        } else if self.caret_line + 1 < self.lines.len() {
+            let next = self.lines.remove(self.caret_line + 1);
+            self.lines[self.caret_line].push_str(&next);
+            self.text = self.lines.join("\n");
+        }
     }
 
     fn clamp_caret(&mut self) {

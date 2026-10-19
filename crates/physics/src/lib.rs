@@ -47,8 +47,8 @@ pub use events::{
 pub use height_field::{HeightField3d, HeightFieldOptions, HEIGHT_FIELD_HOLE};
 pub use hull::Hull3d;
 pub use island::{
-    BodyLinks3d, IslandManager3d, SolverSet3d, AWAKE_SET, DISABLED_SET, FIRST_SLEEPING_SET,
-    STATIC_SET, TIME_TO_SLEEP,
+    BodyLinks3d, SolverSet3d, AWAKE_SET, DISABLED_SET, FIRST_SLEEPING_SET, STATIC_SET,
+    TIME_TO_SLEEP,
 };
 pub use joint::{
     get_swing_angle, DistanceJoint, FilterJoint, Frame3d, Joint, JointBase3d, MotorJoint,
@@ -59,6 +59,7 @@ pub use material::{
     default_friction_callback, default_restitution_callback, FrictionCallback3d,
     RestitutionCallback3d, SurfaceMaterial3d,
 };
+pub use math::{Transform, Transform3d};
 pub use mesh::{Mesh3d, MeshEdge, MeshOptions, MeshRayHit, MeshTriangle};
 pub use mesh_contact::MeshContactCache;
 pub use narrowphase::{

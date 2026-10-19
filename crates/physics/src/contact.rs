@@ -120,7 +120,7 @@ impl Contact3d {
             color: NULL,
             island: NULL,
             island_index: NULL,
-            manifolds: Vec::with_capacity(4),
+            manifolds: Vec::new(),
             is_touching: false,
             was_touching: false,
             cache: ContactCache::default(),
@@ -213,7 +213,9 @@ impl ContactManager3d {
             free: Vec::with_capacity(capacity),
             body_heads: Vec::with_capacity(capacity),
             index: HashMap::with_capacity(capacity),
-            pool: Vec::with_capacity(capacity),
+            pool: (0..capacity)
+                .map(|_| (Vec::with_capacity(4), MeshContactCache::default()))
+                .collect(),
         }
     }
 
@@ -278,18 +280,25 @@ impl ContactManager3d {
         self.body_heads.get(body as usize).copied().unwrap_or(NULL)
     }
 
+    /// Iterates over the contact slots attached to `body` in $O(\text{degree})$ without allocating.
+    pub(crate) fn body_contact_slots(&self, body: u32) -> impl Iterator<Item = u32> + '_ {
+        let mut slot = self.body_head(body);
+        std::iter::from_fn(move || {
+            if slot == NULL {
+                return None;
+            }
+            let current = slot;
+            let c = self.at(current);
+            let edge = usize::from(c.body_b == body);
+            slot = c.edges[edge].next;
+            Some(current)
+        })
+    }
+
     /// Contact slots attached to `body`, walked in $O(\text{degree})$ via the body's contact list.
     #[must_use]
     pub fn body_contacts(&self, body: u32) -> Vec<u32> {
-        let mut out = Vec::new();
-        let mut slot = self.body_head(body);
-        while slot != NULL {
-            let c = self.at(slot);
-            let edge = usize::from(c.body_b == body);
-            out.push(slot);
-            slot = c.edges[edge].next;
-        }
-        out
+        self.body_contact_slots(body).collect()
     }
 
     /// The live contacts, in slot order.
@@ -304,6 +313,8 @@ impl ContactManager3d {
         if let Some((manifolds, mesh_cache)) = self.pool.pop() {
             contact.manifolds = manifolds;
             contact.mesh_cache = mesh_cache;
+        } else {
+            contact.manifolds.reserve(4);
         }
         debug_assert!(!self.index.contains_key(&key));
         let slot = match self.free.pop() {

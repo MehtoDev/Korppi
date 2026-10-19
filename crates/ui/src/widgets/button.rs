@@ -3,6 +3,7 @@
 use crate::input::UiEvent;
 use crate::widgets::alignment::HorizontalAlignment;
 use korppi_ecs::Component;
+use korppi_input::keyboard::KeyCode;
 use korppi_input::mouse::MouseButton;
 
 /// Interactive visual state of a Button.
@@ -38,6 +39,10 @@ pub struct Button {
     pub toggle_mode: bool,
     /// Whether the button is currently in the toggled pressed state.
     button_pressed: bool,
+    /// Whether a mouse left-button press started on this button and has not yet been released.
+    pressing: bool,
+    /// Whether the mouse cursor is currently inside this button.
+    hovered: bool,
 }
 
 impl Component for Button {}
@@ -53,6 +58,8 @@ impl Button {
             disabled: false,
             toggle_mode: false,
             button_pressed: false,
+            pressing: false,
+            hovered: false,
         }
     }
 
@@ -74,7 +81,7 @@ impl Button {
         if self.toggle_mode {
             self.button_pressed
         } else {
-            self.state == ButtonState::Pressed
+            self.state == ButtonState::Pressed || self.button_pressed
         }
     }
 
@@ -82,12 +89,16 @@ impl Button {
     #[inline]
     pub fn set_pressed(&mut self, pressed: bool) {
         self.button_pressed = pressed;
-        if !self.toggle_mode {
-            if pressed {
-                self.state = ButtonState::Pressed;
-            } else if self.state == ButtonState::Pressed {
-                self.state = ButtonState::Normal;
-            }
+        if self.disabled {
+            self.state = ButtonState::Disabled;
+        } else if pressed {
+            self.state = ButtonState::Pressed;
+        } else if self.state == ButtonState::Pressed {
+            self.state = if self.hovered {
+                ButtonState::Hover
+            } else {
+                ButtonState::Normal
+            };
         }
     }
 
@@ -95,15 +106,22 @@ impl Button {
     pub fn set_disabled(&mut self, disabled: bool) {
         self.disabled = disabled;
         if disabled {
+            self.pressing = false;
             self.state = ButtonState::Disabled;
         } else if self.state == ButtonState::Disabled {
-            self.state = ButtonState::Normal;
+            self.state = if self.toggle_mode && self.button_pressed {
+                ButtonState::Pressed
+            } else if self.hovered {
+                ButtonState::Hover
+            } else {
+                ButtonState::Normal
+            };
         }
     }
 
     /// Processes an incoming UI event and updates button state.
     ///
-    /// Returns `true` if a full click activation occurred.
+    /// Returns `true` if a full click or keyboard activation occurred.
     pub fn handle_event(&mut self, event: &UiEvent) -> bool {
         if self.disabled {
             self.state = ButtonState::Disabled;
@@ -112,13 +130,19 @@ impl Button {
 
         match event {
             UiEvent::MouseEnter => {
-                if self.state != ButtonState::Pressed {
+                self.hovered = true;
+                if self.pressing || (self.toggle_mode && self.button_pressed) {
+                    self.state = ButtonState::Pressed;
+                } else {
                     self.state = ButtonState::Hover;
                 }
                 false
             }
             UiEvent::MouseExit => {
-                if self.state != ButtonState::Pressed {
+                self.hovered = false;
+                if self.toggle_mode && self.button_pressed {
+                    self.state = ButtonState::Pressed;
+                } else {
                     self.state = ButtonState::Normal;
                 }
                 false
@@ -128,9 +152,17 @@ impl Button {
                 pressed: true,
                 ..
             } => {
-                self.state = ButtonState::Pressed;
+                self.hovered = true;
+                self.pressing = true;
                 if self.toggle_mode {
                     self.button_pressed = !self.button_pressed;
+                    self.state = if self.button_pressed {
+                        ButtonState::Pressed
+                    } else {
+                        ButtonState::Hover
+                    };
+                } else {
+                    self.state = ButtonState::Pressed;
                 }
                 false
             }
@@ -139,9 +171,43 @@ impl Button {
                 pressed: false,
                 ..
             } => {
-                let was_pressed = self.state == ButtonState::Pressed;
-                self.state = ButtonState::Hover;
-                was_pressed
+                let clicked = self.pressing && self.hovered;
+                self.pressing = false;
+                self.state = if self.toggle_mode && self.button_pressed {
+                    ButtonState::Pressed
+                } else if self.hovered {
+                    ButtonState::Hover
+                } else {
+                    ButtonState::Normal
+                };
+                clicked
+            }
+            UiEvent::KeyDown {
+                key: KeyCode::Enter | KeyCode::Space,
+            } => {
+                if self.toggle_mode {
+                    self.button_pressed = !self.button_pressed;
+                    self.state = if self.button_pressed {
+                        ButtonState::Pressed
+                    } else {
+                        ButtonState::Focused
+                    };
+                } else {
+                    self.state = ButtonState::Pressed;
+                }
+                true
+            }
+            UiEvent::KeyUp {
+                key: KeyCode::Enter | KeyCode::Space,
+            } => {
+                if !self.toggle_mode && self.state == ButtonState::Pressed {
+                    self.state = if self.hovered {
+                        ButtonState::Hover
+                    } else {
+                        ButtonState::Focused
+                    };
+                }
+                false
             }
             UiEvent::FocusGained => {
                 if self.state == ButtonState::Normal {
@@ -150,8 +216,15 @@ impl Button {
                 false
             }
             UiEvent::FocusLost => {
+                self.pressing = false;
                 if self.state == ButtonState::Focused {
-                    self.state = ButtonState::Normal;
+                    self.state = if self.toggle_mode && self.button_pressed {
+                        ButtonState::Pressed
+                    } else if self.hovered {
+                        ButtonState::Hover
+                    } else {
+                        ButtonState::Normal
+                    };
                 }
                 false
             }

@@ -1,7 +1,7 @@
 //! Front-to-back point-in-rect hit testing respecting Godot-style mouse filtering.
 
 use crate::control::{Control, MouseFilter};
-use crate::layout::hierarchy::ResolvedRect;
+use crate::layout::hierarchy::{is_effectively_visible, ResolvedRect};
 use korppi_ecs::{Entity, World};
 use korppi_math::Vec2;
 
@@ -21,8 +21,13 @@ pub fn collect_front_to_back_order(world: &World) -> Vec<Entity> {
         }
     }
 
+    roots.sort_by_key(|&e| {
+        let z = world.get::<Control>(e).map_or(0, |c| c.z_index);
+        (z, e.index())
+    });
+
     let mut result = Vec::new();
-    // Traverse roots in reverse order so later spawned root controls are tested first
+    // Traverse roots in reverse order so higher z_index / later spawned root controls are tested first
     for &root in roots.iter().rev() {
         collect_node_front_to_back(world, root, &mut result);
     }
@@ -31,9 +36,11 @@ pub fn collect_front_to_back_order(world: &World) -> Vec<Entity> {
 
 fn collect_node_front_to_back(world: &World, entity: Entity, out: &mut Vec<Entity>) {
     // In GUI rendering, children are drawn on top of their parent.
-    // Later children in the array are drawn on top of earlier children.
-    // Therefore, front-to-back traversal visits children in reverse order, then self.
-    for &child in world.children(entity).iter().rev() {
+    // Higher z_index and later children in the array are drawn on top of earlier children.
+    // Therefore, front-to-back traversal visits children in reverse draw order, then self.
+    let mut children: Vec<Entity> = world.children(entity).to_vec();
+    children.sort_by_key(|&c| world.get::<Control>(c).map_or(0, |ctl| ctl.z_index));
+    for &child in children.iter().rev() {
         collect_node_front_to_back(world, child, out);
     }
     out.push(entity);
@@ -67,6 +74,10 @@ pub fn hit_test_controls(world: &World, position: Vec2) -> Vec<Entity> {
     let mut hits = Vec::new();
 
     for entity in order {
+        if !is_effectively_visible(world, entity) {
+            continue;
+        }
+
         let (control, rect) = match (
             world.get::<Control>(entity),
             world.get::<ResolvedRect>(entity),
@@ -74,10 +85,6 @@ pub fn hit_test_controls(world: &World, position: Vec2) -> Vec<Entity> {
             (Some(c), Some(r)) => (c, r),
             _ => continue,
         };
-
-        if !control.visible {
-            continue;
-        }
 
         if is_clipped_by_ancestor(world, entity, position) {
             continue;

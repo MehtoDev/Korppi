@@ -19,6 +19,12 @@ pub struct RegisteredClip {
     pub sample_rate: u32,
 }
 
+#[derive(Copy, Clone, Debug)]
+struct CachedClip {
+    clip: RegisteredClip,
+    last_used: u64,
+}
+
 /// Single mixer voices for custom systems, such as adaptive music or granular effects: a world
 /// resource wrapping the game thread's [`MixerControl`].
 ///
@@ -29,7 +35,8 @@ pub struct RegisteredClip {
 pub struct AudioVoices {
     control: MixerControl,
     /// Clips from the asset server registered with the mixer, by asset.
-    clips: HashMap<AssetId, RegisteredClip>,
+    clips: HashMap<AssetId, CachedClip>,
+    access_tick: u64,
 }
 
 impl AudioVoices {
@@ -39,6 +46,7 @@ impl AudioVoices {
         Self {
             control,
             clips: HashMap::new(),
+            access_tick: 0,
         }
     }
 
@@ -53,12 +61,26 @@ impl AudioVoices {
         assets: &AssetServer,
         handle: &AssetHandle<AudioClip>,
     ) -> AudioResult<Option<RegisteredClip>> {
-        if let Some(&clip) = self.clips.get(&handle.id()) {
-            return Ok(Some(clip));
+        self.access_tick = self.access_tick.wrapping_add(1);
+        let tick = self.access_tick;
+        if let Some(entry) = self.clips.get_mut(&handle.id()) {
+            entry.last_used = tick;
+            return Ok(Some(entry.clip));
         }
         let Some(asset) = assets.get(handle) else {
             return Ok(None);
         };
+        if self.control.free_clip_slots() == 0 {
+            if let Some((&victim_asset, &victim)) = self
+                .clips
+                .iter()
+                .filter(|(_, entry)| !self.control.is_clip_in_use(entry.clip.id))
+                .min_by_key(|(_, entry)| entry.last_used)
+            {
+                self.clips.remove(&victim_asset);
+                self.control.reclaim_unused_clip(victim.clip.id);
+            }
+        }
         let data = Arc::new(ClipData::from(AudioClip::clone(&asset)));
         let (frames, sample_rate) = (data.frames(), data.sample_rate());
         let clip = RegisteredClip {
@@ -66,7 +88,13 @@ impl AudioVoices {
             frames,
             sample_rate,
         };
-        self.clips.insert(handle.id(), clip);
+        self.clips.insert(
+            handle.id(),
+            CachedClip {
+                clip,
+                last_used: tick,
+            },
+        );
         Ok(Some(clip))
     }
 
@@ -218,5 +246,17 @@ impl AudioVoices {
     /// Frees ended voices' slots and drops released clips; the engine calls it every tick.
     pub fn update(&mut self) {
         self.control.update();
+        if self.control.free_clip_slots() == 0 {
+            if let Some((&victim_asset, &victim)) = self
+                .clips
+                .iter()
+                .filter(|(_, entry)| !self.control.is_clip_in_use(entry.clip.id))
+                .min_by_key(|(_, entry)| entry.last_used)
+            {
+                if self.control.release_clip(victim.clip.id).is_ok() {
+                    self.clips.remove(&victim_asset);
+                }
+            }
+        }
     }
 }

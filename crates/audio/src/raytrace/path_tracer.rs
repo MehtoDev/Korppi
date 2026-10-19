@@ -150,7 +150,7 @@ impl TraceStatistics {
         Some(std::array::from_fn(|band| {
             let alpha = (self.absorption[band] / self.reflections as f64).clamp(1e-6, 0.999_999);
             let ln = (1.0 - alpha).ln();
-            let per_reflection = (-ln * (1.0 + spread / 2.0 * ln)).max(1e-9);
+            let per_reflection = (-ln / (1.0 - spread / 2.0 * ln)).max(1e-9);
             let rate = per_reflection + f64::from(AIR_ABSORPTION_COEFFS[band]) * mean;
             ((1e6f64).ln() * mean / (f64::from(SPEED_OF_SOUND) * rate)) as f32
         }))
@@ -346,31 +346,35 @@ impl PathTracer {
                 }
                 origin = hit.point + hit.normal * SURFACE_OFFSET;
                 // Next-event estimation: a shadow ray from each bounce to each receiver gathers
-                // energy reflected around corners.
-                for (receiver, response) in receivers.iter().zip(&mut responses) {
-                    let to_receiver = *receiver - origin;
-                    let dist = to_receiver.length();
-                    if dist <= SURFACE_OFFSET || length + dist > reach {
-                        continue;
-                    }
-                    let dir = to_receiver / dist;
-                    let cos = hit.normal.dot(dir);
-                    if cos <= 0.0 {
-                        continue;
-                    }
-                    let shadow = AcousticRay {
-                        origin,
-                        direction: dir,
-                    };
-                    if geometry
-                        .raycast_closest(&shadow, dist - SURFACE_OFFSET)
-                        .is_none()
-                    {
-                        let total_dist = (length + dist).max(1e-3);
-                        let weight = cos / (4.0 * PI * total_dist * total_dist);
-                        for band in 0..3 {
-                            response.bounce_energy[band] +=
-                                energy[band] * (-AIR_ABSORPTION_COEFFS[band] * dist).exp() * weight;
+                // energy reflected diffusely around corners, scaled by the surface's scattering.
+                let scattering = hit.material.scattering.clamp(0.0, 1.0);
+                if scattering > 0.0 {
+                    for (receiver, response) in receivers.iter().zip(&mut responses) {
+                        let to_receiver = *receiver - origin;
+                        let dist = to_receiver.length();
+                        if dist <= SURFACE_OFFSET || length + dist > reach {
+                            continue;
+                        }
+                        let dir = to_receiver / dist;
+                        let cos = hit.normal.dot(dir);
+                        if cos <= 0.0 {
+                            continue;
+                        }
+                        let shadow = AcousticRay {
+                            origin,
+                            direction: dir,
+                        };
+                        if geometry
+                            .raycast_closest(&shadow, dist - SURFACE_OFFSET)
+                            .is_none()
+                        {
+                            let total_dist = (length + dist).max(1e-3);
+                            let weight = scattering * cos / (4.0 * PI * total_dist * total_dist);
+                            for band in 0..3 {
+                                response.bounce_energy[band] += energy[band]
+                                    * (-AIR_ABSORPTION_COEFFS[band] * dist).exp()
+                                    * weight;
+                            }
                         }
                     }
                 }

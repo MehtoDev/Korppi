@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 korppi_core = { path = "../../crates/core" }
+korppi_ecs = { path = "../../crates/ecs" }
 korppi_math = { path = "../../crates/math" }
 korppi_physics = { path = "../../crates/physics" }
 korppi_engine = { path = "../../crates/engine" }
@@ -25,7 +26,6 @@ korppi_input = { path = "../../crates/input" }
 korppi_ui = { path = "../../crates/ui" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-winit = { workspace = true }
 
 [dev-dependencies]
 korppi_rhi_conformance = { path = "../../crates/rhi_conformance" }

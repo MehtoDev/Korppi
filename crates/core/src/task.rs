@@ -63,9 +63,9 @@ pub fn parallel_for(
         return;
     }
     let workers = executor.worker_count().max(1);
-    let max_blocks = 8 * workers;
+    let max_blocks = 8usize.saturating_mul(workers);
     let min_range = min_range.max(1);
-    let block_size = if item_count <= min_range * max_blocks {
+    let block_size = if item_count <= min_range.saturating_mul(max_blocks) {
         min_range
     } else {
         item_count.div_ceil(max_blocks)
@@ -82,7 +82,11 @@ pub fn parallel_for(
             return;
         }
         let start = block * block_size;
-        task(start, (start + block_size).min(item_count), worker);
+        task(
+            start,
+            start.saturating_add(block_size).min(item_count),
+            worker,
+        );
     };
     executor.run(workers.min(block_count), &|_, worker| claim(worker));
     claim(0);
@@ -208,8 +212,15 @@ impl std::fmt::Debug for WorkerPool {
 impl WorkerPool {
     /// A pool of `worker_count` workers: the calling thread and `worker_count - 1` threads
     /// (at least one worker).
+    ///
+    /// # Panics
+    /// Panics if `worker_count > 65_535`.
     #[must_use]
     pub fn new(worker_count: usize) -> Self {
+        assert!(
+            worker_count <= BUSY_MASK as usize,
+            "WorkerPool worker_count ({worker_count}) exceeds maximum supported workers ({BUSY_MASK})"
+        );
         let nop: &(dyn Fn(usize, usize) + Sync + 'static) = &|_, _| {};
         let shared = Arc::new(Shared {
             status: AtomicU64::new(0),

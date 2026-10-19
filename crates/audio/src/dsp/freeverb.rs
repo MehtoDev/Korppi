@@ -109,26 +109,35 @@ impl Freeverb {
     /// Constructs a new Freeverb instance tuned for the given sample rate.
     #[must_use]
     pub fn new(sample_rate: f32) -> Self {
+        let sample_rate = if sample_rate.is_finite() {
+            sample_rate.max(100.0)
+        } else {
+            44_100.0
+        };
         let scale = sample_rate / 44_100.0;
 
         let combs_l = COMB_TUNING_L
             .iter()
-            .map(|&s| CombFilter::new((s as f32 * scale).round() as usize))
+            .map(|&s| CombFilter::new(((s as f32 * scale).round() as usize).max(1)))
             .collect();
 
         let combs_r = COMB_TUNING_L
             .iter()
-            .map(|&s| CombFilter::new(((s + STEREO_SPREAD) as f32 * scale).round() as usize))
+            .map(|&s| {
+                CombFilter::new((((s + STEREO_SPREAD) as f32 * scale).round() as usize).max(1))
+            })
             .collect();
 
         let allpasses_l = ALLPASS_TUNING_L
             .iter()
-            .map(|&s| AllpassFilter::new((s as f32 * scale).round() as usize))
+            .map(|&s| AllpassFilter::new(((s as f32 * scale).round() as usize).max(1)))
             .collect();
 
         let allpasses_r = ALLPASS_TUNING_L
             .iter()
-            .map(|&s| AllpassFilter::new(((s + STEREO_SPREAD) as f32 * scale).round() as usize))
+            .map(|&s| {
+                AllpassFilter::new((((s + STEREO_SPREAD) as f32 * scale).round() as usize).max(1))
+            })
             .collect();
 
         let mut reverb = Self {

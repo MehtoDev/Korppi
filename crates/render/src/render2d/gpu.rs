@@ -30,30 +30,46 @@ pub const QUAD_BATCH_FRAG_SPIRV: &[u8] = include_bytes!("shaders/quad_batch.frag
 /// Bytes of the `Canvas` push-constant block of `quad_batch.vert`.
 const CANVAS_PUSH_CONSTANTS_SIZE: u32 = 16;
 
-/// A growable buffer of one frame slot.
-#[derive(Copy, Clone, Default)]
+type BufferSlice = (BufferHandle, u64);
+
+/// A growable per-frame-slot buffer supporting multiple sub-allocated uploads per frame (`RND-17`).
+#[derive(Clone, Default)]
 struct FrameBuffer {
     buffer: Option<BufferHandle>,
     capacity: u64,
+    cursor: u64,
+    retired: Vec<BufferHandle>,
 }
 
 impl FrameBuffer {
-    /// Writes `data`, replacing the buffer by one of twice the needed size if it is too small.
+    /// Resets the sub-allocation cursor for a new frame and destroys any buffers retired during
+    /// an earlier frame's mid-frame capacity growth (`RND-17`).
+    fn begin_frame(&mut self, device: &dyn GraphicsDevice) -> Result<(), RhiError> {
+        self.cursor = 0;
+        for old in self.retired.drain(..) {
+            device.destroy_buffer(old)?;
+        }
+        Ok(())
+    }
+
+    /// Writes `data` at the current aligned cursor offset, or allocates a larger buffer and
+    /// retires (without immediately destroying) the previous buffer if capacity is exceeded (`RND-17`).
     fn upload(
         &mut self,
         device: &dyn GraphicsDevice,
         usage: BufferUsage,
         label: &'static str,
         data: &[u8],
-    ) -> Result<BufferHandle, RhiError> {
+    ) -> Result<(BufferHandle, u64), RhiError> {
         let needed = data.len() as u64;
-        let buffer = match self.buffer {
-            Some(buffer) if self.capacity >= needed => buffer,
+        let aligned_offset = (self.cursor + 3) & !3;
+        let (buffer, offset) = match self.buffer {
+            Some(buffer) if aligned_offset + needed <= self.capacity => (buffer, aligned_offset),
             old => {
                 if let Some(old) = old {
-                    device.destroy_buffer(old)?;
+                    self.retired.push(old);
                 }
-                let capacity = needed.next_power_of_two().max(4096);
+                let capacity = (aligned_offset + needed).next_power_of_two().max(4096);
                 let buffer = device.create_buffer(
                     &BufferDescriptor {
                         size: capacity,
@@ -65,11 +81,12 @@ impl FrameBuffer {
                 )?;
                 self.buffer = Some(buffer);
                 self.capacity = capacity;
-                buffer
+                (buffer, 0)
             }
         };
-        device.write_buffer(buffer, 0, data)?;
-        Ok(buffer)
+        device.write_buffer(buffer, offset, data)?;
+        self.cursor = offset + needed;
+        Ok((buffer, offset))
     }
 }
 
@@ -86,6 +103,7 @@ pub struct QuadBatchRenderer {
     color_format: TextureFormat,
     vertices: [FrameBuffer; FRAMES_IN_FLIGHT],
     indices: [FrameBuffer; FRAMES_IN_FLIGHT],
+    active_slot: Option<usize>,
 }
 
 impl QuadBatchRenderer {
@@ -254,6 +272,53 @@ impl QuadBatchRenderer {
                 return Err(error);
             }
         };
+        let mut vertices: [FrameBuffer; FRAMES_IN_FLIGHT] =
+            std::array::from_fn(|_| FrameBuffer::default());
+        let mut indices: [FrameBuffer; FRAMES_IN_FLIGHT] =
+            std::array::from_fn(|_| FrameBuffer::default());
+        let init_buffers = (|| -> Result<(), RhiError> {
+            for slot in 0..FRAMES_IN_FLIGHT {
+                let vb = device.create_buffer(
+                    &BufferDescriptor {
+                        size: 4096,
+                        usage: BufferUsage::VERTEX,
+                        memory: MemoryUsage::CpuToGpu,
+                        label: Some("quad_batch_vertices"),
+                    },
+                    None,
+                )?;
+                vertices[slot].buffer = Some(vb);
+                vertices[slot].capacity = 4096;
+
+                let ib = device.create_buffer(
+                    &BufferDescriptor {
+                        size: 4096,
+                        usage: BufferUsage::INDEX,
+                        memory: MemoryUsage::CpuToGpu,
+                        label: Some("quad_batch_indices"),
+                    },
+                    None,
+                )?;
+                indices[slot].buffer = Some(ib);
+                indices[slot].capacity = 4096;
+            }
+            Ok(())
+        })();
+        if let Err(error) = init_buffers {
+            for fb in vertices.into_iter().chain(indices) {
+                if let Some(buf) = fb.buffer {
+                    let _ = device.destroy_buffer(buf);
+                }
+            }
+            let _ = device.destroy_pipeline(pipeline);
+            let _ = device.destroy_bind_group(white_bind_group);
+            let _ = device.destroy_texture(white_texture);
+            let _ = device.destroy_sampler(sampler);
+            let _ = device.destroy_bind_group_layout(bind_group_layout);
+            let _ = device.destroy_shader(vertex_shader);
+            let _ = device.destroy_shader(fragment_shader);
+            return Err(error);
+        }
         Ok(Self {
             vertex_shader,
             fragment_shader,
@@ -264,14 +329,56 @@ impl QuadBatchRenderer {
             texture_bind_groups: HashMap::new(),
             pipeline,
             color_format,
-            vertices: [FrameBuffer::default(); FRAMES_IN_FLIGHT],
-            indices: [FrameBuffer::default(); FRAMES_IN_FLIGHT],
+            vertices,
+            indices,
+            active_slot: None,
         })
     }
 
     /// Format of the targets this renderer draws into.
     pub fn color_format(&self) -> TextureFormat {
         self.color_format
+    }
+
+    /// Resets the sub-allocation cursors and reclaims retired buffers for frame slot `frame` (`RND-17`).
+    pub fn begin_frame(
+        &mut self,
+        device: &dyn GraphicsDevice,
+        frame: FrameIndex,
+    ) -> Result<(), RhiError> {
+        let slot = frame.index() % FRAMES_IN_FLIGHT;
+        self.vertices[slot].begin_frame(device)?;
+        self.indices[slot].begin_frame(device)?;
+        self.active_slot = Some(slot);
+        Ok(())
+    }
+
+    /// Evicts any cached bind group associated with `texture` (or its slot index) and destroys it (`RND-17`).
+    pub fn evict_texture(
+        &mut self,
+        device: &dyn GraphicsDevice,
+        texture: TextureHandle,
+    ) -> Result<(), RhiError> {
+        let stale_keys: Vec<TextureHandle> = self
+            .texture_bind_groups
+            .keys()
+            .copied()
+            .filter(|k| *k == texture || k.id() == texture.id())
+            .collect();
+        for k in stale_keys {
+            if let Some(bg) = self.texture_bind_groups.remove(&k) {
+                device.destroy_bind_group(bg)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Clears and destroys all cached texture bind groups (`RND-17`).
+    pub fn clear_texture_cache(&mut self, device: &dyn GraphicsDevice) -> Result<(), RhiError> {
+        for (_, bg) in self.texture_bind_groups.drain() {
+            device.destroy_bind_group(bg)?;
+        }
+        Ok(())
     }
 
     fn bind_group_for_texture(
@@ -284,6 +391,17 @@ impl QuadBatchRenderer {
         };
         if let Some(&bg) = self.texture_bind_groups.get(&tex) {
             return Ok(bg);
+        }
+        // Evict any stale bind group from a previous generation occupying the same texture slot (`RND-17`).
+        let stale: Option<TextureHandle> = self
+            .texture_bind_groups
+            .keys()
+            .copied()
+            .find(|k| k.id() == tex.id() && k.generation() != tex.generation());
+        if let Some(old_key) = stale {
+            if let Some(old_bg) = self.texture_bind_groups.remove(&old_key) {
+                device.destroy_bind_group(old_bg)?;
+            }
         }
         let bg = device.create_bind_group(&BindGroupDescriptor {
             layout: self.bind_group_layout,
@@ -306,11 +424,16 @@ impl QuadBatchRenderer {
         device: &dyn GraphicsDevice,
         frame: FrameIndex,
         batch: &QuadBatch2d,
-    ) -> Result<Option<(BufferHandle, BufferHandle)>, RhiError> {
+    ) -> Result<Option<(BufferSlice, BufferSlice)>, RhiError> {
+        let slot = frame.index() % FRAMES_IN_FLIGHT;
+        if self.active_slot != Some(slot) {
+            self.vertices[slot].begin_frame(device)?;
+            self.indices[slot].begin_frame(device)?;
+            self.active_slot = Some(slot);
+        }
         if batch.indices().is_empty() {
             return Ok(None);
         }
-        let slot = frame.index();
         let vertices = self.vertices[slot].upload(
             device,
             BufferUsage::VERTEX,
@@ -336,8 +459,8 @@ impl QuadBatchRenderer {
         target_size: (u32, u32),
         canvas_size: (f32, f32),
         batch: &QuadBatch2d,
-        vertices: BufferHandle,
-        indices: BufferHandle,
+        vertices: (BufferHandle, u64),
+        indices: (BufferHandle, u64),
     ) -> Result<(), RhiError> {
         let (width, height) = target_size;
         recorder.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
@@ -359,8 +482,8 @@ impl QuadBatchRenderer {
             *bytes = value.to_ne_bytes();
         }
         recorder.push_constants(0, &push)?;
-        recorder.bind_vertex_buffers(0, &[vertices], &[0]);
-        recorder.bind_index_buffer(indices, 0, IndexType::Uint32);
+        recorder.bind_vertex_buffers(0, &[vertices.0], &[vertices.1]);
+        recorder.bind_index_buffer(indices.0, indices.1, IndexType::Uint32);
 
         let fallback_run = [QuadBatchDraw {
             texture: None,
@@ -459,13 +582,13 @@ impl QuadBatchRenderer {
     /// Destroys the pipeline, bind groups, default texture, sampler, shaders and buffers.
     /// The GPU must be done with them.
     pub fn destroy(self, device: &dyn GraphicsDevice) -> Result<(), RhiError> {
-        for buffer in self
-            .vertices
-            .iter()
-            .chain(self.indices.iter())
-            .filter_map(|b| b.buffer)
-        {
-            device.destroy_buffer(buffer)?;
+        for fb in self.vertices.into_iter().chain(self.indices) {
+            if let Some(buffer) = fb.buffer {
+                device.destroy_buffer(buffer)?;
+            }
+            for old in fb.retired {
+                device.destroy_buffer(old)?;
+            }
         }
         for (_, bg) in self.texture_bind_groups {
             device.destroy_bind_group(bg)?;

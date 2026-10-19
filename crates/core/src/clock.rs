@@ -19,10 +19,14 @@ impl FixedClock {
     /// Creates a new `FixedClock` with the target tick rate (e.g., 60 for 60 Hz).
     ///
     /// # Panics
-    /// Panics if `tick_rate` is 0.
+    /// Panics if `tick_rate` is `0` or exceeds `1_000_000_000` Hz (1 ns timestep).
     #[must_use]
     pub fn new(tick_rate: u32) -> Self {
         assert!(tick_rate > 0, "tick_rate must be greater than zero");
+        assert!(
+            tick_rate <= 1_000_000_000,
+            "tick_rate ({tick_rate}) must not exceed 1_000_000_000 Hz (1 ns minimum timestep)"
+        );
         let nanos_per_tick = 1_000_000_000 / u64::from(tick_rate);
         let timestep = Duration::from_nanos(nanos_per_tick);
 
@@ -62,8 +66,8 @@ impl FixedClock {
     /// Advances the clock accumulator by the elapsed delta time.
     /// Clamps accumulator if it exceeds `max_sub_steps * timestep`.
     pub fn advance(&mut self, delta: Duration) {
-        self.accumulator += delta;
-        let max_accum = self.timestep * self.max_sub_steps;
+        self.accumulator = self.accumulator.saturating_add(delta);
+        let max_accum = self.timestep.saturating_mul(self.max_sub_steps);
         if self.accumulator > max_accum {
             self.accumulator = max_accum;
         }
@@ -92,8 +96,10 @@ impl FixedClock {
     /// Used for rendering interpolation between the previous and current physics states.
     #[must_use]
     pub fn alpha(&self) -> f32 {
+        const MAX_ALPHA_BELOW_ONE: f32 = f32::from_bits(1.0f32.to_bits() - 1);
         let accum_secs = self.accumulator.as_secs_f64();
         let step_secs = self.timestep.as_secs_f64();
-        (accum_secs / step_secs).clamp(0.0, 1.0) as f32
+        let ratio = (accum_secs / step_secs).clamp(0.0, 1.0) as f32;
+        ratio.min(MAX_ALPHA_BELOW_ONE)
     }
 }

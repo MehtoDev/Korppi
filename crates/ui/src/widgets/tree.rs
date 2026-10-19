@@ -42,21 +42,22 @@ impl Tree {
 
     /// Creates a new tree item with an optional parent.
     ///
-    /// If `parent` is `None`, adds the item as a root.
+    /// If `parent` is `None` or refers to an out-of-bounds item ID, adds the item as a root.
     pub fn create_item(&mut self, parent: Option<usize>, text: impl Into<String>) -> usize {
         let id = self.items.len();
+        let valid_parent = parent.filter(|&p_id| p_id < id);
         let item = TreeItem {
             id,
             text: text.into(),
             icon: None,
-            parent,
+            parent: valid_parent,
             children: Vec::new(),
             collapsed: false,
             selected: false,
         };
         self.items.push(item);
 
-        if let Some(p_id) = parent {
+        if let Some(p_id) = valid_parent {
             if let Some(p) = self.items.get_mut(p_id) {
                 p.children.push(id);
             }

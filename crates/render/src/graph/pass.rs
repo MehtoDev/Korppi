@@ -62,6 +62,7 @@ pub struct DepthAttachmentDesc {
 
 /// Execution context provided to pass recording callbacks.
 pub struct PassContext<'a> {
+    pub(crate) graph_id: u32,
     pub(crate) texture_slice: &'a [Option<TextureHandle>],
     pub(crate) buffer_slice: &'a [Option<BufferHandle>],
     pub(crate) texture_map: &'a HashMap<RenderGraphTextureHandle, TextureHandle>,
@@ -69,32 +70,42 @@ pub struct PassContext<'a> {
 }
 
 impl<'a> PassContext<'a> {
-    /// Resolves a virtual texture handle to its concrete physical RHI handle.
+    /// Attempts to resolve a virtual texture handle to its concrete physical RHI handle (`RND-21`).
     #[inline]
-    pub fn get_texture(&self, handle: RenderGraphTextureHandle) -> TextureHandle {
-        if let Some(Some(phys)) = self.texture_slice.get(handle.id() as usize) {
-            return *phys;
+    pub fn try_get_texture(&self, handle: RenderGraphTextureHandle) -> Option<TextureHandle> {
+        if handle.graph_id() == self.graph_id {
+            if let Some(Some(phys)) = self.texture_slice.get(handle.id() as usize) {
+                return Some(*phys);
+            }
         }
-        *self.texture_map.get(&handle).unwrap_or_else(|| {
-            panic!(
-                "PassContext: texture handle {:?} not resolved in compiled graph",
-                handle
-            )
-        })
+        self.texture_map.get(&handle).copied()
     }
 
-    /// Resolves a virtual buffer handle to its concrete physical RHI handle.
+    /// Resolves a virtual texture handle to its concrete physical RHI handle, returning an
+    /// invalid handle if `handle` was dead-pass-culled or foreign (`RND-21`).
+    #[inline]
+    pub fn get_texture(&self, handle: RenderGraphTextureHandle) -> TextureHandle {
+        self.try_get_texture(handle)
+            .unwrap_or_else(|| TextureHandle::new(u32::MAX, 0))
+    }
+
+    /// Attempts to resolve a virtual buffer handle to its concrete physical RHI handle (`RND-21`).
+    #[inline]
+    pub fn try_get_buffer(&self, handle: RenderGraphBufferHandle) -> Option<BufferHandle> {
+        if handle.graph_id() == self.graph_id {
+            if let Some(Some(phys)) = self.buffer_slice.get(handle.id() as usize) {
+                return Some(*phys);
+            }
+        }
+        self.buffer_map.get(&handle).copied()
+    }
+
+    /// Resolves a virtual buffer handle to its concrete physical RHI handle, returning an
+    /// invalid handle if `handle` was dead-pass-culled or foreign (`RND-21`).
     #[inline]
     pub fn get_buffer(&self, handle: RenderGraphBufferHandle) -> BufferHandle {
-        if let Some(Some(phys)) = self.buffer_slice.get(handle.id() as usize) {
-            return *phys;
-        }
-        *self.buffer_map.get(&handle).unwrap_or_else(|| {
-            panic!(
-                "PassContext: buffer handle {:?} not resolved in compiled graph",
-                handle
-            )
-        })
+        self.try_get_buffer(handle)
+            .unwrap_or_else(|| BufferHandle::new(u32::MAX, 0))
     }
 }
 

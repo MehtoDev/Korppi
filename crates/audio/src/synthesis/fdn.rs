@@ -68,6 +68,17 @@ struct Absorption {
 /// A first-order shelf's coefficients (`b0`, `b1`, `a1`) for a corner at `corner` Hz: gain `g` below
 /// it (`low`) or above it, and 1 on the other side; by the bilinear transform with prewarping.
 fn shelf(g: f32, corner: f32, sample_rate: f32, low: bool) -> [f32; 3] {
+    let sample_rate = if sample_rate.is_finite() {
+        sample_rate.max(100.0)
+    } else {
+        48_000.0
+    };
+    let corner = corner.clamp(10.0, sample_rate * 0.45);
+    let g = if g.is_finite() {
+        g.clamp(1e-3, 1e3)
+    } else {
+        1.0
+    };
     let k = (std::f32::consts::PI * corner / sample_rate).tan();
     let (b0, b1, a0, a1) = if low {
         (k * g + 1.0, k * g - 1.0, k + 1.0, k - 1.0)
@@ -79,11 +90,13 @@ fn shelf(g: f32, corner: f32, sample_rate: f32, low: bool) -> [f32; 3] {
 
 /// The magnitude of a first-order filter `[b0, b1, a1]` at `hz`.
 fn magnitude(coefficients: [f32; 3], hz: f32, sample_rate: f32) -> f32 {
-    let w = 2.0 * std::f32::consts::PI * hz / sample_rate;
+    let w = (2.0 * std::f32::consts::PI * hz / sample_rate).clamp(0.0, std::f32::consts::PI);
     let (c, s) = (w.cos(), w.sin());
     let [b0, b1, a1] = coefficients;
     let numerator = ((b0 + b1 * c).powi(2) + (b1 * s).powi(2)).sqrt();
-    let denominator = ((1.0 + a1 * c).powi(2) + (a1 * s).powi(2)).sqrt();
+    let denominator = ((1.0 + a1 * c).powi(2) + (a1 * s).powi(2))
+        .sqrt()
+        .max(1e-12);
     numerator / denominator
 }
 
@@ -94,29 +107,68 @@ impl Absorption {
     /// shelves overlap the bands a little, so their gains are found by a few fixed-point steps on
     /// the exact digital response, each moving a gain by its band's error.
     fn new(length: usize, rt60: [f32; 3], sample_rate: f32) -> Self {
+        let sample_rate = if sample_rate.is_finite() {
+            sample_rate.max(100.0)
+        } else {
+            48_000.0
+        };
         let seconds = length as f32 / sample_rate;
-        let target = rt60.map(|t| -60.0 * seconds / t.clamp(0.05, 30.0));
-        // Gains in dB: overall (mid), low shelf, high shelf.
-        let (mut mid, mut low, mut high) =
-            (target[1], target[0] - target[1], target[2] - target[1]);
+        let target = rt60.map(|t| {
+            let t = if t.is_finite() {
+                t.clamp(0.05, 30.0)
+            } else {
+                1.0
+            };
+            -60.0 * seconds / t
+        });
         let db = |gain: f32| 20.0 * gain.max(1e-12).log10();
-        let amp = |db: f32| 10f32.powf(db / 20.0);
-        for _ in 0..8 {
-            let low_shelf = shelf(amp(low), SHELF_CORNERS[0], sample_rate, true);
-            let high_shelf = shelf(amp(high), SHELF_CORNERS[1], sample_rate, false);
-            let response = RT60_BANDS.map(|hz| {
-                mid + db(magnitude(low_shelf, hz, sample_rate))
-                    + db(magnitude(high_shelf, hz, sample_rate))
-            });
-            mid += target[1] - response[1];
-            low += target[0] - response[0];
-            high += target[2] - response[2];
+        let amp = |db: f32| 10f32.powf(db.clamp(-120.0, 24.0) / 20.0);
+        // Gains in dB: overall (mid), low shelf, high shelf.
+        let (mut mid, mut low, mut high) = if SHELF_CORNERS[1] < sample_rate * 0.45 {
+            (
+                target[1].clamp(-120.0, 0.0),
+                (target[0] - target[1]).clamp(-18.0, 18.0),
+                (target[2] - target[1]).clamp(-18.0, 18.0),
+            )
+        } else {
+            (target[1].clamp(-120.0, 0.0), 0.0, 0.0)
+        };
+        if SHELF_CORNERS[1] < sample_rate * 0.45 {
+            for _ in 0..8 {
+                let low_shelf = shelf(amp(low), SHELF_CORNERS[0], sample_rate, true);
+                let high_shelf = shelf(amp(high), SHELF_CORNERS[1], sample_rate, false);
+                let response = RT60_BANDS.map(|hz| {
+                    mid + db(magnitude(low_shelf, hz, sample_rate))
+                        + db(magnitude(high_shelf, hz, sample_rate))
+                });
+                mid = (mid + target[1] - response[1]).clamp(-120.0, 0.0);
+                low = (low + target[0] - response[0]).clamp(-18.0, 18.0);
+                high = (high + target[2] - response[2]).clamp(-18.0, 18.0);
+            }
         }
+        let low_shelf = shelf(amp(low), SHELF_CORNERS[0], sample_rate, true);
+        let high_shelf = shelf(amp(high), SHELF_CORNERS[1], sample_rate, false);
+        let check_freqs = [
+            0.0,
+            RT60_BANDS[0],
+            SHELF_CORNERS[0],
+            RT60_BANDS[1],
+            SHELF_CORNERS[1],
+            RT60_BANDS[2],
+            sample_rate * 0.5,
+        ];
+        let peak_filter_mag = check_freqs
+            .into_iter()
+            .map(|hz| {
+                magnitude(low_shelf, hz, sample_rate) * magnitude(high_shelf, hz, sample_rate)
+            })
+            .fold(1e-6f32, f32::max);
+        let max_gain = (0.9995 / peak_filter_mag).min(0.9995);
         Self {
-            gain: amp(mid).min(0.9999),
-            low: shelf(amp(low), SHELF_CORNERS[0], sample_rate, true),
+            gain: amp(mid).clamp(0.0, max_gain),
+            low: low_shelf,
             low_state: [0.0; 2],
-            high: shelf(amp(high), SHELF_CORNERS[1], sample_rate, false),
+            high: high_shelf,
             high_state: [0.0; 2],
         }
     }

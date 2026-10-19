@@ -86,7 +86,7 @@ impl SceneRegistry {
     {
         let serialize: SerializeFn = Arc::new(|world, entity| {
             world
-                .get::<T>(entity)
+                .get_owned::<T>(entity)
                 .and_then(|comp| serde_json::to_value(comp).ok())
         });
 
@@ -110,6 +110,12 @@ impl SceneRegistry {
                 remap,
             },
         );
+    }
+
+    /// Returns `true` if a component with `name` is registered in this registry.
+    #[must_use]
+    pub fn is_registered(&self, name: &str) -> bool {
+        self.entries.contains_key(name)
     }
 
     /// Serializes all registered components present on `entity` in `world`.

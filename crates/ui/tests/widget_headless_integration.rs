@@ -121,10 +121,6 @@ fn test_widget_form_interaction_and_gpu_upload_opengl() {
     for ch in "CyberEngine".chars() {
         dispatcher.inject_char(&mut world, ch);
     }
-    world
-        .get_mut::<LineEdit>(input_field)
-        .unwrap()
-        .insert_text("CyberEngine");
     assert_eq!(
         world.get::<LineEdit>(input_field).unwrap().text(),
         "CyberEngine"
@@ -137,7 +133,6 @@ fn test_widget_form_interaction_and_gpu_upload_opengl() {
         Vec2::new(vsync_rect.x + 10.0, vsync_rect.y + 10.0),
         MouseButton::Left,
     );
-    world.get_mut::<CheckBox>(vsync_box).unwrap().toggle();
     assert!(world.get::<CheckBox>(vsync_box).unwrap().is_checked());
 
     // Step C: Agent drags Volume Slider to 80%

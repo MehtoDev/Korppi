@@ -379,6 +379,17 @@ pub fn split_combined_image_samplers(words: &[u32]) -> Result<Cow<'_, [u32]>, St
         at += count;
     }
 
+    let require = |operands: &[u32], min: usize, name: &str| -> Result<(), String> {
+        if operands.len() < min {
+            Err(format!(
+                "malformed {name} instruction (expected at least {min} operands, got {})",
+                operands.len()
+            ))
+        } else {
+            Ok(())
+        }
+    };
+
     // Image type of each sampled-image type, and every UniformConstant pointer type.
     let mut sampled_images: HashMap<u32, u32> = HashMap::new();
     let mut constant_pointers: HashMap<u32, u32> = HashMap::new();
@@ -386,13 +397,18 @@ pub fn split_combined_image_samplers(words: &[u32]) -> Result<Cow<'_, [u32]>, St
     for &(opcode, operands) in &instructions {
         match opcode {
             OP_TYPE_SAMPLED_IMAGE => {
+                require(operands, 2, "OpTypeSampledImage")?;
                 sampled_images.insert(operands[0], operands[1]);
             }
             OP_TYPE_ARRAY | OP_TYPE_RUNTIME_ARRAY => {
+                require(operands, 2, "OpTypeArray")?;
                 array_elements.insert(operands[0], operands[1]);
             }
-            OP_TYPE_POINTER if operands[1] == STORAGE_CLASS_UNIFORM_CONSTANT => {
-                constant_pointers.insert(operands[0], operands[2]);
+            OP_TYPE_POINTER => {
+                require(operands, 3, "OpTypePointer")?;
+                if operands[1] == STORAGE_CLASS_UNIFORM_CONSTANT {
+                    constant_pointers.insert(operands[0], operands[2]);
+                }
             }
             _ => {}
         }
@@ -402,8 +418,18 @@ pub fn split_combined_image_samplers(words: &[u32]) -> Result<Cow<'_, [u32]>, St
     let mut combined: HashMap<u32, u32> = HashMap::new();
     for &(opcode, operands) in &instructions {
         let pointer_type = match opcode {
-            OP_VARIABLE if operands[2] == STORAGE_CLASS_UNIFORM_CONSTANT => operands[0],
-            OP_FUNCTION_PARAMETER => operands[0],
+            OP_VARIABLE => {
+                require(operands, 3, "OpVariable")?;
+                if operands[2] == STORAGE_CLASS_UNIFORM_CONSTANT {
+                    operands[0]
+                } else {
+                    continue;
+                }
+            }
+            OP_FUNCTION_PARAMETER => {
+                require(operands, 2, "OpFunctionParameter")?;
+                operands[0]
+            }
             _ => continue,
         };
         let Some(pointee) = pointee(pointer_type) else {
@@ -435,33 +461,40 @@ pub fn split_combined_image_samplers(words: &[u32]) -> Result<Cow<'_, [u32]>, St
     let mut sets: HashMap<u32, u32> = HashMap::new();
     let mut bindings: HashMap<u32, u32> = HashMap::new();
     for &(opcode, operands) in &instructions {
-        if opcode == OP_DECORATE && combined.contains_key(&operands[0]) && operands.len() > 2 {
-            match operands[1] {
-                DECORATION_DESCRIPTOR_SET => sets.insert(operands[0], operands[2]),
-                DECORATION_BINDING => bindings.insert(operands[0], operands[2]),
-                _ => None,
-            };
+        if opcode == OP_DECORATE {
+            require(operands, 2, "OpDecorate")?;
+            if combined.contains_key(&operands[0]) && operands.len() > 2 {
+                match operands[1] {
+                    DECORATION_DESCRIPTOR_SET => sets.insert(operands[0], operands[2]),
+                    DECORATION_BINDING => bindings.insert(operands[0], operands[2]),
+                    _ => None,
+                };
+            }
         }
     }
 
     // New IDs: the sampler type and pointer types (unless declared already), one sampler
     // variable per combined variable, and two loads per rewritten load.
     let mut bound = words[3];
-    let mut next_id = || {
+    let mut next_id = || -> Result<u32, String> {
         let id = bound;
-        bound += 1;
-        id
+        bound = bound
+            .checked_add(1)
+            .ok_or_else(|| "SPIR-V ID bound overflow".to_string())?;
+        Ok(id)
     };
-    let sampler_type = next_id();
-    let sampler_pointer = next_id();
+    let sampler_type = next_id()?;
+    let sampler_pointer = next_id()?;
     let mut image_pointers: HashMap<u32, u32> = HashMap::new();
     for &image_type in combined.values() {
-        image_pointers
-            .entry(image_type)
-            .or_insert_with(&mut next_id);
+        if let std::collections::hash_map::Entry::Vacant(e) = image_pointers.entry(image_type) {
+            e.insert(next_id()?);
+        }
     }
-    let sampler_variables: HashMap<u32, u32> =
-        combined.keys().map(|&var| (var, next_id())).collect();
+    let mut sampler_variables: HashMap<u32, u32> = HashMap::with_capacity(combined.len());
+    for &var in combined.keys() {
+        sampler_variables.insert(var, next_id()?);
+    }
     let mut types_declared = false;
 
     let mut out: Vec<u32> = Vec::with_capacity(words.len() + 16 * combined.len());
@@ -477,14 +510,23 @@ pub fn split_combined_image_samplers(words: &[u32]) -> Result<Cow<'_, [u32]>, St
                 }
                 out.extend(instruction(opcode, &extended));
             }
-            OP_DECORATE if sampler_variables.contains_key(&operands[0]) => {
+            OP_DECORATE
+                if operands
+                    .first()
+                    .is_some_and(|id| sampler_variables.contains_key(id)) =>
+            {
+                require(operands, 2, "OpDecorate")?;
                 out.extend(instruction(opcode, operands));
                 let var = operands[0];
                 let mut copy = operands.to_vec();
                 copy[0] = sampler_variables[&var];
                 match operands[1] {
-                    DECORATION_DESCRIPTOR_SET => copy[2] = SPLIT_SAMPLER_SET,
+                    DECORATION_DESCRIPTOR_SET => {
+                        require(operands, 3, "OpDecorate(DescriptorSet)")?;
+                        copy[2] = SPLIT_SAMPLER_SET;
+                    }
                     DECORATION_BINDING => {
+                        require(operands, 3, "OpDecorate(Binding)")?;
                         let set = sets.get(&var).copied().unwrap_or(0);
                         copy[2] = set * MAX_BINDINGS_PER_GROUP + operands[2];
                     }
@@ -492,7 +534,7 @@ pub fn split_combined_image_samplers(words: &[u32]) -> Result<Cow<'_, [u32]>, St
                 }
                 out.extend(instruction(opcode, &copy));
             }
-            OP_VARIABLE if combined.contains_key(&operands[1]) => {
+            OP_VARIABLE if operands.get(1).is_some_and(|id| combined.contains_key(id)) => {
                 if !types_declared {
                     // Declared just before the first combined variable, after every type it
                     // uses. A separate OpTypeSampler is fine for naga even if one exists.
@@ -528,10 +570,11 @@ pub fn split_combined_image_samplers(words: &[u32]) -> Result<Cow<'_, [u32]>, St
                     ],
                 ));
             }
-            OP_LOAD if combined.contains_key(&operands[2]) => {
+            OP_LOAD if operands.get(2).is_some_and(|id| combined.contains_key(id)) => {
+                require(operands, 3, "OpLoad")?;
                 let (result_type, result, var) = (operands[0], operands[1], operands[2]);
-                let image = next_id();
-                let sampler = next_id();
+                let image = next_id()?;
+                let sampler = next_id()?;
                 out.extend(instruction(OP_LOAD, &[combined[&var], image, var]));
                 out.extend(instruction(
                     OP_LOAD,

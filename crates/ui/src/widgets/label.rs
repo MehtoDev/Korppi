@@ -28,8 +28,8 @@ impl Label {
     /// Creates a new `Label` with the given text.
     pub fn new(text: impl Into<String>) -> Self {
         let mut label = Self {
-            text: String::new(),
-            lines: Vec::new(),
+            text: String::with_capacity(128),
+            lines: Vec::with_capacity(4),
             horizontal_alignment: HorizontalAlignment::Left,
             vertical_alignment: VerticalAlignment::Top,
             autowrap: false,
@@ -48,8 +48,34 @@ impl Label {
 
     /// Updates the label text and updates cached lines.
     pub fn set_text(&mut self, text: impl Into<String>) {
-        self.text = text.into();
-        self.lines = self.text.split('\n').map(|s| s.to_string()).collect();
+        let incoming = text.into();
+        self.text.clear();
+        self.text.push_str(&incoming);
+        self.rebuild_lines_in_place();
+    }
+
+    /// Updates the label text in-place by clearing the underlying buffer and invoking `fill`,
+    /// reusing existing `String` and line capacities without heap allocations once warmed up.
+    pub fn update_text_with(&mut self, fill: impl FnOnce(&mut String)) {
+        self.text.clear();
+        fill(&mut self.text);
+        self.rebuild_lines_in_place();
+    }
+
+    fn rebuild_lines_in_place(&mut self) {
+        let mut count = 0usize;
+        for part in self.text.split('\n') {
+            if count < self.lines.len() {
+                self.lines[count].clear();
+                self.lines[count].push_str(part);
+            } else {
+                let mut s = String::with_capacity(part.len().max(128));
+                s.push_str(part);
+                self.lines.push(s);
+            }
+            count += 1;
+        }
+        self.lines.truncate(count);
     }
 
     /// Returns the total number of lines separated by newlines.
@@ -63,18 +89,27 @@ impl Label {
         self.lines.get(line).map(|s| s.as_str())
     }
 
+    /// Writes the formatted display string into `out` without allocating when `out` has capacity.
+    pub fn write_display_text(&self, out: &mut String) {
+        out.clear();
+        let limit = self.visible_characters.unwrap_or(usize::MAX);
+        if self.uppercase {
+            for ch in self.text.chars().take(limit) {
+                for upper in ch.to_uppercase() {
+                    out.push(upper);
+                }
+            }
+        } else if self.visible_characters.is_none() {
+            out.push_str(&self.text);
+        } else {
+            out.extend(self.text.chars().take(limit));
+        }
+    }
+
     /// Computes the formatted display string taking `uppercase` and `visible_characters` into account.
     pub fn display_text(&self) -> String {
-        let base = if self.uppercase {
-            self.text.to_uppercase()
-        } else {
-            self.text.clone()
-        };
-
-        if let Some(limit) = self.visible_characters {
-            base.chars().take(limit).collect()
-        } else {
-            base
-        }
+        let mut out = String::with_capacity(self.text.len());
+        self.write_display_text(&mut out);
+        out
     }
 }

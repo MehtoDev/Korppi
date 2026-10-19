@@ -9,6 +9,9 @@
 //! - `min` and `max` follow SSE2's `minps` and `maxps`: `a.min(b)` is `a` only where `a < b`,
 //!   else `b`, so the second operand wins for equal values (`-0.0` and `0.0`) and for NaN.
 //!   Box2D's NEON and scalar fallbacks differ there; Korppi's do not.
+//! - Arithmetic NaN propagation and invalid-operation NaNs (`0.0 / 0.0`, `∞ - ∞`, `0.0 * ∞`,
+//!   `sqrt(-x)`) follow SSE2's exact bit rules (`0xffc0_0000` for generated NaNs, quieted first
+//!   operand NaN, then quieted second operand NaN).
 //! - Comparisons give masks with every bit of a lane set or clear; `blend`, `and`, `any_true`
 //!   take such masks.
 
@@ -17,12 +20,12 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 /// Lanes in a [`FloatW`].
 pub const LANES: usize = 4;
 
-#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2", not(miri)))]
 mod native {
     use std::arch::x86_64::{
-        __m128, _mm_add_ps, _mm_and_ps, _mm_andnot_ps, _mm_cmpeq_ps, _mm_cmpgt_ps, _mm_cmplt_ps,
-        _mm_div_ps, _mm_max_ps, _mm_min_ps, _mm_movemask_ps, _mm_mul_ps, _mm_or_ps, _mm_set1_ps,
-        _mm_setr_ps, _mm_setzero_ps, _mm_sqrt_ps, _mm_storeu_ps, _mm_sub_ps, _mm_xor_ps,
+        __m128, _mm_and_ps, _mm_andnot_ps, _mm_cmpeq_ps, _mm_cmpgt_ps, _mm_cmplt_ps, _mm_max_ps,
+        _mm_min_ps, _mm_movemask_ps, _mm_or_ps, _mm_set1_ps, _mm_setr_ps, _mm_setzero_ps,
+        _mm_storeu_ps, _mm_xor_ps,
     };
 
     /// Runs SSE2 intrinsics that take and return values.
@@ -76,27 +79,82 @@ mod native {
 
         #[inline(always)]
         pub fn sqrt(self) -> Self {
-            Self(sse2!(_mm_sqrt_ps(self.0)))
+            let mut out = self.0;
+            // SAFETY: `target_feature = "sse2"` is enabled; `sqrtps` operates purely on `xmm`
+            // registers without touching memory, stack, or RFLAGS.
+            unsafe {
+                std::arch::asm!(
+                    "sqrtps {0}, {0}",
+                    inout(xmm_reg) out,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
+            Self(out)
         }
 
         #[inline(always)]
         pub fn add_w(self, b: Self) -> Self {
-            Self(sse2!(_mm_add_ps(self.0, b.0)))
+            let mut out = self.0;
+            // SAFETY: `target_feature = "sse2"` is enabled; `addps` operates purely on `xmm`
+            // registers without touching memory, stack, or RFLAGS, avoiding LLVM target-independent
+            // IR constant-folding that would alter SSE2 NaN sign bits on constant inputs.
+            unsafe {
+                std::arch::asm!(
+                    "addps {0}, {1}",
+                    inout(xmm_reg) out,
+                    in(xmm_reg) b.0,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
+            Self(out)
         }
 
         #[inline(always)]
         pub fn sub_w(self, b: Self) -> Self {
-            Self(sse2!(_mm_sub_ps(self.0, b.0)))
+            let mut out = self.0;
+            // SAFETY: `target_feature = "sse2"` is enabled; `subps` operates purely on `xmm`
+            // registers without touching memory, stack, or RFLAGS.
+            unsafe {
+                std::arch::asm!(
+                    "subps {0}, {1}",
+                    inout(xmm_reg) out,
+                    in(xmm_reg) b.0,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
+            Self(out)
         }
 
         #[inline(always)]
         pub fn mul_w(self, b: Self) -> Self {
-            Self(sse2!(_mm_mul_ps(self.0, b.0)))
+            let mut out = self.0;
+            // SAFETY: `target_feature = "sse2"` is enabled; `mulps` operates purely on `xmm`
+            // registers without touching memory, stack, or RFLAGS.
+            unsafe {
+                std::arch::asm!(
+                    "mulps {0}, {1}",
+                    inout(xmm_reg) out,
+                    in(xmm_reg) b.0,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
+            Self(out)
         }
 
         #[inline(always)]
         pub fn div_w(self, b: Self) -> Self {
-            Self(sse2!(_mm_div_ps(self.0, b.0)))
+            let mut out = self.0;
+            // SAFETY: `target_feature = "sse2"` is enabled; `divps` operates purely on `xmm`
+            // registers without touching memory, stack, or RFLAGS.
+            unsafe {
+                std::arch::asm!(
+                    "divps {0}, {1}",
+                    inout(xmm_reg) out,
+                    in(xmm_reg) b.0,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
+            Self(out)
         }
 
         #[inline(always)]
@@ -154,7 +212,7 @@ mod native {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon", not(miri)))]
 mod native {
     use std::arch::aarch64::{
         float32x4_t, vabsq_f32, vaddq_f32, vandq_u32, vbslq_f32, vceqq_f32, vcgtq_f32, vcltq_f32,
@@ -304,28 +362,52 @@ mod native {
 /// The plain-array backend: the same results as SSE2, lane by lane. It is the [`FloatW`] of
 /// targets without SSE2 or NEON, and is public so tests can hold the native backend to it.
 pub mod portable {
+    /// SSE2 floating-point indefinite value (`-qNaN`, `0xffc0_0000`) returned when an arithmetic
+    /// instruction raises an Invalid Operation exception on non-NaN operands.
+    const SSE2_INDEFINITE_NAN: u32 = 0xffc0_0000;
+    /// IEEE-754 binary32 quiet NaN bit.
+    const QUIET_NAN_BIT: u32 = 0x0040_0000;
+
+    #[inline(always)]
+    fn sse2_unary_nan(x: f32, res: f32) -> f32 {
+        if res.is_nan() {
+            if x.is_nan() {
+                f32::from_bits(x.to_bits() | QUIET_NAN_BIT)
+            } else {
+                f32::from_bits(SSE2_INDEFINITE_NAN)
+            }
+        } else {
+            res
+        }
+    }
+
+    #[inline(always)]
+    fn sse2_binary_nan(x: f32, y: f32, res: f32) -> f32 {
+        if res.is_nan() {
+            if x.is_nan() {
+                f32::from_bits(x.to_bits() | QUIET_NAN_BIT)
+            } else if y.is_nan() {
+                f32::from_bits(y.to_bits() | QUIET_NAN_BIT)
+            } else {
+                f32::from_bits(SSE2_INDEFINITE_NAN)
+            }
+        } else {
+            res
+        }
+    }
+
     /// Four lanes in an array, aligned as a SIMD register.
     #[derive(Clone, Copy, Debug)]
     #[repr(C, align(16))]
     pub struct FloatW([f32; 4]);
 
     /// A lane of a mask: every bit set or clear.
+    #[inline(always)]
     const fn mask_lane(set: bool) -> f32 {
         f32::from_bits(if set { u32::MAX } else { 0 })
     }
 
     impl FloatW {
-        #[inline(always)]
-        fn map(self, b: Self, f: impl Fn(f32, f32) -> f32) -> Self {
-            let (a, b) = (self.0, b.0);
-            Self([f(a[0], b[0]), f(a[1], b[1]), f(a[2], b[2]), f(a[3], b[3])])
-        }
-
-        #[inline(always)]
-        fn bits(self, b: Self, f: impl Fn(u32, u32) -> u32) -> Self {
-            self.map(b, |x, y| f32::from_bits(f(x.to_bits(), y.to_bits())))
-        }
-
         /// All lanes zero.
         #[inline(always)]
         #[must_use]
@@ -347,6 +429,13 @@ pub mod portable {
             Self([a, b, c, d])
         }
 
+        /// Lanes from an array.
+        #[inline(always)]
+        #[must_use]
+        pub fn from_array(lanes: [f32; 4]) -> Self {
+            Self(lanes)
+        }
+
         /// The lanes.
         #[inline(always)]
         #[must_use]
@@ -358,127 +447,219 @@ pub mod portable {
         #[inline(always)]
         #[must_use]
         pub fn neg_w(self) -> Self {
-            Self(self.0.map(|x| -x))
+            let a = self.0;
+            Self([-a[0], -a[1], -a[2], -a[3]])
         }
 
         /// Clears each lane's sign bit.
         #[inline(always)]
         #[must_use]
         pub fn abs(self) -> Self {
-            Self(self.0.map(f32::abs))
+            let a = self.0;
+            Self([a[0].abs(), a[1].abs(), a[2].abs(), a[3].abs()])
         }
 
         /// Lane-wise square root.
         #[inline(always)]
         #[must_use]
         pub fn sqrt(self) -> Self {
-            Self(self.0.map(f32::sqrt))
+            let a = self.0;
+            Self([
+                sse2_unary_nan(a[0], a[0].sqrt()),
+                sse2_unary_nan(a[1], a[1].sqrt()),
+                sse2_unary_nan(a[2], a[2].sqrt()),
+                sse2_unary_nan(a[3], a[3].sqrt()),
+            ])
         }
 
         /// Lane-wise `a + b`.
         #[inline(always)]
         #[must_use]
         pub fn add_w(self, b: Self) -> Self {
-            self.map(b, |x, y| x + y)
+            let (a, b) = (self.0, b.0);
+            Self([
+                sse2_binary_nan(a[0], b[0], a[0] + b[0]),
+                sse2_binary_nan(a[1], b[1], a[1] + b[1]),
+                sse2_binary_nan(a[2], b[2], a[2] + b[2]),
+                sse2_binary_nan(a[3], b[3], a[3] + b[3]),
+            ])
         }
 
         /// Lane-wise `a - b`.
         #[inline(always)]
         #[must_use]
         pub fn sub_w(self, b: Self) -> Self {
-            self.map(b, |x, y| x - y)
+            let (a, b) = (self.0, b.0);
+            Self([
+                sse2_binary_nan(a[0], b[0], a[0] - b[0]),
+                sse2_binary_nan(a[1], b[1], a[1] - b[1]),
+                sse2_binary_nan(a[2], b[2], a[2] - b[2]),
+                sse2_binary_nan(a[3], b[3], a[3] - b[3]),
+            ])
         }
 
         /// Lane-wise `a * b`.
         #[inline(always)]
         #[must_use]
         pub fn mul_w(self, b: Self) -> Self {
-            self.map(b, |x, y| x * y)
+            let (a, b) = (self.0, b.0);
+            Self([
+                sse2_binary_nan(a[0], b[0], a[0] * b[0]),
+                sse2_binary_nan(a[1], b[1], a[1] * b[1]),
+                sse2_binary_nan(a[2], b[2], a[2] * b[2]),
+                sse2_binary_nan(a[3], b[3], a[3] * b[3]),
+            ])
         }
 
         /// Lane-wise `a / b`.
         #[inline(always)]
         #[must_use]
         pub fn div_w(self, b: Self) -> Self {
-            self.map(b, |x, y| x / y)
+            let (a, b) = (self.0, b.0);
+            Self([
+                sse2_binary_nan(a[0], b[0], a[0] / b[0]),
+                sse2_binary_nan(a[1], b[1], a[1] / b[1]),
+                sse2_binary_nan(a[2], b[2], a[2] / b[2]),
+                sse2_binary_nan(a[3], b[3], a[3] / b[3]),
+            ])
         }
 
         /// Lane-wise `a < b ? a : b`, as SSE2's `minps`.
         #[inline(always)]
         #[must_use]
         pub fn min(self, b: Self) -> Self {
-            self.map(b, |x, y| if x < y { x } else { y })
+            let (a, b) = (self.0, b.0);
+            Self([
+                if a[0] < b[0] { a[0] } else { b[0] },
+                if a[1] < b[1] { a[1] } else { b[1] },
+                if a[2] < b[2] { a[2] } else { b[2] },
+                if a[3] < b[3] { a[3] } else { b[3] },
+            ])
         }
 
         /// Lane-wise `a > b ? a : b`, as SSE2's `maxps`.
         #[inline(always)]
         #[must_use]
         pub fn max(self, b: Self) -> Self {
-            self.map(b, |x, y| if x > y { x } else { y })
+            let (a, b) = (self.0, b.0);
+            Self([
+                if a[0] > b[0] { a[0] } else { b[0] },
+                if a[1] > b[1] { a[1] } else { b[1] },
+                if a[2] > b[2] { a[2] } else { b[2] },
+                if a[3] > b[3] { a[3] } else { b[3] },
+            ])
         }
 
         /// Lane-wise bitwise and.
         #[inline(always)]
         #[must_use]
         pub fn and(self, b: Self) -> Self {
-            self.bits(b, |x, y| x & y)
+            let (a, b) = (self.0, b.0);
+            Self([
+                f32::from_bits(a[0].to_bits() & b[0].to_bits()),
+                f32::from_bits(a[1].to_bits() & b[1].to_bits()),
+                f32::from_bits(a[2].to_bits() & b[2].to_bits()),
+                f32::from_bits(a[3].to_bits() & b[3].to_bits()),
+            ])
         }
 
         /// Lane-wise bitwise or.
         #[inline(always)]
         #[must_use]
         pub fn or(self, b: Self) -> Self {
-            self.bits(b, |x, y| x | y)
+            let (a, b) = (self.0, b.0);
+            Self([
+                f32::from_bits(a[0].to_bits() | b[0].to_bits()),
+                f32::from_bits(a[1].to_bits() | b[1].to_bits()),
+                f32::from_bits(a[2].to_bits() | b[2].to_bits()),
+                f32::from_bits(a[3].to_bits() | b[3].to_bits()),
+            ])
         }
 
         /// Mask of the lanes where `a > b`.
         #[inline(always)]
         #[must_use]
         pub fn greater_than(self, b: Self) -> Self {
-            self.map(b, |x, y| mask_lane(x > y))
+            let (a, b) = (self.0, b.0);
+            Self([
+                mask_lane(a[0] > b[0]),
+                mask_lane(a[1] > b[1]),
+                mask_lane(a[2] > b[2]),
+                mask_lane(a[3] > b[3]),
+            ])
         }
 
         /// Mask of the lanes where `a < b`.
         #[inline(always)]
         #[must_use]
         pub fn less_than(self, b: Self) -> Self {
-            self.map(b, |x, y| mask_lane(x < y))
+            let (a, b) = (self.0, b.0);
+            Self([
+                mask_lane(a[0] < b[0]),
+                mask_lane(a[1] < b[1]),
+                mask_lane(a[2] < b[2]),
+                mask_lane(a[3] < b[3]),
+            ])
         }
 
         /// Mask of the lanes where `a == b`.
         #[inline(always)]
         #[must_use]
         pub fn equals(self, b: Self) -> Self {
-            self.map(b, |x, y| mask_lane(x == y))
+            let (a, b) = (self.0, b.0);
+            Self([
+                mask_lane(a[0] == b[0]),
+                mask_lane(a[1] == b[1]),
+                mask_lane(a[2] == b[2]),
+                mask_lane(a[3] == b[3]),
+            ])
         }
 
         /// Whether any lane has its sign bit set, as SSE2's `movemask`.
         #[inline(always)]
         #[must_use]
         pub fn any_true(self) -> bool {
-            self.0.iter().any(|x| x.is_sign_negative())
+            let a = self.0;
+            a[0].is_sign_negative()
+                || a[1].is_sign_negative()
+                || a[2].is_sign_negative()
+                || a[3].is_sign_negative()
         }
 
         /// Whether every lane equals zero (either sign).
         #[inline(always)]
         #[must_use]
         pub fn all_zero(self) -> bool {
-            self.0.iter().all(|&x| x == 0.0)
+            let a = self.0;
+            a[0] == 0.0 && a[1] == 0.0 && a[2] == 0.0 && a[3] == 0.0
         }
 
         /// `b` in the lanes `mask` sets, `self` in the others, bit by bit.
         #[inline(always)]
         #[must_use]
         pub fn blend(self, b: Self, mask: Self) -> Self {
-            let picked = mask.bits(b, |m, y| m & y);
-            let kept = mask.bits(self, |m, x| !m & x);
-            picked.bits(kept, |x, y| x | y)
+            let (a, b, m) = (self.0, b.0, mask.0);
+            Self([
+                f32::from_bits(
+                    (m[0].to_bits() & b[0].to_bits()) | (!m[0].to_bits() & a[0].to_bits()),
+                ),
+                f32::from_bits(
+                    (m[1].to_bits() & b[1].to_bits()) | (!m[1].to_bits() & a[1].to_bits()),
+                ),
+                f32::from_bits(
+                    (m[2].to_bits() & b[2].to_bits()) | (!m[2].to_bits() & a[2].to_bits()),
+                ),
+                f32::from_bits(
+                    (m[3].to_bits() & b[3].to_bits()) | (!m[3].to_bits() & a[3].to_bits()),
+                ),
+            ])
         }
     }
 
     impl std::ops::Neg for FloatW {
         type Output = Self;
 
+        #[inline(always)]
         fn neg(self) -> Self {
             self.neg_w()
         }
@@ -487,6 +668,7 @@ pub mod portable {
     impl std::ops::Add for FloatW {
         type Output = Self;
 
+        #[inline(always)]
         fn add(self, b: Self) -> Self {
             self.add_w(b)
         }
@@ -495,6 +677,7 @@ pub mod portable {
     impl std::ops::Sub for FloatW {
         type Output = Self;
 
+        #[inline(always)]
         fn sub(self, b: Self) -> Self {
             self.sub_w(b)
         }
@@ -503,6 +686,7 @@ pub mod portable {
     impl std::ops::Mul for FloatW {
         type Output = Self;
 
+        #[inline(always)]
         fn mul(self, b: Self) -> Self {
             self.mul_w(b)
         }
@@ -511,16 +695,20 @@ pub mod portable {
     impl std::ops::Div for FloatW {
         type Output = Self;
 
+        #[inline(always)]
         fn div(self, b: Self) -> Self {
             self.div_w(b)
         }
     }
 }
 
-#[cfg(not(any(
-    all(target_arch = "x86_64", target_feature = "sse2"),
-    all(target_arch = "aarch64", target_feature = "neon")
-)))]
+#[cfg(any(
+    miri,
+    not(any(
+        all(target_arch = "x86_64", target_feature = "sse2"),
+        all(target_arch = "aarch64", target_feature = "neon")
+    ))
+))]
 mod native {
     pub use super::portable::FloatW;
 }
